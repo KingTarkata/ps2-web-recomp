@@ -475,6 +475,12 @@ void run_vu_thread() {
             switch (h.type) {
             case gs::queue::kVif1: vif::transfer(1, payload, h.arg0); break;
             case gs::queue::kVif1Write: vif::write(1, h.arg0, h.arg1); break;
+            case gs::queue::kGif: gif::transfer(static_cast<int>(h.arg0), payload, h.arg1); break;
+            case gs::queue::kPath3Idle: gif::vif1_idle(); break;
+            case gs::queue::kGifReset:
+                gif::drop_held();
+                gs::queue::render().post(gs::queue::kGifReset, h.arg0, h.arg1, payload, h.bytes);
+                break;
             case gs::queue::kVuReset:
                 vif::reset_vu_side();
                 vu::reset();
