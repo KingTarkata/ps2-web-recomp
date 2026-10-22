@@ -658,6 +658,23 @@ void install_servers() {
         switch (method) {
         case 1: store<std::uint32_t>(g_ram + ret, iop::kernel::alloc(ee_read<std::uint32_t>(args))); break;
         case 2: iop::kernel::free(ee_read<std::uint32_t>(args)); store<std::uint32_t>(g_ram + ret, 0); break;
+        // sceSifLoadIopHeap: the IOP address, then the path of a file to read whole into it.
+        // Sound drivers get their bank and sequence data this way.
+        case 3: {
+            std::uint32_t address = ee_read<std::uint32_t>(args);
+            const std::string path(reinterpret_cast<const char *>(g_ram + args + 4));
+            std::int32_t result = iop::io::open(path, 1);
+            if (result >= 0) {
+                const int fd = result;
+                std::vector<std::uint8_t> buffer(64u << 10);
+                for (int got; (got = iop::io::read(fd, buffer.data(), static_cast<std::uint32_t>(buffer.size()))) > 0; address += static_cast<std::uint32_t>(got))
+                    for (int i = 0; i < got; ++i) *iop::ram_ptr(address + static_cast<std::uint32_t>(i)) = buffer[static_cast<std::size_t>(i)];
+                iop::io::close(fd);
+                result = 0;
+            }
+            store<std::int32_t>(g_ram + ret, result);
+            break;
+        }
         // sceSifAllocSysMemory: size first, then the allocation type and address, which a
         // first-fit heap can ignore. Answering 0 here sends the game to wipe IOP memory from 0.
         case 4: store<std::uint32_t>(g_ram + ret, iop::kernel::alloc(ee_read<std::uint32_t>(args))); break;
