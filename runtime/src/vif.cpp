@@ -353,7 +353,12 @@ void write(int unit, std::uint32_t reg, std::uint32_t value) {
     switch (reg) {
     case 0x10:
         if (value & 1u) {
-            u = Unit{};
+            // A reset leaves the filling registers alone, as in PCSX2: Downhill
+            // Domination sets ROW once and resets the VIF before every frame.
+            Unit fresh{};
+            std::memcpy(fresh.row, u.row, sizeof fresh.row);
+            std::memcpy(fresh.col, u.col, sizeof fresh.col);
+            u = fresh;
         }
         if (value & 8u) {
             u.stat &= ~0x3F00u;
