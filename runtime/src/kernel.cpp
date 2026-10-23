@@ -428,7 +428,11 @@ void service(Cpu &c) {
             else run_intc(c, static_cast<unsigned>(std::countr_zero(pending)));
         }
     }
-    if (g_reschedule || c.pc == kIdle) reschedule(c);
+    // A thread whose entry function returns lands on kIdle, the ra it was started
+    // with, and the PS2 kernel ends it there the way ExitThread does.
+    const Thread *t = current();
+    if (c.pc == kIdle && t && t->status == kRun) exit_current(c, false);
+    else if (g_reschedule || c.pc == kIdle) reschedule(c);
     c.pc &= ~kUnwind;
 }
 
