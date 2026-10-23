@@ -52,7 +52,13 @@ public:
                 if (has_delay_slot(decode(*image_.word(pc + 4), pc + 4).op)) return false;
                 seen.insert(pc + 4);
                 if (f == Flow::Branch || f == Flow::BranchLikely || (f == Flow::Jump && !p_.dynamic.count(pc))) {
-                    if (!valid_target(insn.branch_target_of())) return false;
+                    // Fixed-address modules can tail-call a routine in the main
+                    // executable. Like an external jal, that does not make the
+                    // caller invalid; dispatch resolves the target at run time.
+                    if (!valid_target(insn.branch_target_of())) {
+                        if (f == Flow::Jump) break;
+                        return false;
+                    }
                     pending.push_back(insn.branch_target_of());
                 }
                 if (f == Flow::Jump || f == Flow::JumpRegister) break;
