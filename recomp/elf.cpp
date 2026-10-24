@@ -44,7 +44,7 @@ Image Image::load(const std::string &path) {
         // game rewrites it at runtime, so it holds no code to translate here
         // and any call into it walks to the images the game puts there.
         if (!filesz && (flags & 1u)) continue;
-        Segment segment{vaddr, std::vector<std::uint8_t>(memsz), (flags & 1u) != 0};
+        Segment segment{vaddr, std::vector<std::uint8_t>(memsz), (flags & 1u) != 0, filesz};
         std::memcpy(segment.bytes.data(), data.data() + offset, filesz);
         image.segments_.push_back(std::move(segment));
     }
@@ -74,7 +74,8 @@ Image Image::load(const std::string &path) {
 
 Image Image::raw(std::uint32_t address, std::vector<std::uint8_t> bytes, std::pair<std::uint32_t, std::uint32_t> text) {
     Image image;
-    image.segments_.push_back(Segment{address, std::move(bytes), true});
+    const auto initialized_size = static_cast<std::uint32_t>(bytes.size());
+    image.segments_.push_back(Segment{address, std::move(bytes), true, initialized_size});
     image.text_ = text;
     return image;
 }
@@ -91,8 +92,10 @@ std::optional<std::uint32_t> Image::word(std::uint32_t address) const {
 }
 
 bool Image::executable(std::uint32_t address) const {
+    // Zero-filled memory is data until the game loads code there. Translating its
+    // initial zeroes would mask a fixed-address overlay loaded into that space.
     for (const auto &segment : segments_)
-        if (segment.executable && address >= segment.address && address - segment.address < segment.bytes.size())
+        if (segment.executable && address >= segment.address && address - segment.address < segment.initialized_size)
             return true;
     return false;
 }

@@ -13,6 +13,7 @@ struct Segment {
     std::uint32_t address{};
     std::vector<std::uint8_t> bytes;
     bool executable{};
+    std::uint32_t initialized_size{};
 };
 
 class Image {
