@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace ps2::gif {
 
@@ -144,10 +145,88 @@ void scan(Path &p, const std::uint8_t *data, std::uint32_t qwc) {
 
 Path g_scan[4];
 
+// PATH3 under VIF1's MSKPATH3: while the mask is up a real GIF leaves channel 2's data
+// waiting, and a mask that comes up while a packet is under way stops PATH3 at the packet's
+// end (the tag with EOP). Games stream textures through a few slots of GS memory this way:
+// the VIF1 list drops the mask and raises it again right away before each draw that needs
+// the next texture, which lets exactly one packet through, and leaves it down at the end of
+// the list, which lets the rest through. Channel 2 finishes at once here, so its data is
+// held until then, in the thread that runs VIF1 for real so that it reaches the GS in order
+// with VIF1's own.
+struct Held {
+    bool masked = false, mid_packet = false, flowing = false;
+    std::uint64_t left = 0;
+    bool eop = false;
+    std::vector<std::uint8_t> data;
+} g_held;
+
+bool hold_here() { return !gs::queue::vu_active() || gs::queue::role() == gs::queue::Role::Vu; }
+
+void out(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    if (!qwc) return;
+    if (!gs::queue::active()) {
+        render(path, data, qwc);
+        return;
+    }
+    if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
+    gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
+}
+
+// How many of these qwords belong to the packet under way; mid_packet is left set when
+// the packet goes on past them.
+std::uint32_t packet_length(const std::uint8_t *data, std::uint32_t qwc) {
+    Held &h = g_held;
+    std::uint32_t i = 0;
+    while (i < qwc) {
+        if (!h.left) {
+            std::uint64_t tag;
+            std::memcpy(&tag, data + static_cast<std::size_t>(i) * 16, 8);
+            const std::uint64_t nloop = tag & 0x7FFFu, flg = (tag >> 58) & 3u;
+            std::uint64_t nreg = (tag >> 60) & 0xFu;
+            if (!nreg) nreg = 16;
+            h.eop = (tag >> 15) & 1u;
+            h.left = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+            h.mid_packet = true;
+            ++i;
+        } else {
+            const std::uint32_t take = static_cast<std::uint32_t>(std::min<std::uint64_t>(h.left, qwc - i));
+            h.left -= take;
+            i += take;
+        }
+        if (!h.left && h.eop) {
+            h.mid_packet = false;
+            return i;
+        }
+    }
+    return qwc;
+}
+
+// Lets held data out while PATH3 may run; with only_one, just the next packet.
+void release(bool only_one) {
+    Held &h = g_held;
+    std::size_t done = 0;
+    const std::uint32_t total = static_cast<std::uint32_t>(h.data.size() / 16);
+    while (done < total && (!h.masked || h.mid_packet)) {
+        const std::uint8_t *at = h.data.data() + done * 16;
+        const std::uint32_t n = packet_length(at, static_cast<std::uint32_t>(total - done));
+        out(3, at, n);
+        done += n;
+        if (only_one && !h.mid_packet) break;
+    }
+    h.data.erase(h.data.begin(), h.data.begin() + static_cast<std::ptrdiff_t>(done * 16));
+}
+
+}
+
+void drop_held() {
+    const bool masked = g_held.masked;
+    g_held = Held{};
+    g_held.masked = masked;
 }
 
 void reset() {
     g_stat = 0;
+    if (hold_here()) drop_held();
     if (gs::queue::active()) {
         for (Path &p : g_scan) p = Path{};
         gs::queue::post(gs::queue::kGifReset, 0, 0, nullptr, 0);
@@ -166,12 +245,28 @@ void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
 }
 
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
-    if (!gs::queue::active()) {
-        render(path, data, qwc);
+    Held &h = g_held;
+    if (!hold_here()) {
+        out(path, data, qwc);
         return;
     }
-    if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
-    gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
+    // Once the mask is down, whatever is still held goes ahead of anything new.
+    if (h.flowing && !h.masked) {
+        h.flowing = false;
+        release(false);
+    }
+    if (path != 3) {
+        out(path, data, qwc);
+        return;
+    }
+    if (h.data.empty() && (!h.masked || h.mid_packet)) {
+        std::uint32_t done = 0;
+        while (done < qwc && (!h.masked || h.mid_packet)) done += packet_length(data + static_cast<std::size_t>(done) * 16, qwc - done);
+        out(3, data, done);
+        data += static_cast<std::size_t>(done) * 16;
+        qwc -= done;
+    }
+    h.data.insert(h.data.end(), data, data + static_cast<std::size_t>(qwc) * 16);
 }
 
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc) { scan(g_scan[path], data, qwc); }
@@ -187,8 +282,8 @@ void stats() {
 
 std::uint32_t read(std::uint32_t a) {
     // While PATH3 is masked a real GIF holds the stalled channel 2 transfer in its FIFO, and
-    // games wait for FQC to read non-zero before they touch the GS; transfers here are
-    // immediate, so report the FIFO full for as long as the mask is up.
+    // games wait for FQC to read non-zero before they touch the GS; channel 2 finishes at
+    // once here, so report the FIFO full for as long as the mask is up.
     if ((a & 0xF0u) == 0x20u) return g_stat | ((g_stat & 2u) ? 16u << 24 : 0u);
     return 0;
 }
@@ -198,10 +293,30 @@ void write(std::uint32_t a, std::uint32_t v) {
     if ((a & 0xF0u) == 0x10u) g_stat = (g_stat & ~1u) | (v & 1u);
 }
 
+void vif1_idle() {
+    if (!hold_here()) {
+        gs::queue::vu().post(gs::queue::kPath3Idle, 0, 0, nullptr, 0);
+        return;
+    }
+    Held &h = g_held;
+    h.flowing = false;
+    if (!h.masked) release(false);
+}
+
 void set_path3_masked(bool masked) {
-    g_stat = (g_stat & ~2u) | (masked ? 2u : 0u);
+    if (gs::queue::role() != gs::queue::Role::Vu) g_stat = (g_stat & ~2u) | (masked ? 2u : 0u);
     static const bool trace = std::getenv("PS2_TRACE_PATH3") != nullptr;
     if (trace) std::fprintf(stderr, "[gif] path3 %s\n", masked ? "masked" : "unmasked");
+    if (!hold_here()) return;
+    Held &h = g_held;
+    const bool was = h.masked;
+    h.masked = masked;
+    // The packet that starts as the mask drops gets through even if the mask goes straight
+    // back up; the rest waits for more GIF traffic or for VIF1 to go idle with it still down.
+    if (was && !masked && !h.data.empty()) {
+        release(true);
+        h.flowing = !h.data.empty();
+    }
 }
 
 }
