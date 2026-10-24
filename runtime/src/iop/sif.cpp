@@ -27,6 +27,10 @@ constexpr std::uint32_t kServerXor = 0xACACACACu;
 constexpr std::uint32_t kCmdBuffer = 0x0001E000u;
 constexpr std::uint32_t kCmdRend = 0x80000008u;
 constexpr std::uint32_t kCmdSetSreg = 0x80000001u;
+// An HLE server answers after about the time a call takes on a real IOP. Games
+// depend on it: the calling thread blocks meanwhile and lower priority threads
+// run, as Downhill Domination's loader needs its worker to reach SleepThread.
+constexpr std::uint64_t kHleReplyUsec = 50;
 
 struct Header {
     std::uint32_t size_word, dest, cid, opt;
@@ -72,6 +76,7 @@ std::deque<std::vector<std::uint8_t>> g_outgoing;
 std::map<std::uint32_t, Server> g_servers;
 std::map<std::uint32_t, PendingBind> g_binds;
 std::map<std::uint32_t, Call> g_held_calls;
+std::deque<Call> g_hle_replies;
 std::map<std::uint32_t, std::deque<Request>> g_requests;
 std::map<std::uint32_t, int> g_queue_threads;
 std::map<std::uint32_t, CmdHandler> g_cmd_handlers;
@@ -154,10 +159,14 @@ void call(const std::uint8_t *packet) {
         return;
     }
     if (it->second.hle) {
+        // The IOP runs behind the EE by up to a slice; catch it up so the reply
+        // latency counts from the moment of the call.
+        sync_iop();
         g_held_calls[server] = c;
         if (it->second.invoke(c.rpc_number, g_data_addr, c.send_size, c.recv & (kRamSize - 1), c.recv_size)) {
             g_held_calls.erase(server);
-            reply_call(c);
+            g_hle_replies.push_back(c);
+            iop::kernel::schedule(iop::kernel::now() + iop::kernel::usec_to_cycles(kHleReplyUsec), iop::kernel::Job{iop::kernel::kJobSifReply});
         }
         return;
     }
@@ -343,6 +352,12 @@ void rpc_finish(iop::Cpu &c) {
 
 void install_iop_side() {
     iop::kernel::register_job(iop::kernel::kJobSifDmaCallback, [](const iop::kernel::Job &j) { iop::kernel::call_guest(j.a, j.b); });
+    iop::kernel::register_job(iop::kernel::kJobSifReply, [](const iop::kernel::Job &) {
+        if (g_hle_replies.empty()) return;
+        const Call c = g_hle_replies.front();
+        g_hle_replies.pop_front();
+        reply_call(c);
+    });
     g_loop_stub = iop::kernel::hle_stub(rpc_loop);
     g_finish_stub = iop::kernel::hle_stub(rpc_finish);
 
@@ -701,6 +716,7 @@ void reset() {
     g_servers.clear();
     g_binds.clear();
     g_held_calls.clear();
+    g_hle_replies.clear();
     g_requests.clear();
     g_queue_threads.clear();
     g_cmd_handlers.clear();
@@ -879,6 +895,7 @@ void state(ps2::state::Stream &s) {
     s.pod(g_ee_dma_id);
     s.pod(g_fileio_async);
     s.pod(g_fileio_result);
+    if (s.version() >= 4) s.deque(g_hle_replies, [&s](Call &c) { s.pod(c); });
 }
 
 }

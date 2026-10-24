@@ -326,7 +326,13 @@ bool stalled(int unit) { return state(unit).stalled; }
 std::uint32_t read(int unit, std::uint32_t reg) {
     const Unit &u = state(unit);
     switch (reg) {
-    case 0x00: return u.stat | (u.dbf ? 0x80u : 0u);
+    case 0x00: {
+        std::uint32_t stat = u.stat | (u.dbf ? 0x80u : 0u);
+        // With FDR set the FIFO runs from the GS, and a download keeps it as full as the
+        // game drains it: sceGsExecStoreImage polls FQC before each qword it reads.
+        if (unit == 1 && (u.stat & 0x800000u)) stat |= 16u << 24;
+        return stat;
+    }
     case 0x20: return u.err;
     case 0x30: return u.mark;
     case 0x40: return u.cycle;
@@ -351,9 +357,17 @@ void write(int unit, std::uint32_t reg, std::uint32_t value) {
     if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1Write, reg, value, nullptr, 0);
     Unit &u = state(unit);
     switch (reg) {
+    case 0x00:
+        if (unit == 1) u.stat = (u.stat & ~0x800000u) | (value & 0x800000u);
+        break;
     case 0x10:
         if (value & 1u) {
-            u = Unit{};
+            // A reset leaves the filling registers alone, as in PCSX2: Downhill
+            // Domination sets ROW once and resets the VIF before every frame.
+            Unit fresh{};
+            std::memcpy(fresh.row, u.row, sizeof fresh.row);
+            std::memcpy(fresh.col, u.col, sizeof fresh.col);
+            u = fresh;
         }
         if (value & 8u) {
             u.stat &= ~0x3F00u;

@@ -457,6 +457,16 @@ void render_reset() {
     raster::reset();
 }
 
+// A reset through CSR clears the drawing environment, not just the vertex queue,
+// as PCSX2 does: Downhill Domination's movie player leaves SCANMSK set for it.
+void soft_reset() {
+    std::uint32_t clut[512];
+    std::memcpy(clut, g_state.clut, sizeof clut);
+    std::memset(&g_state, 0, sizeof g_state);
+    std::memcpy(g_state.clut, clut, sizeof clut);
+    ++g_setup_generation;
+}
+
 void reset() {
     g_shadow = DownloadKey{};
     {
@@ -797,8 +807,8 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
         g_csr &= ~(value & 0x1Fu);
         if (value & 0x200u) {
             g_csr = 0x551B4000ull;
-            if (queue::active()) queue::post(queue::kVertexReset, 0, 0, nullptr, 0);
-            else g_state.count = 0;
+            if (queue::active()) queue::post(queue::kSoftReset, 0, 0, nullptr, 0);
+            else soft_reset();
         }
         break;
     case 0x1010:
@@ -986,7 +996,7 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
         case queue::kGif: gif::render(static_cast<int>(h.arg0), payload, h.arg1); break;
         case queue::kGifReset: gif::render_reset(); break;
         case queue::kReset: render_reset(); break;
-        case queue::kVertexReset: g_state.count = 0; break;
+        case queue::kSoftReset: soft_reset(); break;
         case queue::kVblank:
 #ifdef PS2_GPU
             if (gpu_on()) gpu::flush();
