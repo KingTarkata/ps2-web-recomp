@@ -23,3 +23,6 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+# The build machine's glibc is newer than the one on the Switch's Linux;
+# host/glibc_compat.cpp pins the handful of libm symbols that moved.
+set(PS2_GLIBC_COMPAT ON CACHE BOOL "Bind libm symbols to glibc's baseline version")
