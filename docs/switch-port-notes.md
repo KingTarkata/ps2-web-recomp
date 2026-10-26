@@ -269,3 +269,16 @@ disassemble the `.adc` projects, which needs a .NET SDK in the VM.
   optimisation (-O0 crashes identically), and the one opcode family only
   this executable uses (its MMI string routines were checked against
   `mmi.hpp` and look right).
+
+## 11. L4T build (Phase 3 preparation)
+
+A windowed aarch64 `ps2run` for Linux on the Switch links against Ubuntu's
+arm64 SDL2 without root: `libsdl2-classic_*_arm64.deb` from
+ports.ubuntu.com unpacked with `dpkg-deb -x` into `private/sysroot-arm64/`,
+the host's SDL2 headers (same 2.32.10 version) plus a copy of
+`_real_SDL_config.h`, and a four-line `SDL2Config.cmake` that declares the
+imported target with `-Wl,--allow-shlib-undefined` (the library's X11 and
+Wayland dependencies are not in the sysroot and are not needed to link).
+Configure with `-DSDL2_DIR=private/sysroot-arm64/cmake` on top of the
+aarch64 toolchain file. The result depends only on libSDL2-2.0.so.0, libm,
+libstdc++, libgcc_s and libc; wgpu-native loads libvulkan.so.1 at run time.
