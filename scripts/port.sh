@@ -26,12 +26,15 @@ options:
   --pnach-section S  also apply the patches under [S] in those files, the way
                      enabling them in PCSX2 does; lines outside any section
                      always apply
+  --card FILE        start every exploring run from a copy of this memory
+                     card (PCSX2 .ps2 layout) instead of an empty slot, so a
+                     saved game can carry the runs past first-boot screens
 EOF
 }
 
 [ $# -ge 2 ] || { usage; exit 2; }
 name="$1"; source_path="$2"; shift 2
-frames=3600; rounds=8; explore=1; web=1; presses=(); pnach=()
+frames=3600; rounds=8; explore=1; web=1; presses=(); pnach=(); card=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --frames) frames="$2"; shift ;;
@@ -41,6 +44,7 @@ while [ $# -gt 0 ]; do
     --native-only) web=0 ;;
     --pnach) pnach+=("$(realpath "$2")"); shift ;;
     --pnach-section) pnach=(--section "$2" "${pnach[@]}"); shift ;;
+    --card) card="$(realpath "$2")"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
@@ -138,6 +142,7 @@ if [ "$explore" = 1 ]; then
   for ((round = 1; round <= rounds; round++)); do
     build_native
     rm -f "$game/misses.txt" "$game/explore.ps2" "$game/explore_ram.bin"
+    [ -z "$card" ] || cp "$card" "$game/explore.ps2"
     PS2_DUMP="$game/explore_ram.bin" PS2_GPU_LOW_POWER=1 PS2_VU_RECORD="$game/vu1" "$native/ps2run" "$elf" --disc "$iso" --misses "$game/misses.txt" --memcard "$game/explore.ps2" \
       --frames "$frames" "${presses[@]}" --frames-dir "$game/shots" --frame-every 300 > "$game/explore.log" 2>&1 || true
     captured=0

@@ -162,7 +162,15 @@ application, so memory is not a constraint; this number is for the record.
   `{1, 0x006DAF70}` pairs, and the strings next to the object read
   `__builtin__::__projects__::BootProject::CourseData::ArcadeCo...`, so this
   is the game's script object system (the "adhoc" projects) dispatching a
-  method on an object whose class table is stale or freed. Retail GT4's
-  equivalent flow works, so the first Phase 1 task is to find which Spec II
-  project or data file the BootProject loads here and why its method table
-  is empty, with `--trace-io` and a watch on 0x00E39B64.
+  method on an object whose slot 9 holds nil. A write watch
+  (`PS2_WATCH=1FF6A80,10`) shows the nil was stored by the VM's own code
+  (0x4E9998), not by DMA or the runtime, so the script ran a lookup that
+  returned nil. The last plugin code to run before the crash is the mod's
+  module init (`mMyModule`, callbacks 0x68C710 / 0x68C758, registering a
+  native `GetHookSTDCVersion`), invoked from the game's module list walker
+  at 0x4DD370.
+- **With an existing Spec II save** (the user's `specii.ps2` from PCSX2) the
+  same build goes title → Arcade → car selection (744 cars) → a fully
+  rendered 3D car view, with no misses. So Spec II's engine, plugin and VU1
+  paths work; only the first-boot script path fails. `port.sh --card FILE`
+  (new) seeds exploring runs with such a card.
