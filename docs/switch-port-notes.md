@@ -226,8 +226,14 @@ real-time clock the game reads from the host (2124 bytes). The aarch64 build
 under `qemu-aarch64 -L /usr/aarch64-linux-gnu` produces **the same 12
 frames and the same RAM** as x86, apart from those same nine clock ranges.
 So EE, IOP, VU0 and the software GS are bit-exact across the two
-architectures over boot, intro and name entry. A race session (physics and
-VU1-heavy) is the next comparison.
+architectures over boot, intro and name entry.
+
+The same holds for a 6000-frame Spec II session from the title through the
+3D car view into the start of a Nürburgring race, with the 93 compiled VU1
+programs in use: all 20 frames identical and RAM identical except eight
+clock ranges (2112 bytes, one EE word and the rest in IOP memory). The
+Phase 2 determinism goal is met for everything exercised so far; a saved
+replay will extend it to a full lap of physics.
 
 ## 10. The GT-mode blocker (Phase 1)
 
