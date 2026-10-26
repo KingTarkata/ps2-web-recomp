@@ -248,3 +248,24 @@ at 0x01FC600C (a proper object, vtable 0x006A6A98) with the operand cell at
 cell rather than an object. Reading the mod's scripts is the next step:
 Nenkai's GTAdhocToolchain and GTVolTool (C#, .NET) can extract GT4.VOL and
 disassemble the `.adc` projects, which needs a .NET SDK in the VM.
+
+### GT-mode crash: findings so far
+
+- `scripts/gt4vol.py` (new) lists and extracts GT4.VOL, and Nenkai's
+  GTAdhocToolchain (built with .NET 10 under `refs/`) disassembles the
+  `.adc` scripts. The crashing code is `course_define.ad`, shared by the
+  unmodified GT4 Online boot project: `akasaka = ArcadeCourse("akasaka",
+  5116.7, 23.2, 1, 1, 1)` right after `class ArcadeCourse` is defined.
+- The VM's VARIABLE_EVAL handler (0x505010) resolves `ArcadeCourse` through
+  the scope lookup (0x4F44A8 → 0x4EF460 → map search 0x650408). Watches on
+  the output cell show the search visits two scopes and finds nothing, so
+  the handler continues with a nil result and calls through it.
+- The symbol table in RAM holds one `ArcadeCourse` record (id 0x0BA9, hash
+  0x2A4AFA79) while the instruction's operand refers to symbol 0x0E61, which
+  no record carries. Either the operand symbols are resolved through a
+  per-script table that is wrong, or interning produced two ids for one name.
+- Ruled out: the mod's plugin (same init on the working save path), DMA or
+  runtime writes into the objects (watches show only VM stores), compiler
+  optimisation (-O0 crashes identically), and the one opcode family only
+  this executable uses (its MMI string routines were checked against
+  `mmi.hpp` and look right).
