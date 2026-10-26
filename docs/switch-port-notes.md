@@ -139,6 +139,21 @@ application, so memory is not a constraint; this number is for the record.
   no missing IOP library and no rejected GS feature was logged.** The only
   new line is `dev9: unknown dev9 hardware.` from `DEV9.IRX`, which is the
   desired "no network adapter" outcome. Two VU1 microprograms were recorded.
-- Remaining Phase 0 gap: both retail and Spec II stop at name entry with the
-  default `--press` script, so exploration has not yet reached the 3D menus or
-  a race. Phase 1 starts with a press script that types a name.
+- **Headless input.** Upstream's default `--press` script cannot get past the
+  USA first-boot name entry, and the memory card format prompt defaults to
+  Cancel with timing that drifts between runs. `scripts/blank_card.py` writes
+  a formatted empty 8 MB card (PCSX2 layout, with ECC) so the prompt never
+  appears. Sequences that work on llvmpipe at 60 Hz:
+  - Retail: `300:start 600:cross 900:left 1200:cross 1500:right 1800:cross`
+    then `cross` every 300 frames. Reaches the title, Arcade mode and car
+    selection with 37 VU1 programs recorded and no misses.
+  - Spec II: `300:start 600:cross 900:cross 1200:cross 1500:up 1800:left
+    2100:cross 2400:right 2700:down 3000:cross` then `cross` every 300 frames
+    (the language screen comes first, and its keyboard has Caps/Sym keys).
+- **Blocker 2 (open):** with the blank card, Spec II accepts the name, creates
+  game data, shows the "Introduction" screen, reloads its IOP modules, and at
+  frame 5401 calls through a null virtual function:
+  `jalr` at 0x505070 reads a vtable slot `{adjust, fn}` at `*(obj+4) + 72`
+  with `fn == 0`, obj at 0x00E39B64. Retail GT4 goes through the same flow
+  without trouble, so this is specific to Spec II's executable or data.
+  Investigation continues in Phase 1 with a RAM dump at the halt.
