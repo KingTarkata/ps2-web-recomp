@@ -23,3 +23,22 @@ measured in a VM belongs here.
 |---|---|---|---|---|
 | 2026-10-26 | Intro and title, headless (no window) | 600-1100 | 23.81 | first run, default clocks |
 | 2026-10-26 | Nürburgring race, Pontiac Vibe GT, windowed, 3 threads | 6000-6500 | 103.84 | first run, default clocks, 86.8M primitives over 9000 frames |
+| 2026-10-26 | Race from saved state, windowed, 3 threads | 6050-6650 | 97.15 | baseline for the experiments below |
+| 2026-10-26 | same, headless (no window, no present) | 6050-6650 | 95.00 | presentation costs ~2 ms |
+| 2026-10-26 | same, `PS2_ONE_THREAD=1` | 6050-6650 | 97.34 | threading changes nothing: one serial bottleneck |
+| 2026-10-26 | same, `PS2_GPU_PROFILE` timestamps | 6050-6650 | 97.78 | GPU busy 67.3 ms/frame: raster 57.3, decode 4.7, load_clut 3.7, upload 1.7 |
+
+## Where the time goes (race, Nürburgring, native resolution)
+
+- **GPU-bound.** Timestamp queries put the GPU at 67 ms of the 97 ms frame,
+  57 ms of it in the compute rasterizer. The two frames profiled show the
+  heaviest batches are large-triangle passes ("over 16" and "over 1000" tile
+  coverage) on textured, depth-tested geometry, plus a long tail of 60 to 70
+  tiny sprite batches per frame.
+- **CPU mostly idle.** `top -H` during the race: the emulation thread at
+  about 62% of one core, every other thread near 0%, machine 77% idle. The
+  EE recompiled code and the ahead-of-time VU1 programs are not the limit.
+- GPU clock during these runs: 768 MHz (governor cap). The device offers
+  921.6 MHz; `jetson_clocks` pins everything at maximum and is the next
+  measurement.
+- Target is 16.7 ms, so the race is 5.8x short at native resolution.
