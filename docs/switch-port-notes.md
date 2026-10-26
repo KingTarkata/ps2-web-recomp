@@ -181,6 +181,13 @@ application, so memory is not a constraint; this number is for the record.
   `300:start 600:cross 900:cross 1200:cross 1500:cross 1800:cross 2100:cross
   2400:right 2550:right 2700:right 2850:right 3000:right 3150:cross` then
   `cross` every 300 frames.
+- The game data the crashed first-boot run wrote to the card is valid: a
+  second run booting from that card goes straight to the title and into
+  Arcade mode like the PCSX2 save does, and the directory layout and file
+  sizes match the PCSX2 card exactly (garage 1344064 bytes, GAMEDATA 237952,
+  icon0.ico 10704, icon.sys 964). So the memory card path round-trips and
+  the first-boot crash is confined to the script that runs once after game
+  data creation.
 - The plugin's module init runs identically on the saved-game path and the
   new-game path (probe comparison), so the mod's injected code is not what
   breaks the first-boot script.
