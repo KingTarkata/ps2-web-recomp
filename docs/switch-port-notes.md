@@ -199,7 +199,16 @@ application, so memory is not a constraint; this number is for the record.
 and records 93 VU1 programs, 14 of them jump targets, which `vurecomp`
 compiles into the build. Retail and Spec II both have zero misses over every
 run so far, so the static analysis already covers what the menus and a race
-execute.
+execute. Merging the programs recorded by the race runs (Nürburgring and
+High Speed Ring, `games/gt4specii/vu1/`) raises the compiled set to 103.
+
+**Completing a race headless** is not yet done: with the throttle held the
+car drives into the first wall and stays there (High Speed Ring, Original
+Circuits: `1500:right 1650:cross 1950:right 2100:cross 2400:cross 2700:cross
+3000:cross 3300..3900:right 4050:cross`, then `cross` every 300 and
+`6600:cross:25000`). It needs either a steering script per track or, better,
+a replay saved to the card in PCSX2 and played back from the title's Replay
+Theater, which also serves as the Phase 2 physics determinism test.
 
 ## 9. aarch64 build (Phase 2)
 
