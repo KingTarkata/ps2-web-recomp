@@ -26,6 +26,7 @@ measured in a VM belongs here.
 | 2026-10-26 | Race from saved state, windowed, 3 threads | 6050-6650 | 97.15 | baseline for the experiments below |
 | 2026-10-26 | same, headless (no window, no present) | 6050-6650 | 95.00 | presentation costs ~2 ms |
 | 2026-10-26 | same, `PS2_ONE_THREAD=1` | 6050-6650 | 97.34 | threading changes nothing: one serial bottleneck |
+| 2026-10-26 | same, after `jetson_clocks` (CPU pinned 1785 MHz, GPU still 768 MHz) | 6050-6650 | 97.48 | no change |
 | 2026-10-26 | same, `PS2_GPU_PROFILE` timestamps | 6050-6650 | 97.78 | GPU busy 67.3 ms/frame: raster 57.3, decode 4.7, load_clut 3.7, upload 1.7 |
 
 ## Where the time goes (race, Nürburgring, native resolution)
@@ -38,7 +39,11 @@ measured in a VM belongs here.
 - **CPU mostly idle.** `top -H` during the race: the emulation thread at
   about 62% of one core, every other thread near 0%, machine 77% idle. The
   EE recompiled code and the ahead-of-time VU1 programs are not the limit.
-- GPU clock during these runs: 768 MHz (governor cap). The device offers
-  921.6 MHz; `jetson_clocks` pins everything at maximum and is the next
-  measurement.
+- GPU clock during these runs: 768 MHz, which is Switchroot's power mode 0
+  "Console", the same GPU clock as Nintendo's docked mode. Mode 1 "Handheld"
+  caps the GPU at 460.8 MHz, so a handheld Horizon build would be ~1.6x
+  slower again. Mode 3 "OC_GPU" lets the GPU reach its 921.6 MHz top step
+  (an overclock past the official docked clock). `jetson_clocks` did not
+  raise the GPU above the mode's 768 MHz cap; with it pinned the race
+  measured 97.48 ms, unchanged.
 - Target is 16.7 ms, so the race is 5.8x short at native resolution.
