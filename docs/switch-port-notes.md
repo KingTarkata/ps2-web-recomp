@@ -191,3 +191,42 @@ application, so memory is not a constraint; this number is for the record.
 - The plugin's module init runs identically on the saved-game path and the
   new-game path (probe comparison), so the mod's injected code is not what
   breaks the first-boot script.
+
+## 8. Exploration with a save card
+
+`scripts/port.sh gt4specii <iso> --native-only --card specii.ps2 --frames
+9000 --press ...` (the race script from section 7) finds no new entry points
+and records 93 VU1 programs, 14 of them jump targets, which `vurecomp`
+compiles into the build. Retail and Spec II both have zero misses over every
+run so far, so the static analysis already covers what the menus and a race
+execute.
+
+## 9. aarch64 build (Phase 2)
+
+`cmake/aarch64-linux.cmake` cross-compiles with Ubuntu's clang and the
+`aarch64-linux-gnu` GCC sysroot. The runtime and retail GT4's 328 units
+compile without a single source change, with `-ffp-contract=off`. GCC
+cannot be used: `vu_ops.hpp` relies on clang's `__builtin_elementwise_min`
+and `__builtin_reduce_or`. The aarch64 release of wgpu-native goes in
+`third_party/wgpu-native-aarch64/` (git-ignored).
+
+Determinism check (`scripts/compare_runs.py`): two x86 runs of the same
+1200-frame retail session with the software renderer (`PS2_GS=soft`) give
+identical frames and RAM dumps apart from nine small ranges holding the
+real-time clock the game reads from the host (2124 bytes). The aarch64 build
+under `qemu-aarch64 -L /usr/aarch64-linux-gnu` produces the same frames as
+x86 as far as checked; the RAM comparison is pending.
+
+## 10. The GT-mode blocker (Phase 1)
+
+The first-boot crash is the same crash as entering Gran Turismo mode from
+the title with a valid save: `300:start 600:cross 900:down 1200:cross`
+halts at frame 1467 with the identical null call from 0x505070. Since GT
+mode holds the license tests, events and Spec II's missions, this is the
+Phase 1 blocker. Probes on the VM's lookup (0x4F44A8), call (0x505010) and
+assignment (0x4E9998) functions show the last call was made on the object
+at 0x01FC600C (a proper object, vtable 0x006A6A98) with the operand cell at
+0x00ED3E3C, and the value the lookup produced pointed at an operand-stack
+cell rather than an object. Reading the mod's scripts is the next step:
+Nenkai's GTAdhocToolchain and GTVolTool (C#, .NET) can extract GT4.VOL and
+disassemble the `.adc` projects, which needs a .NET SDK in the VM.
