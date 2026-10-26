@@ -214,8 +214,11 @@ Determinism check (`scripts/compare_runs.py`): two x86 runs of the same
 1200-frame retail session with the software renderer (`PS2_GS=soft`) give
 identical frames and RAM dumps apart from nine small ranges holding the
 real-time clock the game reads from the host (2124 bytes). The aarch64 build
-under `qemu-aarch64 -L /usr/aarch64-linux-gnu` produces the same frames as
-x86 as far as checked; the RAM comparison is pending.
+under `qemu-aarch64 -L /usr/aarch64-linux-gnu` produces **the same 12
+frames and the same RAM** as x86, apart from those same nine clock ranges.
+So EE, IOP, VU0 and the software GS are bit-exact across the two
+architectures over boot, intro and name entry. A race session (physics and
+VU1-heavy) is the next comparison.
 
 ## 10. The GT-mode blocker (Phase 1)
 
