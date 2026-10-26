@@ -156,4 +156,13 @@ application, so memory is not a constraint; this number is for the record.
   `jalr` at 0x505070 reads a vtable slot `{adjust, fn}` at `*(obj+4) + 72`
   with `fn == 0`, obj at 0x00E39B64. Retail GT4 goes through the same flow
   without trouble, so this is specific to Spec II's executable or data.
-  Investigation continues in Phase 1 with a RAM dump at the halt.
+  A RAM dump at the halt (`PS2_DUMP`) shows the object is not a C++ object
+  with a real vtable: `obj+4` points to 0x01FF6A40, near the top of RAM,
+  into a block holding `0xCCCCCCCC` fill words and repeated
+  `{1, 0x006DAF70}` pairs, and the strings next to the object read
+  `__builtin__::__projects__::BootProject::CourseData::ArcadeCo...`, so this
+  is the game's script object system (the "adhoc" projects) dispatching a
+  method on an object whose class table is stale or freed. Retail GT4's
+  equivalent flow works, so the first Phase 1 task is to find which Spec II
+  project or data file the BootProject loads here and why its method table
+  is empty, with `--trace-io` and a watch on 0x00E39B64.
