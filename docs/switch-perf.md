@@ -27,6 +27,7 @@ measured in a VM belongs here.
 | 2026-10-26 | same, headless (no window, no present) | 6050-6650 | 95.00 | presentation costs ~2 ms |
 | 2026-10-26 | same, `PS2_ONE_THREAD=1` | 6050-6650 | 97.34 | threading changes nothing: one serial bottleneck |
 | 2026-10-26 | same, after `jetson_clocks` (CPU pinned 1785 MHz, GPU still 768 MHz) | 6050-6650 | 97.48 | no change |
+| 2026-10-26 | same, power mode 3 "OC_GPU" (GPU 921.6 MHz) | 6050-6650 | 82.76 | GPU +20% clock gives -15% frame time: GPU-bound confirmed |
 | 2026-10-26 | same, `PS2_GPU_PROFILE` timestamps | 6050-6650 | 97.78 | GPU busy 67.3 ms/frame: raster 57.3, decode 4.7, load_clut 3.7, upload 1.7 |
 
 ## Where the time goes (race, Nürburgring, native resolution)
