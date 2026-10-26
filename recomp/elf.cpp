@@ -80,8 +80,13 @@ Image Image::raw(std::uint32_t address, std::vector<std::uint8_t> bytes, std::pa
     return image;
 }
 
+// Segments are applied in file order when the game loads, so where two
+// overlap the later one is what ends up in memory. Walk them backwards so a
+// lookup sees the same bytes the loader leaves. GT4 Spec II injects its own
+// code as a third segment inside the address range of the data segment.
 std::optional<std::uint32_t> Image::word(std::uint32_t address) const {
-    for (const auto &segment : segments_) {
+    for (auto it = segments_.rbegin(); it != segments_.rend(); ++it) {
+        const auto &segment = *it;
         if (address >= segment.address && address - segment.address + 4 <= segment.bytes.size()) {
             std::uint32_t value;
             std::memcpy(&value, segment.bytes.data() + (address - segment.address), 4);
@@ -94,9 +99,11 @@ std::optional<std::uint32_t> Image::word(std::uint32_t address) const {
 bool Image::executable(std::uint32_t address) const {
     // Zero-filled memory is data until the game loads code there. Translating its
     // initial zeroes would mask a fixed-address overlay loaded into that space.
-    for (const auto &segment : segments_)
-        if (segment.executable && address >= segment.address && address - segment.address < segment.initialized_size)
-            return true;
+    for (auto it = segments_.rbegin(); it != segments_.rend(); ++it) {
+        const auto &segment = *it;
+        if (address < segment.address || address - segment.address >= segment.bytes.size()) continue;
+        return segment.executable && address - segment.address < segment.initialized_size;
+    }
     return false;
 }
 
