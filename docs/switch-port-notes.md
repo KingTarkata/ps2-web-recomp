@@ -174,3 +174,13 @@ application, so memory is not a constraint; this number is for the record.
   rendered 3D car view, with no misses. So Spec II's engine, plugin and VU1
   paths work; only the first-boot script path fails. `port.sh --card FILE`
   (new) seeds exploring runs with such a card.
+- **Spec II races.** With the save card and this script the game reaches a
+  Single Race at the Nürburgring Nordschleife in a Pontiac Vibe GT, with the
+  driving-options dialog, the grid, and in-car and chase cameras all drawn
+  correctly, 77 VU1 programs recorded and no misses over 9000 frames:
+  `300:start 600:cross 900:cross 1200:cross 1500:cross 1800:cross 2100:cross
+  2400:right 2550:right 2700:right 2850:right 3000:right 3150:cross` then
+  `cross` every 300 frames.
+- The plugin's module init runs identically on the saved-game path and the
+  new-game path (probe comparison), so the mod's injected code is not what
+  breaks the first-boot script.
