@@ -17,7 +17,9 @@ class HwRaster {
 public:
     // `module` holds gs.wgsl + hw.wgsl; `set0` is the compute renderer's
     // buffer set layout, bound as set 0 of every pipeline here too.
-    bool init(Context &ctx, VkShaderModule module, VkDescriptorSetLayout set0, std::uint32_t scale);
+    // `code` is the SPIR-V of gs.wgsl + hw.wgsl (kHwSpvScaleN); the module is
+    // created here, so a driver that rejects it only costs the hardware path.
+    bool init(Context &ctx, const std::uint32_t *code, std::size_t words, VkDescriptorSetLayout set0, std::uint32_t scale);
     void destroy();
 
     // Called while recording a command buffer, before the device would

@@ -67,10 +67,18 @@ if(PS2_GS_VK AND NOT EMSCRIPTEN AND EXISTS "${PS2_VULKAN_HEADERS}/vulkan/vulkan.
     set(PS2_SPV_DIR "${CMAKE_BINARY_DIR}/spv")
     file(MAKE_DIRECTORY "${PS2_SPV_DIR}")
     set(PS2_SPV_SOURCES)
+    # Two modules per scale: the compute renderer's shaders alone, and those plus
+    # the graphics entry points of hw.wgsl, so a driver that dislikes the latter
+    # still runs the former.
     foreach(scale 1 2 3)
         set(out "${PS2_SPV_DIR}/gs_scale${scale}.cpp")
         add_custom_command(OUTPUT "${out}"
-            COMMAND ${CMAKE_COMMAND} -DNAGA=${PS2_NAGA} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DAPPEND=${CMAKE_SOURCE_DIR}/runtime/src/gs/vk/hw.wgsl -DOUT=${out} -DNAME=kGsSpvScale${scale} -DSCALE=${scale} -DWORK=${PS2_SPV_DIR} -P ${CMAKE_SOURCE_DIR}/cmake/wgsl_to_spv.cmake
+            COMMAND ${CMAKE_COMMAND} -DNAGA=${PS2_NAGA} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DOUT=${out} -DNAME=kGsSpvScale${scale} -DSCALE=${scale} -DWORK=${PS2_SPV_DIR} -P ${CMAKE_SOURCE_DIR}/cmake/wgsl_to_spv.cmake
+            DEPENDS runtime/src/gs/gpu/gs.wgsl cmake/wgsl_to_spv.cmake)
+        list(APPEND PS2_SPV_SOURCES "${out}")
+        set(out "${PS2_SPV_DIR}/hw_scale${scale}.cpp")
+        add_custom_command(OUTPUT "${out}"
+            COMMAND ${CMAKE_COMMAND} -DNAGA=${PS2_NAGA} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DAPPEND=${CMAKE_SOURCE_DIR}/runtime/src/gs/vk/hw.wgsl -DOUT=${out} -DNAME=kHwSpvScale${scale} -DSCALE=${scale} -DWORK=${PS2_SPV_DIR} -P ${CMAKE_SOURCE_DIR}/cmake/wgsl_to_spv.cmake
             DEPENDS runtime/src/gs/gpu/gs.wgsl runtime/src/gs/vk/hw.wgsl cmake/wgsl_to_spv.cmake)
         list(APPEND PS2_SPV_SOURCES "${out}")
     endforeach()

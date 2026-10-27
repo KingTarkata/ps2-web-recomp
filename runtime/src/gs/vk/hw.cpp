@@ -1,4 +1,5 @@
 #include "hw.hpp"
+#include "ps2/system.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -31,9 +32,17 @@ std::uint32_t z_at(std::uint32_t z0, float d) {
 
 }
 
-bool HwRaster::init(Context &ctx, VkShaderModule module, VkDescriptorSetLayout set0, std::uint32_t scale) {
+bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, VkDescriptorSetLayout set0, std::uint32_t scale) {
     ctx_ = &ctx;
     scale_ = scale;
+    VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mci.codeSize = words * 4;
+    mci.pCode = code;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(ctx.device, &mci, nullptr, &module) != VK_SUCCESS) {
+        std::fprintf(stderr, "[vk] the driver rejected the hardware raster shaders\n");
+        return false;
+    }
     VkDescriptorSetLayoutBinding b[4] = {};
     b[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -241,7 +250,9 @@ VkPipeline HwRaster::pipeline_for(const PipelineKey &key) {
     stages[1].pName = "hw_fs";
     const VkCompareOp ops[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
     VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    dss.depthTestEnable = key.with_depth && key.ztst != 1 ? VK_TRUE : VK_FALSE;
+    // Vulkan drops depth writes whenever the depth test is off, so a GS
+    // "always" test that still writes Z keeps the test on with COMPARE_OP_ALWAYS.
+    dss.depthTestEnable = key.with_depth ? VK_TRUE : VK_FALSE;
     dss.depthWriteEnable = key.with_depth && key.zwrite ? VK_TRUE : VK_FALSE;
     dss.depthCompareOp = ops[key.ztst & 3u];
     VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
@@ -457,9 +468,42 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
     const std::uint32_t *setups = nullptr;
     std::uint32_t zmode = 0;
-    if (!supported(cmd, arena, params, setups, zmode) || ((debug & 1u) && zmode)) {
+    bool blended = false, textured = false, fogged = false;
+    const bool ok = supported(cmd, arena, params, setups, zmode);
+    if (ok)
+        for (std::uint32_t i = 0; i < cmd.setups; ++i) {
+            blended = blended || (setups[i * kSetupWords] & F_ABE);
+            textured = textured || (setups[i * kSetupWords] & F_TME);
+            fogged = fogged || (setups[i * kSetupWords] & 4u);
+        }
+    // Debug bits: 1 skip depth batches, 256 skip blended, 512 skip textured, 1024 skip triangles.
+    bool triangles = false;
+    if (ok)
+        for (std::uint32_t i = 0; i < cmd.prims; ++i) triangles = triangles || (arena + (params + cmd.param * (gpu::kParamStride / 4))[1])[i * kPrimWords + 1] == 0;
+    if (debug & 2048u) {
+        std::uint32_t max_index = 0;
+        const std::uint32_t *pr = arena + (params + cmd.param * (gpu::kParamStride / 4))[1];
+        for (std::uint32_t i = 0; i < cmd.prims; ++i) max_index = std::max(max_index, pr[i * kPrimWords]);
+        std::fprintf(stderr, "[hw] decide f%llu prims %u setups %u max setup index %u debug %u blended %d textured %d triangles %d zmode %u ok %d flags", static_cast<unsigned long long>(frame_count()), cmd.prims, cmd.setups, max_index, debug, blended, textured, triangles, zmode, ok);
+        for (std::uint32_t i = 0; ok && i < cmd.setups; ++i) std::fprintf(stderr, " %04x", setups[i * kSetupWords]);
+        std::fprintf(stderr, "\n");
+    }
+    if (!ok || ((debug & 1u) && zmode) || ((debug & 256u) && blended) || ((debug & 512u) && textured) || ((debug & 1024u) && triangles) || ((debug & 4096u) && fogged)) {
         ++fallback_;
         return false;
+    }
+    // PS2_HW_ONLY=frame,count bisects a frame: the hardware path draws only
+    // the first `count` accepted batches of that frame, nothing elsewhere.
+    static unsigned long long only_frame = ~0ull, only_count = 0;
+    static const bool only = [] {
+        const char *spec = std::getenv("PS2_HW_ONLY");
+        return spec && std::sscanf(spec, "%llu,%llu", &only_frame, &only_count) == 2;
+    }();
+    if (only) {
+        static unsigned long long seen_frame = ~0ull, seen = 0;
+        if (frame_count() != only_frame) { ++fallback_; return false; }
+        if (seen_frame != only_frame) { seen_frame = only_frame; seen = 0; }
+        if (seen++ >= only_count) { ++fallback_; return false; }
     }
     FrameScratch &f = *frame_;
     const std::uint64_t need = static_cast<std::uint64_t>(cmd.prims) * 6 * sizeof(Vertex);
@@ -516,13 +560,29 @@ bool HwRaster::draw_part(VkCommandBuffer cb, const gpu::Command &cmd, VkDescript
         return false;
     }
     const std::uint32_t rw = (maxx - minx + 1) * scale_, rh = (maxy - miny + 1) * scale_;
-    static const bool trace = std::getenv("PS2_HW_TRACE") != nullptr;
-    if (trace) {
+    // PS2_HW_TRACE=from,to prints the batches drawn in that frame window.
+    static std::uint64_t trace_from = ~0ull, trace_to = 0;
+    static const bool trace = [] {
+        const char *spec = std::getenv("PS2_HW_TRACE");
+        if (!spec) return false;
+        unsigned long long a = 0, z = ~0ull;
+        if (std::sscanf(spec, "%llu,%llu", &a, &z) >= 1) { trace_from = a; trace_to = z; }
+        return true;
+    }();
+    if (trace && frame_count() >= trace_from && frame_count() < trace_to) {
         const std::uint32_t *w = setups + prims[0] * kSetupWords;
-        std::fprintf(stderr, "[hw] batch prims %u setups %u rect %u,%u-%u,%u flags %04x fpsm %02x fbmsk %08x zpsm %02x ztst %u zmsk %u z0 %08x kind %u scissor %u,%u-%u,%u xy %.1f,%.1f %.1fx%.1f\n", cmd.prims, cmd.setups,
+        std::fprintf(stderr, "[hw] f%llu batch prims %u setups %u rect %u,%u-%u,%u flags %04x fpsm %02x fbmsk %08x zpsm %02x ztst %u zmsk %u z0 %08x kind %u scissor %u,%u-%u,%u xy %.1f,%.1f %.1fx%.1f c0 %08x\n", static_cast<unsigned long long>(frame_count()), cmd.prims, cmd.setups,
                      minx, miny, maxx, maxy, w[0], w[3], w[4], w[6], (w[7] >> 8) & 3u, (w[0] & F_ZMSK) ? 1u : 0u, prims[24], prims[1],
-                     w[10] & 0xFFFFu, w[11] & 0xFFFFu, w[10] >> 16, w[11] >> 16, fat(prims[4]), fat(prims[5]), fat(prims[6]), fat(prims[7]));
+                     w[10] & 0xFFFFu, w[11] & 0xFFFFu, w[10] >> 16, w[11] >> 16, fat(prims[4]), fat(prims[5]), fat(prims[6]), fat(prims[7]), prims[12]);
         if (w[0] & F_TME) std::fprintf(stderr, "[hw]   tex0 %.1f,%.1f q %.3f tex1 %.1f,%.1f q %.3f color %08x tw %u th %u fst %u\n", fat(prims[15]), fat(prims[16]), fat(prims[17]), fat(prims[18]), fat(prims[19]), fat(prims[20]), prims[13], w[15] & 0xFFu, w[15] >> 8, (w[0] & 16u) ? 1u : 0u);
+        for (std::uint32_t i = 0; i < cmd.setups; ++i) {
+            const std::uint32_t *u = setups + i * kSetupWords;
+            std::fprintf(stderr, "[hw]   setup %u flags %04x fb %u/%u/%02x fbmsk %08x zb %u/%02x test %08x aref %u fix %u scissor %u,%u-%u,%u\n", i, u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10] & 0xFFFFu, u[11] & 0xFFFFu, u[10] >> 16, u[11] >> 16);
+        }
+        for (std::uint32_t i = 0; i < std::min(cmd.prims, 16u); ++i) {
+            const std::uint32_t *r = prims + i * kPrimWords;
+            std::fprintf(stderr, "[hw]   prim %u setup %u kind %u box %u,%u-%u,%u xy %.1f,%.1f %.1fx%.1f z %08x c %08x %08x\n", i, r[0], r[1], r[2] & 0xFFFFu, r[2] >> 16, r[3] & 0xFFFFu, r[3] >> 16, fat(r[4]), fat(r[5]), fat(r[6]), fat(r[7]), r[24], r[12], r[13]);
+        }
     }
     const bool with_depth = zmode != 0;
     const std::uint32_t first_setup = setup_offset;  // all setups share frame and depth buffers

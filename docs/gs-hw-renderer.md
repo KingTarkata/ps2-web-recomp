@@ -207,5 +207,21 @@ now. The runtime's queue and threads do not change.
 - Lessons: naga flips Y for Vulkan unless `--keep-coordinate-space`;
   descriptor bindings must name the graphics stages; llvmpipe crashed on a
   fragment-depth import draw, so depth moves through buffer/image copies.
-- Next: measure on the Switch; then page ownership so import/export only
-  run when memory and target disagree, which is where the time will be.
+- 2026-10-26, races: the first race frames through the hardware path were
+  wrong (sky and distant scenery black). Bisecting one frame batch by batch
+  (`PS2_HW_ONLY=frame,count`) led to the game's full-screen clear, which
+  writes Z through the "always" test: the pipeline mapped that to depth test
+  off with depth write on, and Vulkan drops depth writes whenever the test
+  is off, so Z memory kept the previous frame and everything behind it
+  failed. With the test kept on as COMPARE_OP_ALWAYS, 500 race frames from
+  a saved state match the compute renderer to within blend rounding: about
+  60k of 287k pixels differ by 1 or 2, and 15 to 25 pixels per frame by
+  more, all single pixels on triangle edges (fill-rule differences). The
+  Tegra driver also needs the compute shaders built from a module without
+  the graphics entry points (`kGsSpv` and `kHwSpv` are separate), depth is
+  exported with floor rather than round (coplanar greater-or-equal draws),
+  and the vertex shader clamps Z to the format's maximum as `plot` does.
+- Next: page ownership so import/export only run when memory and target
+  disagree, which is where the time will be; then the remaining fallbacks
+  (batches reading their own target, destination-alpha factors, DATE,
+  alpha-test fail modes, 16-bit frames, upscaling, lines and points).

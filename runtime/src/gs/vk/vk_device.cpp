@@ -19,6 +19,12 @@ extern const std::uint32_t kGsSpvScale2[];
 extern const std::size_t kGsSpvScale2_words;
 extern const std::uint32_t kGsSpvScale3[];
 extern const std::size_t kGsSpvScale3_words;
+extern const std::uint32_t kHwSpvScale1[];
+extern const std::size_t kHwSpvScale1_words;
+extern const std::uint32_t kHwSpvScale2[];
+extern const std::size_t kHwSpvScale2_words;
+extern const std::uint32_t kHwSpvScale3[];
+extern const std::size_t kHwSpvScale3_words;
 
 namespace ps2::gs::gpu {
 
@@ -281,7 +287,9 @@ bool VkDevice_::init(const Limits &limits, const std::vector<std::uint32_t> &tab
     ctx_.end_once(cb);
     write(gpu::Buffer::Tables, 0, tables.data(), tables.size() * 4);
     if (!build_pipelines(limits.scale)) return false;
-    hw_on_ = !std::getenv("PS2_HW_OFF") && hw_.init(ctx_, module_, layout_, limits.scale);
+    const std::uint32_t *hw_code = limits.scale == 2 ? kHwSpvScale2 : limits.scale == 3 ? kHwSpvScale3 : kHwSpvScale1;
+    const std::size_t hw_words = limits.scale == 2 ? kHwSpvScale2_words : limits.scale == 3 ? kHwSpvScale3_words : kHwSpvScale1_words;
+    hw_on_ = !std::getenv("PS2_HW_OFF") && hw_.init(ctx_, hw_code, hw_words, layout_, limits.scale);
     std::fprintf(stderr, "[gpu] %s via Vulkan (%s)\n", ctx_.name.c_str(), hw_on_ ? "hardware rasterizer with compute fallback" : "compute rasterizer only");
     return true;
 }

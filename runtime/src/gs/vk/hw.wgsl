@@ -53,7 +53,9 @@ fn hw_vs(v: VsIn) -> VsOut {
     // GS pixel centers are at integer coordinates; Vulkan's are at +0.5.
     let x = (v.pos.x + 0.5) / w * 2.0 - 1.0;
     let y = (v.pos.y + 0.5) / h * 2.0 - 1.0;
-    o.clip = vec4<f32>(x, y, f32(v.z) / 4294967296.0, 1.0);
+    // Z is clamped to the depth buffer format's maximum, as plot() does.
+    let s = load_setup(hw.setup);
+    o.clip = vec4<f32>(x, y, f32(min(v.z, s.zmax)) / 4294967296.0, 1.0);
     o.color = v.color;
     o.tex = v.tex;
     o.z_hi = v.z;
@@ -274,10 +276,13 @@ fn export_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     let y = ty / hw.scale;
     let k = (ty % hw.scale) * hw.scale + tx % hw.scale;
     let l = addr(s.zf, x, y);
+    // The rasterizer interpolates depth between integer vertex values; the
+    // GS keeps the integer part, so floor it back (round would lift half of
+    // the pixels by one and break greater-or-equal tests on coplanar draws).
     let d = bitcast<f32>(depth_stage[gid.y * hw.width + gid.x]);
     var z = 0xFFFFFFFFu;
     if (d < 1.0) {
-        z = u32(round(d * 4294967296.0));
+        z = u32(floor(d * 4294967296.0 + 0.001));
     }
     store(l, k, z & s.zmax);
 }
