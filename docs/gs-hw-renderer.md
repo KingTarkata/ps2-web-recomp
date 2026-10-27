@@ -456,3 +456,35 @@ round-trip), with the CLUT loads between them already reused. Then the 70
 block draws form one pass and the 70 tile draws another. That is the next
 GPU stage; its payoff is most of the 13.5 ms drain floor. DATE on the
 stencil buffer is the smaller, independent item.
+
+### 2026-10-28: scratch versioning tried, parked on branch `scratch-versioning`
+
+Built: every batch for another surface, and everything that depends on
+held work, is held; a list scheduler orders the held items at flush by
+page-indexed memory dependencies (version-aware), CLUT loads before
+textured batches, compute commands in order, batches extending the open
+pass first. A small 32-bit region that held batches overwrite whole
+(opaque sprites covering it) gets an image band per version in an atlas;
+readers view their band or have it exported to VRAM; the latest band is
+copied back into the surface at flush or when anything unversioned
+touches the region. Cacheable textures that a surface holds dirty are
+viewed instead of decoded.
+
+Measured on the Switch, race frame 6100: closes 231 -> 91 (the 70 strip
+pairs collapse as designed), GPU raster 31.5 -> 29.7 ms, main thread
++13 ms of bookkeeping (a std::sort on dependency lists alone is 19% of
+the thread), threaded 40-42 -> 52-57 ms. Correctness did not hold: native
+frames wrong and a crash in the resolve copy under llvmpipe (the flush
+hook re-entering a chain, fixed, then more), car pixels wrong on the
+Switch. Verdict: the pass-drain model over-predicted. 140 fewer passes
+bought about 2 ms, so the 13.5 ms floor with a trivial shader is mostly
+not pass drains; the candidates left are per-draw fixed costs (several
+pipeline and descriptor binds per setup, 230 batches with up to a few
+setups each) and the import/export dispatches around batches. The work
+stays on `scratch-versioning` (WIP commit with the full description);
+`switch-port` is back at the verified surface-view build.
+
+Next: the CPU side (GS front end 22 ms, device submit 29 ms on the main
+thread) and DATE on the stencil buffer; on the GPU side, measure the
+per-draw fixed cost directly (one batch, many setups) before building
+anything else on a model.
