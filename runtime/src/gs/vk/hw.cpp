@@ -1949,7 +1949,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     }
 
     // 2. Render pass: one draw per run of primitives sharing a setup.
-    if (!same_pass) {
+    if (!same_pass && !(debug & 268435456u)) {  // debug bit 28 (with bit 27): no render passes at all, the overhead outside them
         // The render area is the whole surface (it costs nothing on this
         // hardware, measured) so later batches of the pass fit anywhere in it.
         VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -2011,7 +2011,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
             const std::int32_t ax0 = rbi.renderArea.offset.x, ay0 = rbi.renderArea.offset.y;
             const std::int32_t ax1 = ax0 + static_cast<std::int32_t>(rbi.renderArea.extent.width), ay1 = ay0 + static_cast<std::int32_t>(rbi.renderArea.extent.height);
             const std::int32_t x0 = std::max(sx0, ax0), y0 = std::max(sy0, ay0), x1 = std::min(sx1, ax1), y1 = std::min(sy1, ay1);
-            if (x0 >= x1 || y0 >= y1) {
+            if (x0 >= x1 || y0 >= y1 || (debug & 134217728u)) {  // debug bit 27: record everything but the draws (fixed-cost measurement)
                 skip_draw = true;
             } else {
                 const VkRect2D sc{{x0, y0}, {static_cast<std::uint32_t>(x1 - x0), static_cast<std::uint32_t>(y1 - y0)}};

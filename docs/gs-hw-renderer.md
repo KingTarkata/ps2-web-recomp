@@ -613,3 +613,48 @@ ms/frame: with GPU time at about 41 ms the main thread is no longer the
 limit, so the GPU side (per-draw fixed cost measured directly) is the
 next lever; on the CPU side the upload copy and the present path are
 what is left of any size.
+
+### 2026-10-27: the hardware path's fixed cost, measured directly
+
+Two measurement knobs: `PS2_HW_DEBUG` bit 27 (134217728) records every
+batch as usual but issues no draw calls; bit 28 (268435456, with 27)
+also begins no render passes. GPU profile, race frames 6050-6650, the
+hardware-raster brackets (which include the imports, write-backs, decodes
+and copies around each batch):
+
+| run | raster-hw ms/frame | total ms/frame |
+|---|---|---|
+| full | 33.9 | 44.6 |
+| no draws (bit 27) | 18.1 | 27.5 |
+| no draws, no copies (27 + 32768) | 8.6 | 18.7 |
+| no draws, never re-decode (27 + 131072) | 12.9 | 22.4 |
+| no draws, no render passes (27 + 28) | 12.3 | 21.7 |
+
+So of the 34 ms, about 16 ms is the draws themselves and 18 ms is
+overhead, of which the import/export dispatches (`copy_rects`) are 9.4
+ms, texture re-decodes about 5 ms and the render-pass begin/end (213
+per frame) about 6 ms, overlapping. The 17.8 ms "trivial shader floor"
+measured earlier was this overhead, not pass drains.
+
+Where the copies come from (`PS2_HW_TRACE=6100,6102`, frame 6100):
+6.9 Mpx moved per frame, 24 screens' worth: depth 2240/10/31 exported
+988 kpx in 62 rectangles and imported 627 kpx; frame 6720/10/00 exported
+586 kpx and imported 395 kpx; the frame's 24-bit aliases 4480/10/01 and
+2240/10/01 imported 942 kpx; the 256-wide scratch 11200/4/00 imported
+309 kpx. Write-backs by cause: 71 for CLUT loads (the post-process chain
+reads the frame as a palette source), 26 for compute-drawn (DATE)
+batches, 4 for uploads. With the parked hardware-DATE patch the DATE
+write-backs disappear but only 0.8 Mpx with them (6.1 Mpx left): the
+depth buffer at 2240 aliases the frame's 24-bit lower half 2240/10/01
+that the post-process reads, so the depth surface still round-trips
+(627 kpx in, 586 kpx out) every frame, and the CLUT-load write-backs of
+the frame stay.
+
+Next GPU work, in order of expected payoff: (1) the 71 CLUT-load
+write-backs per frame, by reading the palette from the surface image
+(a CLUT load from a resident surface, like a surface view) instead of
+writing the frame back; (2) the depth 2240 / frame 2240 aliasing, by
+answering the 24-bit frame reads from the depth image or keeping the
+two coherent without a full export; (3) cheaper import/export shaders
+(they cost about 1.4 ms per Mpx); (4) fewer passes once the copies
+between batches are gone, since every copy closes the pass.
