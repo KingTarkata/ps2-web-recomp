@@ -539,7 +539,7 @@ void flush_batch() {
     const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi});
     note_raster(prims, tiles, total, snapshot);
-    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
+    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param, prims, static_cast<std::uint32_t>(b.setups.size() / kSetupWords)});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     b.prims.clear();
@@ -1225,6 +1225,7 @@ void stats() {
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
+    if (g_dev) g_dev->stats();
 }
 
 bool attach_surface(const SurfaceTarget &target) {

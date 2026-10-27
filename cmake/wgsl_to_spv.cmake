@@ -3,11 +3,17 @@
 # the caller passes SCALE and the source is rewritten to a constant first.
 #   cmake -DNAGA=... -DSRC=gs.wgsl -DOUT=gs_scale2.cpp -DNAME=kGsSpvScale2 -DSCALE=2 -DWORK=dir -P wgsl_to_spv.cmake
 file(READ "${SRC}" wgsl)
+if(APPEND)
+    file(READ "${APPEND}" extra)
+    string(APPEND wgsl "\n" "${extra}")
+endif()
 if(SCALE)
     string(REPLACE "override SCALE: u32 = 1u;" "const SCALE: u32 = ${SCALE}u;" wgsl "${wgsl}")
 endif()
 file(WRITE "${WORK}/${NAME}.wgsl" "${wgsl}")
-execute_process(COMMAND "${NAGA}" "${WORK}/${NAME}.wgsl" "${WORK}/${NAME}.spv" RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+# WGSL's clip space has +y up; naga flips it for Vulkan unless told not to. The
+# graphics shaders in hw.wgsl are written for Vulkan's own convention.
+execute_process(COMMAND "${NAGA}" --keep-coordinate-space "${WORK}/${NAME}.wgsl" "${WORK}/${NAME}.spv" RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)
     message(FATAL_ERROR "naga failed on ${SRC}: ${out} ${err}")
 endif()

@@ -5,10 +5,12 @@
 // share these buffers.
 #include "../gpu/device.hpp"
 #include "context.hpp"
+#include "hw.hpp"
 #include "ps2/system.hpp"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 extern const std::uint32_t kGsSpvScale1[];
@@ -46,6 +48,12 @@ struct ReadSlot {
 
 class VkDevice_ final : public Device {
 public:
+    void stats() override {
+        if (hw_on_)
+            std::fprintf(stderr, "[vk] hardware raster: %llu batches drawn, %llu through the compute rasterizer\n", static_cast<unsigned long long>(hw_.drawn_batches()),
+                         static_cast<unsigned long long>(hw_.fallback_batches()));
+        if (hw_on_) hw_.print_reasons();
+    }
     bool init(const Limits &limits, const std::vector<std::uint32_t> &tables) override;
     bool timestamps() const override { return ctx_.has_timestamps; }
     void write(gpu::Buffer b, std::uint64_t offset, const void *data, std::uint64_t bytes) override;
@@ -85,10 +93,12 @@ private:
     bool ensure_frame_capacity(Frame &f, std::size_t param_bytes, std::size_t arena_words);
     void write_descriptors(Frame &f);
     void wait_frame(Frame &f);
-    void record(VkCommandBuffer cb, const std::vector<Command> &commands, Frame &f, VkQueryPool queries, std::uint32_t base, bool per_command);
+    void record(VkCommandBuffer cb, const std::vector<Command> &commands, Frame &f, VkQueryPool queries, std::uint32_t base, bool per_command, const std::uint32_t *arena, const void *params);
     bool copy_once(VkBuffer src, std::uint64_t src_offset, VkBuffer dst, std::uint64_t dst_offset, std::uint64_t bytes, VkFence fence, VkCommandBuffer &cb);
 
     Context ctx_;
+    vk::HwRaster hw_;
+    bool hw_on_ = false;
     Buffer vram_, tables_, clut_, scratch_, cache_, decoded_, readback_, staging_;
     VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
@@ -147,7 +157,8 @@ bool VkDevice_::build_pipelines(std::uint32_t scale) {
         bindings[i].binding = i;
         bindings[i].descriptorType = i == 2 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        // The hardware raster's vertex and fragment shaders read these buffers too.
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     lci.bindingCount = 8;
@@ -270,7 +281,8 @@ bool VkDevice_::init(const Limits &limits, const std::vector<std::uint32_t> &tab
     ctx_.end_once(cb);
     write(gpu::Buffer::Tables, 0, tables.data(), tables.size() * 4);
     if (!build_pipelines(limits.scale)) return false;
-    std::fprintf(stderr, "[gpu] %s via Vulkan (hardware backend, compute parity stage)\n", ctx_.name.c_str());
+    hw_on_ = !std::getenv("PS2_HW_OFF") && hw_.init(ctx_, module_, layout_, limits.scale);
+    std::fprintf(stderr, "[gpu] %s via Vulkan (%s)\n", ctx_.name.c_str(), hw_on_ ? "hardware rasterizer with compute fallback" : "compute rasterizer only");
     return true;
 }
 
@@ -300,7 +312,7 @@ void VkDevice_::write(gpu::Buffer b, std::uint64_t offset, const void *data, std
     }
 }
 
-void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands, Frame &f, VkQueryPool queries, std::uint32_t base, bool per_command) {
+void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands, Frame &f, VkQueryPool queries, std::uint32_t base, bool per_command, const std::uint32_t *arena, const void *params) {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk::vkBeginCommandBuffer(cb, &bi);
@@ -318,10 +330,16 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
     // Vulkan needs a barrier between every pair for the same guarantee.
     VkMemoryBarrier between{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     between.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    between.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    between.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT;
+    const VkPipelineStageFlags shader_stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     Pipeline current = kPipelines;
     for (std::uint32_t i = 0; i < commands.size(); ++i) {
         const Command &c = commands[i];
+        if (c.pipeline == kRaster && hw_on_ && hw_.draw(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), f.data.buffer)) {
+            current = kPipelines;  // the draw rebinds compute pipelines
+            vk::vkCmdPipelineBarrier(cb, shader_stages, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
+            continue;
+        }
         if (c.pipeline != current) {
             vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[c.pipeline]);
             current = c.pipeline;
@@ -330,7 +348,7 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
         vk::vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &f.set, 1, &offset);
         if (queries && per_command && i < n) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, i * 2);
         vk::vkCmdDispatch(cb, c.x, c.y, 1);
-        vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &between, 0, nullptr, 0, nullptr);
+        vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
         if (queries && per_command && i < n) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
     }
     if (queries && !per_command) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, base + 1);
@@ -362,7 +380,8 @@ void VkDevice_::submit(const std::vector<Command> &commands, const void *params,
     std::memcpy(f.data.mapped, arena, arena_words * 4);
     std::memcpy(f.params.mapped, params, param_bytes);
     const bool measure = queries_ && !query_pending_;
-    record(f.cb, commands, f, measure ? queries_ : VK_NULL_HANDLE, static_cast<std::uint32_t>(frame_) * 2, false);
+    hw_.begin_frame(frame_);
+    record(f.cb, commands, f, measure ? queries_ : VK_NULL_HANDLE, static_cast<std::uint32_t>(frame_) * 2, false, arena, params);
     if (measure) {
         query_pending_ = true;
         query_frame_ = frame_;
@@ -394,7 +413,8 @@ void VkDevice_::submit_profiled(const std::vector<Command> &commands, const void
     if (!ensure_frame_capacity(f, param_bytes, arena_words)) return;
     std::memcpy(f.data.mapped, arena, arena_words * 4);
     std::memcpy(f.params.mapped, params, param_bytes);
-    record(f.cb, commands, f, profile_queries_, 0, true);
+    hw_.begin_frame(frame_);
+    record(f.cb, commands, f, profile_queries_, 0, true, arena, params);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &f.cb;
