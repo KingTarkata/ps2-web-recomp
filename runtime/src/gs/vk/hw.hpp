@@ -150,6 +150,10 @@ private:
         bool depth = false;
         Image image;
         std::uint32_t width = 0, height = 0;  // GS pixels
+        // The GS memory the image covers and its page geometry, set with the
+        // size: the span tests run per surface for every command.
+        std::uint64_t mem_lo = 0, mem_hi = 0;
+        std::uint32_t per_row = 1, pw = 64, ph = 32;
         Plane plane;
         VkDescriptorSet set1[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};  // per frame slot
         VkDescriptorSet set2 = VK_NULL_HANDLE;                        // the surface as a texture
@@ -319,6 +323,18 @@ private:
     std::uint64_t submits_ = 0, use_counter_ = 0;
     FrameScratch frames_[2];
     FrameScratch *frame_ = nullptr;
+    // The surfaces' keys and memory bounds side by side: the per-command span
+    // tests and lookups walk all surfaces, and the Surface objects (tile maps
+    // included) are too large to walk by pointer without a cache miss each.
+    struct Bound {
+        std::uint64_t lo, hi;
+        std::uint32_t bp, bw, psm;
+        bool depth;
+        Surface *s;
+    };
+    std::vector<Bound> bounds_;
+    bool bounds_dirty_ = true;
+    const std::vector<Bound> &bounds();
     int slot_ = 0;
     VkCommandBuffer pass_cb_ = VK_NULL_HANDLE;  // the open render pass, if any
     std::function<void()> pass_closed_hook_;

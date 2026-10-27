@@ -793,9 +793,18 @@ void HwRaster::append_prims(FrameScratch &f, const std::uint32_t *prims, std::ui
 
 // ---- Surfaces --------------------------------------------------------------
 
+const std::vector<HwRaster::Bound> &HwRaster::bounds() {
+    if (bounds_dirty_) {
+        bounds_.clear();
+        for (auto &s : surfaces_) bounds_.push_back({s->width ? s->mem_lo : 0, s->width ? s->mem_hi : 0, s->bp, s->bw, s->psm, s->depth, s.get()});
+        bounds_dirty_ = false;
+    }
+    return bounds_;
+}
+
 HwRaster::Surface *HwRaster::find_surface(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, bool depth) {
-    for (auto &s : surfaces_)
-        if (s->bp == bp && s->bw == bw && s->psm == psm && s->depth == depth) return s.get();
+    for (const Bound &b : bounds())
+        if (b.bp == bp && b.bw == bw && b.psm == psm && b.depth == depth) return b.s;
     return nullptr;
 }
 
@@ -807,6 +816,11 @@ bool HwRaster::allocate(Surface &s, std::uint32_t width, std::uint32_t height) {
         return false;
     s.width = width;
     s.height = height;
+    page_size(s.psm, s.pw, s.ph);
+    s.per_row = std::max<std::uint32_t>(1, s.bw * 64 / s.pw);
+    s.mem_lo = static_cast<std::uint64_t>(s.bp) * 256;
+    s.mem_hi = std::min<std::uint64_t>(s.mem_lo + (s.height + s.ph - 1) / s.ph * static_cast<std::uint64_t>(s.per_row) * 8192, kMemoryBytes);
+    bounds_dirty_ = true;
     // The image lives in GENERAL layout for its whole life.
     VkCommandBuffer cb = ctx_->begin_once();
     VkImageMemoryBarrier bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -880,6 +894,7 @@ void HwRaster::retire(Surface &s) {
     s.image = Image{};
     s.set1[0] = s.set1[1] = VK_NULL_HANDLE;
     s.width = s.height = 0;
+    bounds_dirty_ = true;
     s.plane.reset();
 }
 
@@ -898,9 +913,11 @@ HwRaster::Surface *HwRaster::surface_for(VkCommandBuffer cb, VkDescriptorSet set
             write_back(cb, set0, v, Rect{0, 0, kTargetSize - 1, kTargetSize - 1});
             retire(v);
             surfaces_.erase(surfaces_.begin() + static_cast<std::ptrdiff_t>(victim));
+            bounds_dirty_ = true;
             ++evictions_;
         }
         surfaces_.push_back(std::make_unique<Surface>());
+        bounds_dirty_ = true;
         s = surfaces_.back().get();
         s->bp = bp;
         s->bw = bw;
@@ -951,12 +968,10 @@ VkFramebuffer HwRaster::framebuffer_for(const Surface &color, const Surface *dep
 // that a memory span touches, conservatively.
 bool HwRaster::span_rect(const Surface &s, const gpu::Span &span, Rect &out) const {
     if (span.hi <= span.lo || !s.width) return false;
-    std::uint32_t pw, ph;
-    page_size(s.psm, pw, ph);
-    const std::uint64_t per_row = std::max<std::uint32_t>(1, s.bw * 64 / pw);
-    const std::uint64_t base = static_cast<std::uint64_t>(s.bp) * 256;
-    const std::uint64_t end = std::min<std::uint64_t>(base + (s.height + ph - 1) / ph * per_row * 8192, kMemoryBytes);
+    const std::uint64_t base = s.mem_lo, end = s.mem_hi;
     if (span.hi <= base || span.lo >= end) return false;
+    const std::uint32_t pw = s.pw, ph = s.ph;
+    const std::uint64_t per_row = s.per_row;
     const std::uint64_t p0 = (std::max<std::uint64_t>(span.lo, base) - base) / 8192, p1 = (std::min<std::uint64_t>(span.hi, end) - 1 - base) / 8192;
     out.y0 = static_cast<std::uint32_t>(p0 / per_row * ph);
     out.y1 = std::min<std::uint32_t>(static_cast<std::uint32_t>((p1 / per_row + 1) * ph) - 1, s.height - 1);
@@ -1152,19 +1167,23 @@ void HwRaster::mark_dirty(Surface &s, const Rect &rect) {
 }
 
 void HwRaster::memory_read(VkCommandBuffer cb, VkDescriptorSet set0, const gpu::Span &span, const Surface *except) {
+    if (span.hi <= span.lo) return;
     Rect r;
-    for (auto &s : surfaces_)
-        if (s.get() != except && span_rect(*s, span, r)) write_back(cb, set0, *s, r);
+    const std::vector<Bound> &bs = bounds();  // write_back retires nothing, so the table stays valid
+    for (const Bound &b : bs)
+        if (b.s != except && span.hi > b.lo && span.lo < b.hi && span_rect(*b.s, span, r)) write_back(cb, set0, *b.s, r);
 }
 
 void HwRaster::memory_written(VkCommandBuffer cb, VkDescriptorSet set0, const gpu::Span &span, const Surface *except_a, const Surface *except_b) {
     tex_drop_cause_ = 0;
     if (!keep_textures_) textures_written(span);
+    if (span.hi <= span.lo) return;
     Rect r;
-    for (auto &s : surfaces_)
-        if (s.get() != except_a && s.get() != except_b && span_rect(*s, span, r)) {
-            write_back(cb, set0, *s, r);
-            invalidate(*s, r);
+    const std::vector<Bound> &bs = bounds();
+    for (const Bound &b : bs)
+        if (b.s != except_a && b.s != except_b && span.hi > b.lo && span.lo < b.hi && span_rect(*b.s, span, r)) {
+            write_back(cb, set0, *b.s, r);
+            invalidate(*b.s, r);
         }
 }
 
@@ -1287,7 +1306,7 @@ void HwRaster::before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDes
 void HwRaster::flush_sync(VkDescriptorSet set0, const gpu::Span &span) {
     bool hit = false;
     Rect r;
-    for (auto &s : surfaces_) hit = hit || (s->plane.dirty_count && span_rect(*s, span, r));
+    for (const Bound &b : bounds()) hit = hit || (span.hi > b.lo && span.lo < b.hi && b.s->plane.dirty_count && span_rect(*b.s, span, r));
     if (!hit) return;
     VkCommandBuffer cb = ctx_->begin_once();
     memory_read(cb, set0, span);
@@ -2127,6 +2146,7 @@ void HwRaster::destroy() {
     }
     for (auto &s : surfaces_) ctx_->destroy_image(s->image);
     surfaces_.clear();
+    bounds_dirty_ = true;
     ctx_->destroy_buffer(depth_stage_);
     ctx_->destroy_image(dummy_);
     for (FrameScratch &f : frames_) {

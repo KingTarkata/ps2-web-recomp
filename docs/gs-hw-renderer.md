@@ -538,3 +538,17 @@ uploads into the arena 8.3%, SDL present copy 4%, read-back copy 2%),
 gpu::draw 5.7%, load_clut 5% (1059 calls/frame), write_packed 4.9%,
 gif::render 4.9%, memory_written 4.1%, gs::write 3.6%, copy_frame 3%,
 kick 2.3%. GPU time is about 41 ms, so the thread is at parity now.
+
+### 2026-10-27: surface bounds table
+
+`memory_written`, `memory_read` and `find_surface` walk all resident
+surfaces for every command and draw; each Surface carries its tile maps,
+so walking them by pointer was a cache miss per surface (perf: 40% of
+memory_written on the loads of the surface pointer and its width). The
+surfaces' keys and memory bounds now live in a compact table
+(`bounds()`, rebuilt lazily when a surface is allocated, retired or
+evicted) and the span tests reject on the bounds before `span_rect`.
+Switch: device record 13.1 -> 12.7 ms, threaded race 36-38.9 ms/frame;
+frames identical natively and on the Switch. What is left in
+memory_written is `textures_written` filling `block_ids_` over the
+written span (256-byte granularity), about 1 ms per frame.
