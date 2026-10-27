@@ -587,3 +587,29 @@ a snapshot copy and surface imports ("import-source" closes 761 ->
 `private/notes/date-hw-experiment-2026-10-27.patch`; the stencil form
 would have the same per-batch structure. Not worth it until the
 per-batch fixed cost of the hardware path itself comes down.
+
+### 2026-10-27: GS front end, first pass (shared code, with the user's go-ahead)
+
+perf with instruction context on the Switch main thread:
+
+- `write()` and `write_packed()`: a quarter of each was the
+  initialisation guard of a function-local `static const char *seq =
+  getenv(...)`, an acquire load (`ldarb`) per register write on the A57,
+  plus the load of the pointer. One namespace-scope constant now
+  (c01dd38): write_packed 5.9 -> 2.8%, gs::write out of the top ten.
+- `gif::render` (5%): half of it is the 16-byte load of each packet
+  qword from the render-queue ring, written by the EE thread (cross-core
+  lines). A software prefetch eight qwords ahead changed nothing
+  measurable (4.6 -> 4.3%), reverted.
+- `gpu::draw` (4-6%): spread over the per-primitive float work and the
+  setup cache; no single hot spot.
+- `kick` (2.5%): call overhead and the vertex queue shuffles.
+
+The remaining main-thread profile: memcpy 17-20% (texture uploads into
+the arena 8%, SDL present 4%, read-back 2%), gpu::draw 6%, gif::render
+4.6%, memory_written 3% (block-id fill), copy_frame 3%, kick 2.7%,
+load_clut 2.5%, append_prims 2.5%. Threaded race unchanged at 36-39
+ms/frame: with GPU time at about 41 ms the main thread is no longer the
+limit, so the GPU side (per-draw fixed cost measured directly) is the
+next lever; on the CPU side the upload copy and the present path are
+what is left of any size.
