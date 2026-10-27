@@ -552,3 +552,14 @@ Switch: device record 13.1 -> 12.7 ms, threaded race 36-38.9 ms/frame;
 frames identical natively and on the Switch. What is left in
 memory_written is `textures_written` filling `block_ids_` over the
 written span (256-byte granularity), about 1 ms per frame.
+
+### 2026-10-27: CLUT load bookkeeping in direct-mapped tables
+
+`load_clut` runs about 1059 times per race frame and was 3.2 ms of the
+main thread; perf put half of it in the std::map walk naming the
+palette source and the two hash probes of the result memo. The source
+map now has a 256-entry direct-mapped cache in front and a packed
+64-bit key; the memo is a 4096-entry direct-mapped table (a lost entry
+only re-emits a load; reuse 187058 -> 186899 over the run). load_clut
+3.2 -> 2.4 ms per frame; frames identical. A "same result already in
+the current slot" shortcut was tried first and bought nothing.

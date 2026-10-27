@@ -86,5 +86,6 @@ second). On the Switch over SSH: `DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority
 | 2026-10-27 | same, threaded, hardware path after the render-thread work (texture key index and LRU list, cell-grid validity, dirty counters, arena built in mapped memory) | 41-42.5 | main thread was the limit at 98% of a core; now about 50 ms of work per frame there against 41.6 ms of GPU time |
 | 2026-10-27 | same, threaded, hardware path with batches promised to the hardware path skipping the compute tile lists, decode plans and snapshots | 38-42 | main thread flush_batch+emit_all 6-8 -> 2.6 ms; 0 batches lost (descriptor pool enlarged for the race-start surface churn); CPU and GPU now both near 41 ms |
 | 2026-10-27 | same, threaded, hardware path with the vertex/uniform scratch in host-cached memory | 36.4-39.5 | append_prims 8 -> 1.8% of the main thread; CPU 184-214% |
+| 2026-10-27 | same, threaded, hardware path with the surface bounds table and direct-mapped CLUT tables | 35.8-38.6 | device record 12.4 ms, load_clut 2.4 ms per frame; main thread and GPU (~41 ms) now at parity |
 
 Mode 0 "Console" (768 MHz GPU) throughout. Target remains 16.7 ms.

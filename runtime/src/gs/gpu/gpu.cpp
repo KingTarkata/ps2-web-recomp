@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <array>
-#include <map>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -48,7 +47,7 @@ std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1
 
 std::uint32_t g_decoded_used = 0;
 bool g_rendered[512] = {};
-std::uint64_t g_uploads = 0, g_upload_bytes = 0, g_hardware_batches = 0;  // batches emitted without compute tile lists
+std::uint64_t g_uploads = 0, g_upload_bytes = 0, g_upload_bytes_window = 0, g_hardware_batches = 0;  // batches emitted without compute tile lists
 bool g_decode = true;
 struct CommandInfo {
     std::size_t index;
@@ -110,14 +109,27 @@ std::uint32_t g_clut_slot = 0, g_clut_loads = 0, g_texflushes = 0;
 std::uint64_t g_page_gen[512] = {};
 std::uint64_t g_slot_key[kClutSlots] = {};
 std::array<std::uint64_t, 32> g_slot_chunks[kClutSlots] = {};  // a slot's 512 entries as 32 chunks of 16, each identified by the load that last wrote it
-std::unordered_map<std::uint64_t, std::uint32_t> g_clut_memo;
+// Result identity -> slot holding it, a direct-mapped table: a lost entry
+// only costs a re-emission, and the lookup runs 1000 times a frame.
+struct ClutMemo {
+    std::uint64_t key = 0;
+    std::uint32_t slot = 0;
+};
+constexpr std::uint32_t kClutMemoSize = 4096;
+ClutMemo g_clut_memo[kClutMemoSize];
+inline ClutMemo &clut_memo(std::uint64_t key) { return g_clut_memo[(key ^ (key >> 29) ^ (key >> 47)) & (kClutMemoSize - 1)]; }
 std::uint64_t g_clut_reused = 0, g_clut_emitted = 0;
 std::uint32_t g_clut_next = 1;  // the ring position the next emitted load writes (independent of the current slot, which a reuse may point back)
 // Slots handed out by a reuse this submit: setups already built reference
 // them, so no load emitted before the submit may overwrite them.
 std::vector<std::uint8_t> g_slot_pinned(kClutSlots, 0);
 std::vector<std::uint32_t> g_pinned_slots;
-std::map<std::array<std::uint32_t, 6>, std::uint32_t> g_clut_sources;  // (cbp, cbw, cpsm, csm, cou, cov) -> id, for texture caches
+std::unordered_map<std::uint64_t, std::uint32_t> g_clut_sources;  // packed (cbp, cbw, cpsm, csm, cou, cov) -> id, for texture caches
+struct ClutSourceCache {
+    std::uint64_t key = ~0ull;
+    std::uint32_t id = 0;
+};
+ClutSourceCache g_clut_source_cache[256];  // in front of the map: the same few palettes recur
 std::uint32_t g_clut_source_id = 0;  // of the latest load
 
 struct Image {
@@ -770,6 +782,7 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     if (!source) {
         offset = arena_append(bytes, n);
         g_upload_bytes += n;
+        if (cpu_timers::active()) g_upload_bytes_window += n;
     }
     const std::uint32_t rec[11] = {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, lead_bits, im.bpp | source};
     std::memcpy(op.rec, rec, sizeof rec);
@@ -1319,13 +1332,18 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     // The source id names the palette's memory for the texture caches; it
     // is set whether the load is emitted or a slot is reused.
     {
-        const std::array<std::uint32_t, 6> source{cbp, cbw, cpsm, csm, cou, cov};
-        auto it = g_clut_sources.find(source);
-        if (it == g_clut_sources.end()) {
-            it = g_clut_sources.emplace(source, static_cast<std::uint32_t>(g_clut_sources.size() + 1)).first;
-            g_dev->clut_source(it->second, span_of(op.range));
+        const std::uint64_t source = static_cast<std::uint64_t>(cbp) | static_cast<std::uint64_t>(cbw) << 14 | static_cast<std::uint64_t>(cpsm) << 20 | static_cast<std::uint64_t>(csm) << 26 | static_cast<std::uint64_t>(cou) << 27 | static_cast<std::uint64_t>(cov) << 33;
+        ClutSourceCache &c = g_clut_source_cache[(source ^ (source >> 14) ^ (source >> 27)) & 255u];
+        if (c.key != source) {
+            auto it = g_clut_sources.find(source);
+            if (it == g_clut_sources.end()) {
+                it = g_clut_sources.emplace(source, static_cast<std::uint32_t>(g_clut_sources.size() + 1)).first;
+                g_dev->clut_source(it->second, span_of(op.range));
+            }
+            c.key = source;
+            c.id = it->second;
         }
-        g_clut_source_id = it->second;
+        g_clut_source_id = c.id;
     }
     // The result's identity: the slot's 32 chunks of 16 entries, each named
     // by the load that last wrote it (its parameters and the source pages'
@@ -1352,8 +1370,18 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     static const bool dedupe = !std::getenv("PS2_CLUT_NO_DEDUPE");  // A/B knob
     static const int dedupe_mode = std::getenv("PS2_CLUT_DEDUPE_MODE") ? std::atoi(std::getenv("PS2_CLUT_DEDUPE_MODE")) : 0;  // 1: full 8-bit loads only, 2: csm 0 only, 3: 16-entry only
     const bool allowed = dedupe_mode == 0 || (dedupe_mode == 1 && eight) || (dedupe_mode == 2 && !csm) || (dedupe_mode == 3 && !eight);
-    if (const auto it = g_clut_memo.find(key); dedupe && allowed && it != g_clut_memo.end() && g_slot_key[it->second] == key) {
-        g_clut_slot = it->second;
+    // The current slot already holding this result (the same palette loaded
+    // again) needs no hash lookup.
+    if (dedupe && allowed && g_slot_key[g_clut_slot] == key) {
+        if (!g_slot_pinned[g_clut_slot]) {
+            g_slot_pinned[g_clut_slot] = 1;
+            g_pinned_slots.push_back(g_clut_slot);
+        }
+        ++g_clut_reused;
+        return;
+    }
+    if (const ClutMemo &m = clut_memo(key); dedupe && allowed && m.key == key && g_slot_key[m.slot] == key) {
+        g_clut_slot = m.slot;
         if (!g_slot_pinned[g_clut_slot]) {
             g_slot_pinned[g_clut_slot] = 1;
             g_pinned_slots.push_back(g_clut_slot);
@@ -1369,12 +1397,12 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     std::memcpy(op.rec + 1, &next, sizeof next);  // the slot may have moved past pinned ones
     queue_pre(op);
     if (g_slot_key[next]) {
-        const auto old = g_clut_memo.find(g_slot_key[next]);
-        if (old != g_clut_memo.end() && old->second == next) g_clut_memo.erase(old);
+        ClutMemo &old = clut_memo(g_slot_key[next]);
+        if (old.key == g_slot_key[next] && old.slot == next) old = ClutMemo{};
     }
     g_slot_key[next] = key;
     g_slot_chunks[next] = chunks;
-    g_clut_memo[key] = next;
+    clut_memo(key) = ClutMemo{key, next};
     g_clut_next = (next + 1) % kClutSlots;
     ++g_clut_emitted;
     g_clut_slot = next;
@@ -1451,7 +1479,7 @@ void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vec
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut) {
     wait_idle();
     for (std::uint64_t &g : g_page_gen) ++g;
-    g_clut_memo.clear();
+    for (ClutMemo &m : g_clut_memo) m = ClutMemo{};
     std::fill(std::begin(g_slot_key), std::end(g_slot_key), 0ull);
     for (auto &c : g_slot_chunks) c.fill(0);
     const std::size_t words = kMemorySize / 4;
@@ -1471,7 +1499,7 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
 
 void stats() {
     if (g_mode == Mode::off) return;
-    std::fprintf(stderr, "[gpu] clut loads: %llu emitted, %llu reused; %llu batches promised to the hardware path; %llu uploads copied %.1f MB into the arena\n", static_cast<unsigned long long>(g_clut_emitted), static_cast<unsigned long long>(g_clut_reused), static_cast<unsigned long long>(g_hardware_batches), static_cast<unsigned long long>(g_uploads), static_cast<double>(g_upload_bytes) / 1048576.0);
+    std::fprintf(stderr, "[gpu] clut loads: %llu emitted, %llu reused; %llu batches promised to the hardware path; %llu uploads copied %.1f MB into the arena (%.1f MB in the timer window)\n", static_cast<unsigned long long>(g_clut_emitted), static_cast<unsigned long long>(g_clut_reused), static_cast<unsigned long long>(g_hardware_batches), static_cast<unsigned long long>(g_uploads), static_cast<double>(g_upload_bytes) / 1048576.0, static_cast<double>(g_upload_bytes_window) / 1048576.0);
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
