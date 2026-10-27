@@ -484,6 +484,61 @@ void HwRaster::note_deferred(const gpu::Command &cmd) {
         if (s.hi > s.lo) deferred_writes_.push_back(s);
 }
 
+namespace {
+bool spans_overlap(const gpu::Span &a, const gpu::Span &b) { return a.hi > a.lo && b.hi > b.lo && a.lo < b.hi && b.lo < a.hi; }
+}  // namespace
+
+void HwRaster::note_held(const gpu::Command &cmd) {
+    ++held_batches_;
+    for (const gpu::Span &s : cmd.reads)
+        if (s.hi > s.lo) held_reads_.push_back(s);
+    for (const gpu::Span &s : cmd.writes)
+        if (s.hi > s.lo) held_writes_.push_back(s);
+}
+
+// Would recording `cmd` now, ahead of the held batches, change what either
+// sees? Its writes against their reads and writes, its reads against their
+// writes.
+bool HwRaster::held_conflict(const gpu::Command &cmd) const {
+    if (held_reads_.empty() && held_writes_.empty()) return false;
+    if (!cmd.ranged) return true;
+    for (const gpu::Span &w : cmd.writes) {
+        for (const gpu::Span &d : held_reads_)
+            if (spans_overlap(w, d)) return true;
+        for (const gpu::Span &d : held_writes_)
+            if (spans_overlap(w, d)) return true;
+    }
+    for (const gpu::Span &r : cmd.reads)
+        for (const gpu::Span &d : held_writes_)
+            if (spans_overlap(r, d)) return true;
+    return false;
+}
+
+HwRaster::Plan HwRaster::plan(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) {
+    const std::uint32_t *setups = nullptr;
+    std::uint32_t zmode = 0;
+    if (!supported(cmd, arena, params, setups, zmode)) {
+        ++fallback_;
+        return Plan::Declined;
+    }
+    if (!pass_cb_) return Plan::Draw;
+    static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
+    if (debug & 16777216u) return Plan::Draw;  // debug: never hold a batch back
+    const bool with_depth = zmode != 0 && !(debug & 8388608u);
+    Surface *color = find_surface(setups[1], setups[2], setups[3], false);
+    Surface *depth = with_depth ? find_surface(setups[5], setups[2], setups[6], true) : nullptr;
+    if (color == pass_color_ && depth == pass_depth_ && with_depth == pass_with_depth_) return Plan::Draw;
+    // Other surfaces: hold it unless something held back or drawn must come
+    // first (then draw() closes the pass and switches).
+    static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
+    const bool conflict = !cmd.ranged || deferred_conflict(cmd) || held_conflict(cmd);
+    if (frame_count() == trace_frame)
+        std::fprintf(stderr, "[pass] f%llu plan: batch for %u/%u/%02x%s while pass on %u/%u/%02x%s: %s\n", static_cast<unsigned long long>(frame_count()), setups[1], setups[2], setups[3], with_depth ? " +z" : "", pass_color_->bp, pass_color_->bw, pass_color_->psm,
+                     pass_depth_ ? " +z" : "", conflict ? "draw (conflict)" : "hold");
+    if (conflict) return Plan::Draw;
+    return Plan::Hold;
+}
+
 bool HwRaster::deferred_conflict(const gpu::Command &cmd) const {
     if (deferred_reads_.empty() && deferred_writes_.empty()) return false;
     const auto overlaps = [](const gpu::Span &a, const gpu::Span &b) { return a.hi > a.lo && b.hi > b.lo && a.lo < b.hi && b.lo < a.hi; };
@@ -513,6 +568,14 @@ void HwRaster::close_pass(VkCommandBuffer cb, CloseWhy why) {
     pass_cb_ = VK_NULL_HANDLE;
     pass_color_ = pass_depth_ = nullptr;
     if (pass_closed_hook_) pass_closed_hook_();
+    // Drawing what was held back may have left a pass open; a caller about
+    // to record outside a pass needs it closed.
+    if (pass_cb_ == cb) {
+        vkCmdEndRenderPass(cb);
+        barrier_after_draw(cb, *pass_color_, pass_depth_);
+        pass_cb_ = VK_NULL_HANDLE;
+        pass_color_ = pass_depth_ = nullptr;
+    }
 }
 
 void HwRaster::end_frame(VkCommandBuffer cb) {
@@ -525,7 +588,7 @@ void HwRaster::end_frame(VkCommandBuffer cb) {
 
 void HwRaster::print_reasons() const {
     static const char *const kCloseNames[kCloseCount] = {"import", "write-back", "decode", "copy", "texture", "memory-read", "surfaces", "failed", "end", "device", "decoded", "wb-draw", "wb-decode", "wb-before", "wb-evict", "wb-overlap", "import-own", "import-source", "wb-uncached", "depth-toggle", "color-change", "depth-change"};
-    std::fprintf(stderr, "[vk] render passes: %llu (%.2f per hardware-drawn batch); closed by:", static_cast<unsigned long long>(passes_), drawn_ ? static_cast<double>(passes_) / static_cast<double>(drawn_) : 0.0);
+    std::fprintf(stderr, "[vk] render passes: %llu (%.2f per hardware-drawn batch), %llu batches held back for other surfaces; closed by:", static_cast<unsigned long long>(passes_), drawn_ ? static_cast<double>(passes_) / static_cast<double>(drawn_) : 0.0, static_cast<unsigned long long>(held_batches_));
     for (int i = 0; i < kCloseCount; ++i)
         if (closes_[i]) std::fprintf(stderr, " %s %llu", kCloseNames[i], static_cast<unsigned long long>(closes_[i]));
     std::fprintf(stderr, "\n");
@@ -1657,7 +1720,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     }
     // Commands held back while the pass is open must land before a batch
     // that touches their memory (see note_deferred).
-    if (pass_cb_ == cb && deferred_conflict(cmd)) close_pass(cb, kCloseMemoryRead);
+    if (pass_cb_ == cb && (deferred_conflict(cmd) || held_conflict(cmd))) close_pass(cb, kCloseMemoryRead);
     const std::uint32_t *p = params + cmd.param * (gpu::kParamStride / 4);
     const std::uint32_t *prims = arena + p[1];
     const std::uint32_t setup_offset = p[2];

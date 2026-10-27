@@ -40,6 +40,20 @@ public:
     // dispatch the compute raster for `cmd`. Returns true when the batch was
     // drawn here (imports, draw and bookkeeping all recorded into `cb`).
     bool draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, VkBuffer data_buffer);
+    // What to do with a raster batch before anything is recorded: decline it
+    // (compute path), draw it now, or hold it back because it targets other
+    // surfaces than the open pass and nothing drawn since needs it first. A
+    // held batch is drawn when the pass closes (the device's hook), after
+    // the compute commands held with it; batches on the open surfaces that
+    // touch a held batch's memory close the pass first (held_conflict).
+    enum class Plan { Declined, Draw, Hold };
+    Plan plan(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params);
+    void note_held(const gpu::Command &cmd);
+    void clear_held() {
+        held_reads_.clear();
+        held_writes_.clear();
+    }
+    bool held_conflict(const gpu::Command &cmd) const;
     // Whether a setup record alone (blend, tests, formats) is drawable here.
     bool setup_supported(const std::uint32_t *setup) const;
     // Runs the texture decode of `cmd` with the hardware module's pipeline,
@@ -305,6 +319,8 @@ private:
     VkCommandBuffer pass_cb_ = VK_NULL_HANDLE;  // the open render pass, if any
     std::function<void()> pass_closed_hook_;
     std::vector<gpu::Span> deferred_reads_, deferred_writes_;
+    std::vector<gpu::Span> held_reads_, held_writes_;  // spans of batches held back for other surfaces
+    std::uint64_t held_batches_ = 0;
     std::size_t deferred_count_ = 0;
     Surface *pass_color_ = nullptr, *pass_depth_ = nullptr;
     bool pass_with_depth_ = false;

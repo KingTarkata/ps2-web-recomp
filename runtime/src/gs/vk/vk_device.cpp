@@ -379,15 +379,20 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
     // read none of their results, since a read that would see them (a
     // texture decode, a tile import, memory sampling) closes the pass first.
     // Their order among themselves is kept.
-    std::vector<std::function<void()>> deferred;
-    if (hw_on_)
-        hw_.on_pass_closed([&] {
-            // Recorded after the pass: each command's surface write-backs
-            // and invalidations (before_command) right before it.
-            for (std::size_t d = 0; d < deferred.size(); ++d) deferred[d]();
-            deferred.clear();
-            hw_.clear_deferred();
-        });
+    // Held back while a pass is open: compute commands and raster batches
+    // for other surfaces. When the pass closes (HwRaster::close_pass runs the
+    // hook) the compute commands are recorded first, in order, each after
+    // its before_command write-backs, then the batches, in order; the span
+    // checks at hold time (deferred_conflict, held_conflict) keep that
+    // reordering invisible.
+    struct Deferred {
+        bool batch;
+        Command c;
+        std::uint32_t index;
+        bool timed;
+        std::size_t skipped_from;
+    };
+    std::vector<Deferred> deferred;
     const auto dispatch = [&](const Command &k, std::uint32_t index, bool timed, bool top_written) {
         if (timed && !top_written) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, index * 2);
         if (k.pipeline == kDecode && hw_on_) {
@@ -401,6 +406,43 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
         vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
         if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, index * 2 + 1);
     };
+    // Decodes and snapshots skipped for a batch the hardware path was going
+    // to draw, replayed when it declines after all.
+    const auto replay = [&](std::size_t from, std::size_t to) {
+        for (std::size_t k = from; k < to; ++k) {
+            hw_.before_command(cb, commands[k], f.set, arena, static_cast<const std::uint32_t *>(params), false);
+            hw_.close_pass(cb);
+            dispatch(commands[k], static_cast<std::uint32_t>(k), false, false);
+        }
+    };
+    const auto draw_held = [&](const Deferred &d) {
+        if (d.timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, d.index * 2);
+        if (hw_.draw(cb, d.c, f.set, arena, static_cast<const std::uint32_t *>(params), f.data.buffer)) {
+            if (!hw_.pass_open()) vk::vkCmdPipelineBarrier(cb, shader_stages, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
+            if (d.timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, d.index * 2 + 1);
+            return;
+        }
+        static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
+        if (ps2::frame_count() == trace_frame) std::fprintf(stderr, "[pass] f%llu held batch %u declined at flush\n", static_cast<unsigned long long>(ps2::frame_count()), d.index);
+        if (d.skipped_from < d.index) replay(d.skipped_from, d.index);
+        hw_.close_pass(cb);
+        hw_.before_command(cb, d.c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
+        dispatch(d.c, d.index, d.timed, true);
+    };
+    if (hw_on_)
+        hw_.on_pass_closed([&] {
+            std::vector<Deferred> items;
+            items.swap(deferred);
+            hw_.clear_deferred();
+            hw_.clear_held();
+            for (const Deferred &d : items)
+                if (!d.batch) {
+                    hw_.before_command(cb, d.c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
+                    dispatch(d.c, d.index, d.timed, false);
+                }
+            for (const Deferred &d : items)
+                if (d.batch) draw_held(d);
+        });
     for (std::uint32_t i = 0; i < commands.size(); ++i) {
         const Command &c = commands[i];
         // Every command writes both of its timestamps, drawn here or not: a
@@ -408,13 +450,22 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
         const bool timed = queries && per_command && i < n;
         bool top_written = false;
         if (c.pipeline == kRaster && hw_on_) {
-            if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, i * 2);
-            top_written = timed;
-            if (hw_.draw(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), f.data.buffer)) {
+            const auto plan = hw_.plan(c, arena, static_cast<const std::uint32_t *>(params));
+            if (plan == vk::HwRaster::Plan::Hold) {
+                hw_.note_held(c);
+                deferred.push_back({true, c, i, timed, skipped_from});
                 skipped_from = ~static_cast<std::size_t>(0);
-                if (!hw_.pass_open()) vk::vkCmdPipelineBarrier(cb, shader_stages, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);  // an open pass is closed, with its barrier, by whatever comes next
-                if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
                 continue;
+            }
+            if (plan == vk::HwRaster::Plan::Draw) {
+                if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, i * 2);
+                top_written = timed;
+                if (hw_.draw(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), f.data.buffer)) {
+                    skipped_from = ~static_cast<std::size_t>(0);
+                    if (!hw_.pass_open()) vk::vkCmdPipelineBarrier(cb, shader_stages, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);  // an open pass is closed, with its barrier, by whatever comes next
+                    if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
+                    continue;
+                }
             }
         }
         if (hw_on_) {
@@ -434,26 +485,16 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
                     continue;
                 }
             }
-            if (c.pipeline == kRaster && skipped_from < i) {
-                // Declined after all: replay what was skipped, in order.
-                for (std::size_t k = skipped_from; k < i; ++k) {
-                    hw_.before_command(cb, commands[k], f.set, arena, static_cast<const std::uint32_t *>(params), false);
-                    hw_.close_pass(cb);
-                    dispatch(commands[k], static_cast<std::uint32_t>(k), false, false);
-                }
-            }
+            if (c.pipeline == kRaster && skipped_from < i) replay(skipped_from, i);  // declined after all
             skipped_from = ~static_cast<std::size_t>(0);
-            if (hw_.pass_open() && c.pipeline != kRaster && c.ranged) {
+            if (hw_.pass_open() && c.pipeline != kRaster && c.ranged && !hw_.held_conflict(c)) {
                 hw_.note_deferred(c);
-                deferred.push_back([&, c, i, timed] {
-                    hw_.before_command(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
-                    dispatch(c, i, timed, false);
-                });
+                deferred.push_back({false, c, i, timed, 0});
                 continue;
             }
             if (hw_.pass_open()) {
                 ++closes_by_pipeline_[c.pipeline];
-                hw_.close_pass(cb);  // a compute-drawn batch or an unranged command: everything held back lands first
+                hw_.close_pass(cb);  // a compute-drawn batch, an unranged command, or one a held batch must precede: everything held back lands first
             }
             // The resident surfaces may hold memory this command reads or writes.
             hw_.before_command(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), false);

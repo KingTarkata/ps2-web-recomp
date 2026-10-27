@@ -427,3 +427,32 @@ memory-sampling shader (inverse page tables for PSMCT32), so 8-bit reads
 of a 32-bit surface sample its image instead of forcing a write-back.
 (3) DATE through the stencil buffer. (4) 16-entry CLUT loads keyed by the
 chunks they touch rather than the whole chain, for more reuse.
+
+### 2026-10-27, later: batches held back for other surfaces, and the real chain
+
+Raster batches for surfaces other than the open pass's are now held back
+with the compute commands (`HwRaster::plan`), drawn when the pass closes,
+after the held compute commands; a batch or command whose memory spans
+overlap a held batch's closes the pass first (`held_conflict`). Native
+frames bit-identical. Frame 6100: 231 -> 154 closes; threaded time
+unchanged (39.8-42 ms).
+
+Why only that far: the post-process is a dependency chain, not an
+interleaving. For strip i the block draw reads page i of the frame buffer
+as an 8-bit REGION_REPEAT texture (uncached, so it samples memory) and
+writes a 64x32 scratch at a second address; the tile draw reads that
+scratch as eight 8x32 8-bit textures through a CLUT and writes page i
+back. Every block draw writes the same scratch, so block i+1 must wait for
+tile i to have read it: 140 passes a frame are forced by the data. The
+remaining closes: that chain (70 pairs), 18 copies for batches sampling
+their own frame, 14+14 copies in two 64-wide scratch ping-pongs, 23
+compute-path DATE batches, a few Z-alias overlaps.
+
+To break the chain the device would have to (a) version the scratch
+surface (each block draw gets its own image of it, since it overwrites it
+whole) and (b) let the tile draws sample those images through memory
+addressing in the fragment shader (inverse page tables, no VRAM
+round-trip), with the CLUT loads between them already reused. Then the 70
+block draws form one pass and the 70 tile draws another. That is the next
+GPU stage; its payoff is most of the 13.5 ms drain floor. DATE on the
+stencil buffer is the smaller, independent item.
