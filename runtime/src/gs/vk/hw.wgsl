@@ -24,7 +24,17 @@ struct HwParams {
     scale: u32,
     snap_lo: u32,    // draws: the snapshot window (compute `raster` reads it from params)
     snap_hi: u32,
-    pad2: u32,
+    // A surface view: memory words in [view_base, view_base + view_words)
+    // are read from the set-2 image through the surface's PSMCT32 layout
+    // (view_table: the inverse page table in `tables`), view_shift rows down.
+    view_table: u32,
+    view_base: u32,
+    view_bw: u32,
+    view_words: u32,
+    view_shift: u32,
+    pad3: u32,
+    pad4: u32,
+    pad5: u32,
     setup: array<vec4<u32>, 7>,  // draws: the setup record itself, so no fragment loads it from `data`
 };
 
@@ -104,6 +114,18 @@ fn setup_u() -> Setup {
 @group(2) @binding(3) var samp_rc: sampler;
 @group(2) @binding(4) var samp_cr: sampler;
 @group(2) @binding(5) var samp_cc: sampler;
+
+fn surface_word(word: u32) -> vec2<u32> {
+    if (hw.view_words == 0u || word < hw.view_base || word - hw.view_base >= hw.view_words) {
+        return vec2<u32>(0u, 0u);
+    }
+    let rel = word - hw.view_base;
+    let page = rel / 2048u;
+    let e = tables[hw.view_table + (rel % 2048u)];
+    let x = (page % hw.view_bw) * 64u + (e & 0xFFu);
+    let y = (page / hw.view_bw) * 32u + (e >> 8u) + hw.view_shift;
+    return vec2<u32>(1u, pack_word(textureLoad(tex_image, vec2<i32>(i32(x * hw.scale), i32(y * hw.scale)), 0)));
+}
 
 fn decoded_load(i: u32) -> u32 {
     return textureLoad(decoded_read, vec2<i32>(i32(i & 2047u), i32(i >> 11u)), 0).x;

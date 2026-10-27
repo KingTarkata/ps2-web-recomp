@@ -320,6 +320,7 @@ bool VkDevice_::init(const Limits &limits, const std::vector<std::uint32_t> &tab
     const std::uint32_t *const variants[8] = {kHwSpvScale1V0, kHwSpvScale1V1, kHwSpvScale1V2, kHwSpvScale1V3, kHwSpvScale1V4, kHwSpvScale1V5, kHwSpvScale1V6, kHwSpvScale1V7};
     const std::size_t variant_words[8] = {kHwSpvScale1V0_words, kHwSpvScale1V1_words, kHwSpvScale1V2_words, kHwSpvScale1V3_words, kHwSpvScale1V4_words, kHwSpvScale1V5_words, kHwSpvScale1V6_words, kHwSpvScale1V7_words};
     hw_on_ = !std::getenv("PS2_HW_OFF") && hw_.init(ctx_, hw_code, hw_words, limits.scale == 1 ? variants : nullptr, variant_words, layout_, limits.scale);
+    hw_.set_inverse_table(limits.inverse32_words);
     std::fprintf(stderr, "[gpu] %s via Vulkan (%s)\n", ctx_.name.c_str(), hw_on_ ? "hardware rasterizer with compute fallback" : "compute rasterizer only");
     return true;
 }
@@ -494,6 +495,10 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
             }
             if (hw_.pass_open()) {
                 ++closes_by_pipeline_[c.pipeline];
+                static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
+                if (ps2::frame_count() == trace_frame)
+                    std::fprintf(stderr, "[pass] f%llu device closes for %s%s: reads %x-%x %x-%x writes %x-%x\n", static_cast<unsigned long long>(ps2::frame_count()), kEntryPoints[c.pipeline], !c.ranged ? " (unranged)" : hw_.held_conflict(c) ? " (held batch conflict)" : "",
+                                 c.reads[0].lo, c.reads[0].hi, c.reads[1].lo, c.reads[1].hi, c.writes[0].lo, c.writes[0].hi);
                 hw_.close_pass(cb);  // a compute-drawn batch, an unranged command, or one a held batch must precede: everything held back lands first
             }
             // The resident surfaces may hold memory this command reads or writes.

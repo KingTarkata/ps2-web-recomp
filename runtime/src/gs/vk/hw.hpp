@@ -82,6 +82,7 @@ public:
     void begin_frame(int slot);
     void end_frame(VkCommandBuffer cb);  // closes the open render pass and the per-frame fragment count
     bool pass_open() const { return pass_cb_ != VK_NULL_HANDLE; }
+    void set_inverse_table(std::uint32_t words) { inverse32_words_ = words; }
     // Consecutive hardware-drawn batches on the same colour (and depth)
     // surface share one render pass; anything recorded outside a pass
     // (imports, write-backs, decodes, copies, image barriers) closes it
@@ -321,6 +322,14 @@ private:
     std::vector<gpu::Span> deferred_reads_, deferred_writes_;
     std::vector<gpu::Span> held_reads_, held_writes_;  // spans of batches held back for other surfaces
     std::uint64_t held_batches_ = 0;
+    std::uint32_t inverse32_words_ = 0;
+    std::uint64_t surface_views_ = 0;  // uncached texture reads answered by a surface image
+    // A surface view for one setup's memory reads (see hw.wgsl HwParams).
+    struct View {
+        std::uint32_t base = 0, bw = 0, words = 0, shift = 0;
+    };
+    // The resident 32/24-bit colour surface holding `span` whole (not this batch's own), or null.
+    Surface *viewable_surface(const gpu::Span &span, const Surface *color, const Surface *depth);
     std::size_t deferred_count_ = 0;
     Surface *pass_color_ = nullptr, *pass_depth_ = nullptr;
     bool pass_with_depth_ = false;

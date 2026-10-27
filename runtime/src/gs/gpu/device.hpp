@@ -52,6 +52,7 @@ struct Limits {
     std::uint64_t cache_bytes;
     std::uint64_t decoded_bytes;
     std::uint64_t readback_bytes;
+    std::uint32_t inverse32_words = 0;  // offset in `tables` of the PSMCT32 inverse page table (2048 words: x | y << 8 per word of a page)
 };
 
 // Parameters of the final blit to the window, written each presented frame.

@@ -1013,6 +1013,11 @@ bool init(Mode m) {
     swizzle_tables(tables);
     Limits limits;
     limits.scale = g_scale;
+    // Word within a PSMCT32 page -> pixel, for surfaces read as memory.
+    limits.inverse32_words = static_cast<std::uint32_t>(tables.size());
+    tables.resize(tables.size() + 2048, 0);
+    for (std::uint32_t y = 0; y < 32; ++y)
+        for (std::uint32_t x = 0; x < 64; ++x) tables[limits.inverse32_words + pixel_address(PSMCT32, 0, 1, x, y) / 4] = x | (y << 8);
     limits.vram_bytes = static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale;
     limits.clut_bytes = static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4;
     limits.scratch_bytes = (static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4;

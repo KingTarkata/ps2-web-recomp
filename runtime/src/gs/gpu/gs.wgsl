@@ -565,6 +565,12 @@ fn load_texel(l: Loc, k: u32) -> u32 {
     if (l.word >= snapshot_lo && l.word < snapshot_hi) {
         return (scratch[(l.word - snapshot_lo) * SCALE * SCALE + k] >> l.shift) & l.mask;
     }
+    // A resident surface holding this memory answers from its image
+    // (hw.wgsl: surface_word); the compute path has none.
+    let v = surface_word(l.word);
+    if (v.x != 0u) {
+        return (v.y >> l.shift) & l.mask;
+    }
     return load_at(l, k);
 }
 

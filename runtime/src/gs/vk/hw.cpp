@@ -16,7 +16,7 @@ namespace {
 constexpr std::uint32_t kPrimWords = 28, kSetupWords = 25;
 constexpr std::uint64_t kVertexBytes = 16u << 20, kUniformBytes = 16u << 20;
 constexpr std::uint32_t kUniformStride = 256;
-constexpr std::uint32_t kUniformWords = 12 + 28;  // HwParams: 12 words plus the setup record padded to 7 vec4s
+constexpr std::uint32_t kUniformWords = 20 + 28;  // HwParams: 20 words plus the setup record padded to 7 vec4s
 constexpr std::uint32_t kMaxFailModePrims = 1024;
 
 constexpr std::uint32_t F_TME = 2, F_ABE = 8, F_ZMSK = 32, F_ATE = 64, F_DATE = 128, F_ZTE = 512, F_PABE = 1024, F_COLCLAMP = 2048;
@@ -514,6 +514,17 @@ bool HwRaster::held_conflict(const gpu::Command &cmd) const {
     return false;
 }
 
+HwRaster::Surface *HwRaster::viewable_surface(const gpu::Span &span, const Surface *color, const Surface *depth) {
+    if (span.hi <= span.lo) return nullptr;
+    for (auto &sp : surfaces_) {
+        Surface &s = *sp;
+        if (s.depth || !s.image.image || !s.set2 || (s.psm != 0x00u && s.psm != 0x01u) || &s == color || &s == depth) continue;
+        const std::uint64_t base = static_cast<std::uint64_t>(s.bp) * 256, end = base + static_cast<std::uint64_t>(s.height / 32) * s.bw * 8192;
+        if (span.lo >= base && span.hi <= end) return &s;
+    }
+    return nullptr;
+}
+
 HwRaster::Plan HwRaster::plan(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) {
     const std::uint32_t *setups = nullptr;
     std::uint32_t zmode = 0;
@@ -595,8 +606,8 @@ void HwRaster::print_reasons() const {
     if (fragment_frames_) std::fprintf(stderr, "[vk] fragments: %.2f M per frame reached the colour stage over %llu frames (hardware-drawn batches)\n", static_cast<double>(fragments_) / static_cast<double>(fragment_frames_) / 1e6, static_cast<unsigned long long>(fragment_frames_));
     std::fprintf(stderr, "[vk] surfaces: %zu resident, %.1f Mpx imported, %.1f Mpx written back, %llu evictions, %llu aliased batches, %llu uniform overflows\n", surfaces_.size(), static_cast<double>(imported_px_) / 1e6,
                  static_cast<double>(exported_px_) / 1e6, static_cast<unsigned long long>(evictions_), static_cast<unsigned long long>(alias_batches_), static_cast<unsigned long long>(uniform_overflows_));
-    std::fprintf(stderr, "[vk] textures: %zu resident, %llu decoded, %llu hits, %llu sampled from surfaces, %llu copied from own surface; block writes by commands %llu, write-backs %llu, own draws %llu; evictions %llu, stale at lookup %llu\n", textures_.size(),
-                 static_cast<unsigned long long>(decoded_textures_), static_cast<unsigned long long>(texture_hits_), static_cast<unsigned long long>(surface_samples_), static_cast<unsigned long long>(surface_copies_), static_cast<unsigned long long>(tex_drops_[0]), static_cast<unsigned long long>(tex_drops_[1]),
+    std::fprintf(stderr, "[vk] textures: %zu resident, %llu decoded, %llu hits, %llu sampled from surfaces, %llu copied from own surface, %llu memory reads answered by surface views; block writes by commands %llu, write-backs %llu, own draws %llu; evictions %llu, stale at lookup %llu\n", textures_.size(),
+                 static_cast<unsigned long long>(decoded_textures_), static_cast<unsigned long long>(texture_hits_), static_cast<unsigned long long>(surface_samples_), static_cast<unsigned long long>(surface_copies_), static_cast<unsigned long long>(surface_views_), static_cast<unsigned long long>(tex_drops_[0]), static_cast<unsigned long long>(tex_drops_[1]),
                  static_cast<unsigned long long>(tex_drops_[2]), static_cast<unsigned long long>(tex_drops_[3]), static_cast<unsigned long long>(tex_drops_[4]));
     std::fprintf(stderr, "[vk] fallback reasons:");
     for (int i = 0; i < 12; ++i)
@@ -1796,6 +1807,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     // decode, surfaces need nothing. Depth tests read the depth surface.
     const std::uint64_t exported_before = exported_px_;
     std::vector<VkDescriptorSet> textures(cmd.setups, VK_NULL_HANDLE);
+    std::vector<View> views(cmd.setups);
     bool decoded_any = false, memory_sampled = false;
     // Textures the cache does not take (tiny, or region modes outside the
     // texture): a surface in the same layout is sampled in place; otherwise
@@ -1809,6 +1821,24 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
             decoded_any = decoded_any || imported_px_ != before_imports || surface_copies_ != before_copies;
         }
         if (!textures[i]) {
+            // Memory inside a resident 32/24-bit surface: the fragment shader
+            // reads that surface's image through its layout (surface view),
+            // so nothing is written back.
+            const gpu::Span span = texture_span(w);
+            Surface *v = (debug & 33554432u) ? nullptr : viewable_surface(span, color, depth);  // debug: no surface views
+            Rect vr;
+            if (v && span_rect(*v, span, vr)) {
+                if (pass_cb_ == cb && (v == pass_color_ || v == pass_depth_)) close_pass(cb, kCloseSurfaces);  // its attachment writes land first
+                const std::uint64_t before_imports = imported_px_;
+                WhyScope why(import_why_, kCloseImportSource);
+                import_tiles(cb, set0, *v, vr);  // what memory still owns there
+                decoded_any = decoded_any || imported_px_ != before_imports;
+                views[i] = View{v->bp * 64u, v->bw, static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u, 0u};
+                textures[i] = v->set2;
+                memory_sampled = true;  // the shader still reads the CLUT buffer
+                ++surface_views_;
+                continue;
+            }
             memory_sampled = true;
             static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
             if (frame_count() == trace_frame)
@@ -1922,7 +1952,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         write_mask(w[4], wmask);
         const VkDescriptorSet texture = textures[si];
         if (texture) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 2, 1, &texture, 0, nullptr);
-        const std::uint32_t base_flags = (with_depth ? 1u : 0u) | ((debug & 8u) ? 2u : 0u) | ((debug & 16u) ? 4u : 0u) | ((blend >> 15) & 1u) << 4 | ((blend >> 16) & 1u) << 5 | ((debug & 16384u) ? 128u : 0u) | (texture ? 256u : 0u) | ((debug & 524288u) ? 512u : 0u);
+        const std::uint32_t base_flags = (with_depth ? 1u : 0u) | ((debug & 8u) ? 2u : 0u) | ((debug & 16u) ? 4u : 0u) | ((blend >> 15) & 1u) << 4 | ((blend >> 16) & 1u) << 5 | ((debug & 16384u) ? 128u : 0u) | ((texture && views[si].words == 0) ? 256u : 0u) | ((debug & 524288u) ? 512u : 0u);  // a surface view keeps the memory-sampling shader
         // The GS scissor (inclusive, GS pixels) as the Vulkan scissor, within
         // the render area; an empty one skips the draws.
         bool skip_draw = false;
@@ -1946,8 +1976,8 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         const bool may_discard = ((w[0] & F_ATE) && ((w[7] & 7u) != 1u)) || (((w[7] >> 28) & 3u) != 0u);
         const std::uint32_t variant = (!(w[0] & F_TME) || cached_fs) ? ((cached_fs ? 1u : 0u) | (may_discard ? 2u : 0u) | ((w[0] & 4u) ? 4u : 0u)) : 0xFFu;
         const auto bind_draw = [&](std::uint32_t flags, bool write_z, std::uint32_t mask) -> bool {
-            std::uint32_t words[kUniformWords] = {setup_offset + si * kSetupWords, 0, 0, flags, 0, 0, kTargetSize * scale_, kTargetSize * scale_, scale_, p[5], p[6], 0};
-            std::memcpy(words + 12, w, kSetupWords * 4);
+            std::uint32_t words[kUniformWords] = {setup_offset + si * kSetupWords, 0, 0, flags, 0, 0, kTargetSize * scale_, kTargetSize * scale_, scale_, p[5], p[6], inverse32_words_, views[si].base, views[si].bw, views[si].words, views[si].shift};
+            std::memcpy(words + 20, w, kSetupWords * 4);
             const std::uint32_t uniform = push_uniform(f, words);
             VkPipeline pipeline = (debug & 4194304u) ? pipeline_for({ztst, write_z ? 1u : 0u, with_depth ? 1u : 0u, 0u, 0xFu, 2u, 0xFFu})  // debug: minimal fragment shader, single output, no blend
                                                    : pipeline_for({ztst, write_z ? 1u : 0u, with_depth ? 1u : 0u, blend & 0x7FFFu, mask, variant < 8 ? 1u : cached_fs ? 1u : 0u, variant});

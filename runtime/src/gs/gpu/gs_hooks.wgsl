@@ -7,3 +7,7 @@ fn decoded_load(i: u32) -> u32 {
 fn decoded_store(i: u32, v: u32) {
     decoded[i] = v;
 }
+
+fn surface_word(word: u32) -> vec2<u32> {
+    return vec2<u32>(0u, 0u);
+}
