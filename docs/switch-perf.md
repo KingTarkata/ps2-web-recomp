@@ -48,3 +48,5 @@ measured in a VM belongs here.
   raise the GPU above the mode's 768 MHz cap; with it pinned the race
   measured 97.48 ms, unchanged.
 - Target is 16.7 ms, so the race is 5.8x short at native resolution.
+| 2026-10-26 | Race from saved state, headless, renderer refactored behind `Device`, wgpu | 6050-6650 | 95.12 | unchanged by the refactor |
+| 2026-10-26 | same, Vulkan device (`PS2_GS=hw`), identical compute shaders via naga | 6050-6650 | 80.88 | 15% from dropping wgpu-native alone, before any graphics-pipeline work |

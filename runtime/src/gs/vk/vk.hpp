@@ -7,14 +7,7 @@
 
 namespace ps2::gs::vk {
 
-// True when the environment asks for this backend.
+// True when the environment asks for this backend (PS2_GS=hw).
 bool wanted();
-// Creates the device and the GS memory buffers. False leaves the compute
-// renderer in charge.
-bool init(std::uint32_t scale);
-bool active();
-void shutdown();
-// Device name for logs, empty before init.
-const char *device_name();
 
 }

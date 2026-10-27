@@ -1,10 +1,9 @@
+// The GS renderer's API-neutral half: batching, hazard tracking, uploads,
+// palettes, downloads and the display path. A Device (device.hpp) runs the
+// resulting command lists on wgpu-native or Vulkan.
 #include "gpu.hpp"
+#include "device.hpp"
 #include "ps2/system.hpp"
-
-#include <webgpu/webgpu.h>
-#ifndef __EMSCRIPTEN__
-#include <webgpu/wgpu.h>
-#endif
 
 #include <algorithm>
 #include <array>
@@ -17,21 +16,16 @@
 #include <string>
 #include <unordered_map>
 
-extern const char kGsShader[];
-extern const char kBlitShader[];
-
 namespace ps2::gs {
 void swizzle_tables(std::vector<std::uint32_t> &out);
 }
 
 namespace ps2::gs::gpu {
 
-namespace {
-
-enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kPipelines };
 const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode"};
 
-constexpr std::uint32_t kParamStride = 256;
+namespace {
+
 constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
@@ -42,44 +36,16 @@ constexpr std::uint32_t kDecodePrims = 64;
 Mode g_mode = Mode::off;
 std::uint64_t g_dispatches[kPipelines] = {}, g_submits = 0;
 
-WGPUInstance g_instance = nullptr;
-WGPUAdapter g_adapter = nullptr;
-WGPUSurface g_surface = nullptr;
-WGPUTextureFormat g_surface_format = WGPUTextureFormat_Undefined;
-WGPUPresentMode g_present_mode = WGPUPresentMode_Fifo;
-std::uint32_t g_surface_width = 0, g_surface_height = 0;
-WGPURenderPipeline g_blit = nullptr;
-WGPUBindGroup g_blit_group = nullptr;
-WGPUBuffer g_blit_params = nullptr;
+Device *g_dev = nullptr;
 std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
 bool g_have_previous = false;
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
 
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
 
-bool g_timestamps = false;
-WGPUQuerySet g_queries = nullptr;
-WGPUBuffer g_query_resolve = nullptr, g_query_read = nullptr;
-bool g_query_pending = false, g_query_ready = false;
-std::uint64_t g_measured_ns = 0, g_measured = 0, g_total_passes = 0;
-WGPUDevice g_device = nullptr;
-WGPUQueue g_queue = nullptr;
-WGPUBuffer g_vram = nullptr, g_tables = nullptr, g_params = nullptr, g_data = nullptr, g_clut = nullptr, g_scratch = nullptr, g_readback = nullptr, g_decoded = nullptr;
 std::uint32_t g_decoded_used = 0;
 bool g_rendered[512] = {};
 bool g_decode = true;
-std::uint64_t g_params_size = 0, g_data_size = 0;
-WGPUBindGroupLayout g_layout = nullptr;
-WGPUPipelineLayout g_pipeline_layout = nullptr;
-WGPUBindGroup g_group = nullptr;
-WGPUComputePipeline g_pipelines[kPipelines] = {};
-
-struct Command {
-    Pipeline pipeline;
-    std::uint32_t x, y;
-    std::uint32_t param;
-};
-
 struct CommandInfo {
     std::size_t index;
     std::uint32_t values[8];
@@ -87,8 +53,6 @@ struct CommandInfo {
 std::vector<CommandInfo> g_command_info;
 std::FILE *g_profile_out = nullptr;
 std::uint64_t g_profile_from = 0, g_profile_to = 0;
-WGPUQuerySet g_profile_queries = nullptr;
-WGPUBuffer g_profile_resolve = nullptr, g_profile_read = nullptr;
 
 std::vector<Command> g_commands;
 std::vector<std::array<std::uint32_t, kParamStride / 4>> g_param_records;
@@ -177,8 +141,6 @@ int g_tiles_per_row = 128;
 std::vector<std::uint32_t> g_tile_count(128 * 128), g_tile_fill(128 * 128);
 std::vector<std::uint32_t> g_touched;
 
-WGPUStringView view(const char *s) { return WGPUStringView{s, WGPU_STRLEN}; }
-
 std::uint32_t bits_per_pixel(std::uint32_t psm) {
     switch (psm) {
     case PSMCT24: case PSMZ24: return 24;
@@ -248,7 +210,6 @@ struct CacheEntry {
     std::uint64_t used;
 };
 
-WGPUBuffer g_cache = nullptr;
 std::vector<std::uint32_t> g_cache_copy;
 std::deque<CacheEntry> g_cache_ring;
 std::unordered_multimap<std::uint64_t, CacheEntry *> g_cache_index;
@@ -313,7 +274,7 @@ bool cache_insert(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, s
     to[words - 1] = 0;
     to[words - 2] = 0;
     std::memcpy(to, bytes, n);
-    wgpuQueueWriteBuffer(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
+    g_dev->write(Buffer::Cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
     g_cache_ring.push_back({key, offset, words, n, g_serial});
     g_cache_index.emplace(key, &g_cache_ring.back());
     g_cache_head += words;
@@ -714,255 +675,44 @@ void flush_all() {
     emit_all();
 }
 
-void on_error(WGPUDevice const *, WGPUErrorType type, WGPUStringView message, void *, void *) {
-    std::fprintf(stderr, "[gpu] error %d: %.*s\n", static_cast<int>(type), static_cast<int>(message.length == WGPU_STRLEN ? std::strlen(message.data) : message.length), message.data);
-}
-
-void pump() {
-#ifdef __EMSCRIPTEN__
-    browser_yield();
-    wgpuInstanceProcessEvents(g_instance);
-#else
-    if (g_device) wgpuDevicePoll(g_device, true, nullptr);
-    else wgpuInstanceProcessEvents(g_instance);
-#endif
-}
-
-void wait_until(const bool &flag) {
-    while (!flag) pump();
-}
-
-WGPUBuffer make_buffer(std::uint64_t size, WGPUBufferUsage usage) {
-    WGPUBufferDescriptor d = WGPU_BUFFER_DESCRIPTOR_INIT;
-    d.size = size;
-    d.usage = usage;
-    return wgpuDeviceCreateBuffer(g_device, &d);
-}
-
-void rebuild_group() {
-    if (g_group) wgpuBindGroupRelease(g_group);
-    WGPUBindGroupEntry e[8] = {};
-    WGPUBuffer buffers[8] = {g_vram, g_tables, g_params, g_data, g_clut, g_scratch, g_cache, g_decoded};
-    for (int i = 0; i < 8; ++i) {
-        e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
-        e[i].binding = static_cast<std::uint32_t>(i);
-        e[i].buffer = buffers[i];
-        e[i].size = i == 2 ? kParamStride : WGPU_WHOLE_SIZE;
-    }
-    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-    d.layout = g_layout;
-    d.entryCount = 8;
-    d.entries = e;
-    g_group = wgpuDeviceCreateBindGroup(g_device, &d);
-}
-
-void ensure_capacity() {
-    bool changed = false;
-    const std::uint64_t data_bytes = std::max<std::uint64_t>(g_arena.size() * 4, 16);
-    if (data_bytes > g_data_size) {
-        if (g_data) wgpuBufferRelease(g_data);
-        g_data_size = std::max<std::uint64_t>(g_data_size * 2, (data_bytes + (4u << 20) - 1) & ~((4ull << 20) - 1));
-        g_data = make_buffer(g_data_size, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
-        changed = true;
-    }
-    const std::uint64_t param_bytes = std::max<std::uint64_t>(g_param_records.size(), 1) * kParamStride;
-    if (param_bytes > g_params_size) {
-        if (g_params) wgpuBufferRelease(g_params);
-        g_params_size = std::max<std::uint64_t>(g_params_size * 2, std::max<std::uint64_t>(param_bytes, 64 * 1024));
-        g_params = make_buffer(g_params_size, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
-        changed = true;
-    }
-    if (changed || !g_group) rebuild_group();
+void finish_submit() {
+    g_commands.clear();
+    g_command_info.clear();
+    ++g_serial;
+    g_param_records.clear();
+    g_arena.clear();
+    g_decoded_used = 0;
+    g_clut_loads = 0;
 }
 
 void profile_submit() {
-    constexpr std::uint32_t kMax = 2048;
-    if (!g_profile_queries) {
-        WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
-        qd.type = WGPUQueryType_Timestamp;
-        qd.count = kMax * 2;
-        g_profile_queries = wgpuDeviceCreateQuerySet(g_device, &qd);
-        g_profile_resolve = make_buffer(kMax * 16, WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc);
-        g_profile_read = make_buffer(kMax * 16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+    std::vector<std::uint64_t> ns;
+    g_dev->submit_profiled(g_commands, g_param_records.data(), g_param_records.size() * kParamStride, g_arena.data(), g_arena.size(), ns);
+    std::size_t info = 0;
+    for (std::size_t i = 0; i < ns.size(); ++i) {
+        while (info < g_command_info.size() && g_command_info[info].index < i) ++info;
+        std::fprintf(g_profile_out, "%llu %u %s %llu %u %u", static_cast<unsigned long long>(frame_count()), static_cast<unsigned>(i), kEntryPoints[g_commands[i].pipeline],
+                     static_cast<unsigned long long>(ns[i]), g_commands[i].x, g_commands[i].y);
+        if (info < g_command_info.size() && g_command_info[info].index == i)
+            for (std::uint32_t v : g_command_info[info].values) std::fprintf(g_profile_out, " %u", v);
+        std::fprintf(g_profile_out, "\n");
     }
-    ensure_capacity();
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
-    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
-    const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(g_commands.size(), kMax));
-    for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
-        const Command &c = g_commands[i];
-        WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
-        writes.querySet = g_profile_queries;
-        writes.beginningOfPassWriteIndex = i * 2;
-        writes.endOfPassWriteIndex = i * 2 + 1;
-        WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
-        if (i < n) cd.timestampWrites = &writes;
-        WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
-        wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
-        const std::uint32_t offset = c.param * kParamStride;
-        wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
-        wgpuComputePassEncoderEnd(pass);
-        wgpuComputePassEncoderRelease(pass);
-    }
-    if (n) {
-        wgpuCommandEncoderResolveQuerySet(enc, g_profile_queries, 0, n * 2, g_profile_resolve, 0);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, g_profile_resolve, 0, g_profile_read, 0, n * 16);
-    }
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
-    wgpuQueueSubmit(g_queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd);
-    wgpuCommandEncoderRelease(enc);
-    if (n) {
-        bool done = false;
-        WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
-        cb.mode = WGPUCallbackMode_AllowProcessEvents;
-        cb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
-        cb.userdata1 = &done;
-        wgpuBufferMapAsync(g_profile_read, WGPUMapMode_Read, 0, n * 16, cb);
-        wait_until(done);
-        const auto *t = static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_profile_read, 0, n * 16));
-        std::size_t info = 0;
-        for (std::uint32_t i = 0; t && i < n; ++i) {
-            while (info < g_command_info.size() && g_command_info[info].index < i) ++info;
-            std::fprintf(g_profile_out, "%llu %u %s %llu %u %u", static_cast<unsigned long long>(frame_count()), i, kEntryPoints[g_commands[i].pipeline],
-                         static_cast<unsigned long long>(t[i * 2 + 1] > t[i * 2] ? t[i * 2 + 1] - t[i * 2] : 0), g_commands[i].x, g_commands[i].y);
-            if (info < g_command_info.size() && g_command_info[info].index == i)
-                for (std::uint32_t v : g_command_info[info].values) std::fprintf(g_profile_out, " %u", v);
-            std::fprintf(g_profile_out, "\n");
-        }
-        wgpuBufferUnmap(g_profile_read);
-    }
-    g_commands.clear();
-    g_command_info.clear();
-    ++g_serial;
-    g_param_records.clear();
-    g_arena.clear();
-    g_decoded_used = 0;
-    g_clut_loads = 0;
+    finish_submit();
 }
 
-// Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
-void submit(WGPUTextureView present_view = nullptr) {
-    if (g_commands.empty() && !present_view) return;
-    if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
+void submit(bool present = false) {
+    if (g_commands.empty() && !present) return;
+    if (g_profile_out && !present && g_dev->timestamps() && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
         profile_submit();
         return;
     }
-    ensure_capacity();
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
-    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
-    if (g_query_ready) {
-        const void *mapped = wgpuBufferGetConstMappedRange(g_query_read, 0, 16);
-        if (mapped) {
-            std::uint64_t t[2];
-            std::memcpy(t, mapped, sizeof t);
-            if (t[1] > t[0]) {
-                g_measured_ns += t[1] - t[0];
-                ++g_measured;
-            }
-        }
-        wgpuBufferUnmap(g_query_read);
-        g_query_ready = g_query_pending = false;
-    }
-    const bool measure = g_timestamps && !g_query_pending;
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
-    WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
-    writes.querySet = g_queries;
-    writes.beginningOfPassWriteIndex = 0;
-    writes.endOfPassWriteIndex = 1;
-    WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
-    if (measure) cd.timestampWrites = &writes;
-    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
-    Pipeline current = kPipelines;
     ++g_submits;
-    ++g_total_passes;
-    for (const Command &c : g_commands) {
-        ++g_dispatches[c.pipeline];
-        if (c.pipeline != current) {
-            wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
-            current = c.pipeline;
-        }
-        const std::uint32_t offset = c.param * kParamStride;
-        wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
-    }
-    wgpuComputePassEncoderEnd(pass);
-    wgpuComputePassEncoderRelease(pass);
-    if (measure) {
-        wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
-    }
-    if (present_view) {
-        WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
-        color.view = present_view;
-        color.loadOp = WGPULoadOp_Clear;
-        color.storeOp = WGPUStoreOp_Store;
-        color.clearValue = WGPUColor{0.0, 0.0, 0.0, 1.0};
-        WGPURenderPassDescriptor rd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-        rd.colorAttachmentCount = 1;
-        rd.colorAttachments = &color;
-        WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
-        const float w = static_cast<float>(g_surface_width), h = static_cast<float>(g_surface_height);
-        const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
-        const float vw = std::min(w, h * aspect), vh = vw / aspect;
-        wgpuRenderPassEncoderSetViewport(rp, (w - vw) * 0.5f, (h - vh) * 0.5f, vw, vh, 0.0f, 1.0f);
-        wgpuRenderPassEncoderSetPipeline(rp, g_blit);
-        wgpuRenderPassEncoderSetBindGroup(rp, 0, g_blit_group, 0, nullptr);
-        wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
-        wgpuRenderPassEncoderEnd(rp);
-        wgpuRenderPassEncoderRelease(rp);
-    }
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
-    wgpuQueueSubmit(g_queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd);
-    wgpuCommandEncoderRelease(enc);
-    if (measure) {
-        g_query_pending = true;
-        WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
-        cb.mode = WGPUCallbackMode_AllowProcessEvents;
-        cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *, void *) {
-            if (status == WGPUMapAsyncStatus_Success) g_query_ready = true;
-            else g_query_pending = false;
-        };
-        wgpuBufferMapAsync(g_query_read, WGPUMapMode_Read, 0, 16, cb);
-    }
-#ifdef __EMSCRIPTEN__
-    wgpuInstanceProcessEvents(g_instance);
-#else
-    wgpuDevicePoll(g_device, false, nullptr);
-#endif
-    g_commands.clear();
-    g_command_info.clear();
-    ++g_serial;
-    g_param_records.clear();
-    g_arena.clear();
-    g_decoded_used = 0;
-    g_clut_loads = 0;
+    for (const Command &c : g_commands) ++g_dispatches[c.pipeline];
+    g_dev->submit(g_commands, g_param_records.data(), g_param_records.size() * kParamStride, g_arena.data(), g_arena.size(), present);
+    finish_submit();
 }
 
-void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t offset = 0) {
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
-    wgpuCommandEncoderCopyBufferToBuffer(enc, source, offset, g_readback, 0, bytes);
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
-    wgpuQueueSubmit(g_queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd);
-    wgpuCommandEncoderRelease(enc);
-    bool done = false;
-    WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
-    cb.mode = WGPUCallbackMode_AllowProcessEvents;
-    cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *flag, void *) {
-        if (status != WGPUMapAsyncStatus_Success) std::fprintf(stderr, "[gpu] map failed %d\n", static_cast<int>(status));
-        *static_cast<bool *>(flag) = true;
-    };
-    cb.userdata1 = &done;
-    wgpuBufferMapAsync(g_readback, WGPUMapMode_Read, 0, bytes, cb);
-    wait_until(done);
-    const void *mapped = wgpuBufferGetConstMappedRange(g_readback, 0, bytes);
-    if (mapped) std::memcpy(out, mapped, bytes);
-    wgpuBufferUnmap(g_readback);
-}
+void read_back(Buffer source, std::uint64_t bytes, void *out, std::uint64_t offset = 0) { g_dev->read_back(source, offset, bytes, out); }
 
 std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) {
     const Context &c = st.ctx[(attr >> 9) & 1u];
@@ -1098,71 +848,6 @@ Mode mode() { return g_mode; }
 
 bool init(Mode m) {
     if (m == Mode::off) return false;
-#ifdef __EMSCRIPTEN__
-    g_instance = wgpuCreateInstance(nullptr);
-#else
-    WGPUInstanceExtras extras = {};
-    extras.chain.sType = static_cast<WGPUSType>(WGPUSType_InstanceExtras);
-    extras.backends = WGPUInstanceBackend_Primary;
-    WGPUInstanceDescriptor id = WGPU_INSTANCE_DESCRIPTOR_INIT;
-    id.nextInChain = &extras.chain;
-    g_instance = wgpuCreateInstance(&id);
-#endif
-    if (!g_instance) return false;
-    WGPUAdapter adapter = nullptr;
-    bool adapter_done = false;
-    WGPURequestAdapterOptions options = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
-    options.powerPreference = std::getenv("PS2_GPU_LOW_POWER") ? WGPUPowerPreference_LowPower : WGPUPowerPreference_HighPerformance;
-    options.forceFallbackAdapter = std::getenv("PS2_GPU_FALLBACK") != nullptr;
-    WGPURequestAdapterCallbackInfo acb = WGPU_REQUEST_ADAPTER_CALLBACK_INFO_INIT;
-    acb.mode = WGPUCallbackMode_AllowSpontaneous;
-    acb.callback = [](WGPURequestAdapterStatus status, WGPUAdapter a, WGPUStringView, void *out, void *done) {
-        if (status == WGPURequestAdapterStatus_Success) *static_cast<WGPUAdapter *>(out) = a;
-        *static_cast<bool *>(done) = true;
-    };
-    acb.userdata1 = &adapter;
-    acb.userdata2 = &adapter_done;
-    wgpuInstanceRequestAdapter(g_instance, &options, acb);
-    while (!adapter_done) pump();
-    if (!adapter) {
-        std::fprintf(stderr, "[gpu] no adapter\n");
-        return false;
-    }
-    WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
-    if (wgpuAdapterGetInfo(adapter, &info) == WGPUStatus_Success) {
-        std::fprintf(stderr, "[gpu] %.*s (%.*s)\n", static_cast<int>(info.device.length), info.device.data, static_cast<int>(info.description.length), info.description.data);
-        wgpuAdapterInfoFreeMembers(info);
-    }
-    WGPULimits supported = WGPU_LIMITS_INIT;
-    wgpuAdapterGetLimits(adapter, &supported);
-    WGPULimits limits = WGPU_LIMITS_INIT;
-    limits.maxStorageBufferBindingSize = supported.maxStorageBufferBindingSize;
-    limits.maxBufferSize = supported.maxBufferSize;
-    WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
-    dd.requiredLimits = &limits;
-    const WGPUFeatureName timestamp_feature = WGPUFeatureName_TimestampQuery;
-    g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
-    if (g_timestamps) {
-        dd.requiredFeatureCount = 1;
-        dd.requiredFeatures = &timestamp_feature;
-    }
-    dd.uncapturedErrorCallbackInfo.callback = on_error;
-    bool device_done = false;
-    WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
-    dcb.mode = WGPUCallbackMode_AllowSpontaneous;
-    dcb.callback = [](WGPURequestDeviceStatus status, WGPUDevice d, WGPUStringView message, void *out, void *done) {
-        if (status == WGPURequestDeviceStatus_Success) *static_cast<WGPUDevice *>(out) = d;
-        else std::fprintf(stderr, "[gpu] device: %.*s\n", static_cast<int>(message.length), message.data);
-        *static_cast<bool *>(done) = true;
-    };
-    dcb.userdata1 = &g_device;
-    dcb.userdata2 = &device_done;
-    wgpuAdapterRequestDevice(adapter, &dd, dcb);
-    while (!device_done) pump();
-    g_adapter = adapter;
-    if (!g_device) return false;
-    g_queue = wgpuDeviceGetQueue(g_device);
-
     if (const char *spec = std::getenv("PS2_GPU_PROFILE")) {
         char path[512] = {};
         unsigned long long a = 0, z = 0;
@@ -1178,68 +863,23 @@ bool init(Mode m) {
     g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
     g_tile_fill.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
     g_field_words = (1u << 19) * g_scale * g_scale;
-    g_vram = make_buffer(static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
-    std::vector<std::uint32_t> tables;
-    swizzle_tables(tables);
-    g_tables = make_buffer(tables.size() * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
-    wgpuQueueWriteBuffer(g_queue, g_tables, 0, tables.data(), tables.size() * 4);
-    g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
-    g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
-    g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
-    g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
     g_cache_copy.assign(kCacheWords, 0);
-    g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
-    if (g_timestamps) {
-        WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
-        qd.type = WGPUQueryType_Timestamp;
-        qd.count = 2;
-        g_queries = wgpuDeviceCreateQuerySet(g_device, &qd);
-        g_query_resolve = make_buffer(16, WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc);
-        g_query_read = make_buffer(16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
-    }
-
-    WGPUBindGroupLayoutEntry le[8] = {};
-    const WGPUBufferBindingType types[8] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
-                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage, WGPUBufferBindingType_Storage,
-                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage};
-    for (int i = 0; i < 8; ++i) {
-        le[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
-        le[i].binding = static_cast<std::uint32_t>(i);
-        le[i].visibility = WGPUShaderStage_Compute;
-        le[i].buffer.type = types[i];
-        le[i].buffer.hasDynamicOffset = i == 2;
-        le[i].buffer.minBindingSize = i == 2 ? kParamStride : 0;
-    }
-    WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
-    ld.entryCount = 8;
-    ld.entries = le;
-    g_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
-    WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
-    pld.bindGroupLayoutCount = 1;
-    pld.bindGroupLayouts = &g_layout;
-    g_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
-
-    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
-    source.code = view(kGsShader);
-    WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
-    md.nextInChain = &source.chain;
-    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
-    for (int i = 0; i < kPipelines; ++i) {
-        WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
-        cd.layout = g_pipeline_layout;
-        cd.compute.module = module;
-        cd.compute.entryPoint = view(kEntryPoints[i]);
-        WGPUConstantEntry constant = WGPU_CONSTANT_ENTRY_INIT;
-        constant.key = view("SCALE");
-        constant.value = static_cast<double>(g_scale);
-        cd.compute.constantCount = 1;
-        cd.compute.constants = &constant;
-        g_pipelines[i] = wgpuDeviceCreateComputePipeline(g_device, &cd);
-        if (!g_pipelines[i]) return false;
-    }
-    wgpuShaderModuleRelease(module);
-    ensure_capacity();
+    std::vector<std::uint32_t> tables;
+    swizzle_tables(tables);
+    Limits limits;
+    limits.scale = g_scale;
+    limits.vram_bytes = static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale;
+    limits.clut_bytes = static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4;
+    limits.scratch_bytes = (static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4;
+    limits.cache_bytes = static_cast<std::uint64_t>(kCacheWords) * 4;
+    limits.decoded_bytes = static_cast<std::uint64_t>(kDecodedWords) * 4;
+    limits.readback_bytes = static_cast<std::uint64_t>(g_copy_words) * 4;
+#ifdef PS2_GS_VK
+    if (!g_dev && std::getenv("PS2_GS") && std::strcmp(std::getenv("PS2_GS"), "hw") == 0) g_dev = make_vk_device();
+#endif
+    if (!g_dev) g_dev = make_wgpu_device();
+    if (!g_dev->init(limits, tables)) return false;
     g_mode = m;
     return true;
 }
@@ -1507,81 +1147,50 @@ void flush() {
 void wait_idle() {
     flush_all();
     submit();
-    bool done = false;
-    WGPUQueueWorkDoneCallbackInfo cb = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
-    cb.mode = WGPUCallbackMode_AllowProcessEvents;
-    cb.callback = [](WGPUQueueWorkDoneStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
-    cb.userdata1 = &done;
-    wgpuQueueOnSubmittedWorkDone(g_queue, cb);
-    wait_until(done);
+    g_dev->wait_idle();
 }
 
 struct PendingDownload {
-    WGPUBuffer buffer = nullptr;
-    std::uint64_t capacity = 0;
+    int slot = -1;
     std::uint8_t *memory = nullptr;
     std::uint32_t offset = 0, bytes = 0, serial = 0;
-    bool busy = false, ready = false;
 } g_pending;
 
-void collect_download() {
-    if (!g_pending.busy || !g_pending.ready) return;
-    const void *mapped = wgpuBufferGetConstMappedRange(g_pending.buffer, 0, g_pending.bytes);
-    if (mapped) std::memcpy(g_pending.memory + g_pending.offset, mapped, g_pending.bytes);
-    wgpuBufferUnmap(g_pending.buffer);
-    g_pending.busy = g_pending.ready = false;
-}
-
 bool download_async(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes, std::uint32_t serial) {
-    collect_download();
-    if (g_pending.busy) return false;
-    if (g_pending.capacity < bytes) {
-        if (g_pending.buffer) wgpuBufferRelease(g_pending.buffer);
-        g_pending.capacity = bytes;
-        g_pending.buffer = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+    if (g_pending.slot >= 0) {
+        if (g_dev->poll_read(g_pending.slot, g_pending.memory + g_pending.offset) == 0) return false;
+        g_pending.slot = -1;
     }
     flush_all();
     if (g_scale != 1) dispatch_linear(kResolve, bytes / 4, push_params({offset / 4}));
     submit();
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
-    wgpuCommandEncoderCopyBufferToBuffer(enc, g_scale == 1 ? g_vram : g_scratch, offset, g_pending.buffer, 0, bytes);
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
-    wgpuQueueSubmit(g_queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd);
-    wgpuCommandEncoderRelease(enc);
+    const int slot = g_dev->begin_read(g_scale == 1 ? Buffer::Vram : Buffer::Scratch, offset, bytes);
+    if (slot < 0) return false;
+    g_pending.slot = slot;
     g_pending.memory = memory;
     g_pending.offset = offset;
     g_pending.bytes = bytes;
     g_pending.serial = serial;
-    g_pending.busy = true;
-    WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
-    cb.mode = WGPUCallbackMode_AllowProcessEvents;
-    cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *, void *) {
-        if (status == WGPUMapAsyncStatus_Success) g_pending.ready = true;
-        else g_pending.busy = false;
-    };
-    wgpuBufferMapAsync(g_pending.buffer, WGPUMapMode_Read, 0, bytes, cb);
     return true;
 }
 
 bool finish_download(std::uint32_t serial) {
-    if (!g_pending.busy || g_pending.serial != serial) return false;
-    while (g_pending.busy && !g_pending.ready) pump();
-    const bool done = g_pending.ready;
-    collect_download();
-    return done;
+    if (g_pending.slot < 0 || g_pending.serial != serial) return false;
+    const int done = g_dev->wait_read(g_pending.slot, g_pending.memory + g_pending.offset);
+    g_pending.slot = -1;
+    return done > 0;
 }
 
 void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
     flush_all();
     if (g_scale == 1) {
         submit();
-        read_back(g_vram, bytes, memory + offset, offset);
+        read_back(Buffer::Vram, bytes, memory + offset, offset);
         return;
     }
     dispatch_linear(kResolve, bytes / 4, push_params({offset / 4}));
     submit();
-    read_back(g_scratch, bytes, memory + offset, offset);
+    read_back(Buffer::Scratch, bytes, memory + offset, offset);
 }
 
 void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vector<std::uint32_t> &clut) {
@@ -1589,9 +1198,9 @@ void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vec
     submit();
     scale = g_scale;
     vram.resize(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
-    read_back(g_vram, vram.size() * 4, vram.data());
+    read_back(Buffer::Vram, vram.size() * 4, vram.data());
     clut.resize(kClutEntries);
-    read_back(g_clut, kClutEntries * 4, clut.data(), static_cast<std::uint64_t>(g_clut_slot) * kClutEntries * 4);
+    read_back(Buffer::Clut, kClutEntries * 4, clut.data(), static_cast<std::uint64_t>(g_clut_slot) * kClutEntries * 4);
 }
 
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut) {
@@ -1600,14 +1209,14 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
     std::fill(std::begin(g_rendered), std::end(g_rendered), from == to && to > 1);
     if (from == to && vram.size() == words * to) {
-        wgpuQueueWriteBuffer(g_queue, g_vram, 0, vram.data(), vram.size() * 4);
+        g_dev->write(Buffer::Vram, 0, vram.data(), vram.size() * 4);
     } else {
         std::vector<std::uint32_t> layers(words * to);
         for (std::size_t w = 0; w < words; ++w)
             for (std::uint32_t k = 0; k < to; ++k) layers[w * to + k] = vram[w * from];
-        wgpuQueueWriteBuffer(g_queue, g_vram, 0, layers.data(), layers.size() * 4);
+        g_dev->write(Buffer::Vram, 0, layers.data(), layers.size() * 4);
     }
-    if (clut.size() >= kClutEntries) wgpuQueueWriteBuffer(g_queue, g_clut, static_cast<std::uint64_t>(g_clut_slot) * kClutEntries * 4, clut.data(), kClutEntries * 4);
+    if (clut.size() >= kClutEntries) g_dev->write(Buffer::Clut, static_cast<std::uint64_t>(g_clut_slot) * kClutEntries * 4, clut.data(), kClutEntries * 4);
     wait_idle();
 }
 
@@ -1618,231 +1227,86 @@ void stats() {
     std::fprintf(stderr, "\n");
 }
 
-void configure_surface() {
-    WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
-    config.device = g_device;
-    config.format = g_surface_format;
-    config.usage = WGPUTextureUsage_RenderAttachment;
-    config.width = std::max(g_surface_width, 1u);
-    config.height = std::max(g_surface_height, 1u);
-    config.presentMode = g_present_mode;
-    config.alphaMode = WGPUCompositeAlphaMode_Auto;
-    wgpuSurfaceConfigure(g_surface, &config);
-}
-
 bool attach_surface(const SurfaceTarget &target) {
-    if (g_mode != Mode::primary || !g_device) return false;
-    WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
-#ifdef __EMSCRIPTEN__
-    WGPUEmscriptenSurfaceSourceCanvasHTMLSelector canvas = WGPU_EMSCRIPTEN_SURFACE_SOURCE_CANVAS_HTML_SELECTOR_INIT;
-    canvas.selector = view(target.selector ? target.selector : "#canvas");
-    sd.nextInChain = &canvas.chain;
-#else
-    WGPUSurfaceSourceXlibWindow xlib = WGPU_SURFACE_SOURCE_XLIB_WINDOW_INIT;
-    WGPUSurfaceSourceWaylandSurface wayland = WGPU_SURFACE_SOURCE_WAYLAND_SURFACE_INIT;
-    if (target.kind == SurfaceTarget::X11) {
-        xlib.display = target.display;
-        xlib.window = target.window;
-        sd.nextInChain = &xlib.chain;
-    } else if (target.kind == SurfaceTarget::Wayland) {
-        wayland.display = target.display;
-        wayland.surface = target.surface;
-        sd.nextInChain = &wayland.chain;
-    } else {
-        return false;
-    }
-#endif
-    g_surface = wgpuInstanceCreateSurface(g_instance, &sd);
-    if (!g_surface) return false;
-    WGPUSurfaceCapabilities caps = WGPU_SURFACE_CAPABILITIES_INIT;
-    if (wgpuSurfaceGetCapabilities(g_surface, g_adapter, &caps) != WGPUStatus_Success || !caps.formatCount) {
-        wgpuSurfaceRelease(g_surface);
-        g_surface = nullptr;
-        return false;
-    }
-    g_surface_format = caps.formats[0];
-    for (std::size_t i = 0; i < caps.formatCount; ++i)
-        if (caps.formats[i] == WGPUTextureFormat_BGRA8Unorm || caps.formats[i] == WGPUTextureFormat_RGBA8Unorm) {
-            g_surface_format = caps.formats[i];
-            break;
-        }
-    g_present_mode = WGPUPresentMode_Fifo;
-    for (const WGPUPresentMode wanted : {WGPUPresentMode_Immediate, WGPUPresentMode_Mailbox})
-        for (std::size_t i = 0; i < caps.presentModeCount; ++i)
-            if (caps.presentModes[i] == wanted) g_present_mode = wanted;
-    wgpuSurfaceCapabilitiesFreeMembers(caps);
-    g_surface_width = target.width;
-    g_surface_height = target.height;
-    configure_surface();
-
-    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
-    source.code = view(kBlitShader);
-    WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
-    md.nextInChain = &source.chain;
-    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
-    WGPUBindGroupLayoutEntry le[2] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
-    le[0].binding = 0;
-    le[0].visibility = WGPUShaderStage_Fragment;
-    le[0].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
-    le[1].binding = 1;
-    le[1].visibility = WGPUShaderStage_Fragment;
-    le[1].buffer.type = WGPUBufferBindingType_Uniform;
-    WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
-    ld.entryCount = 2;
-    ld.entries = le;
-    WGPUBindGroupLayout layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
-    WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
-    pld.bindGroupLayoutCount = 1;
-    pld.bindGroupLayouts = &layout;
-    WGPUPipelineLayout pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
-    WGPUColorTargetState color = WGPU_COLOR_TARGET_STATE_INIT;
-    color.format = g_surface_format;
-    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
-    fragment.module = module;
-    fragment.entryPoint = view("fs");
-    fragment.targetCount = 1;
-    fragment.targets = &color;
-    WGPURenderPipelineDescriptor rd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
-    rd.layout = pipeline_layout;
-    rd.vertex.module = module;
-    rd.vertex.entryPoint = view("vs");
-    rd.fragment = &fragment;
-    g_blit = wgpuDeviceCreateRenderPipeline(g_device, &rd);
-    wgpuShaderModuleRelease(module);
-    wgpuPipelineLayoutRelease(pipeline_layout);
-    g_blit_params = make_buffer(32, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
-    WGPUBindGroupEntry be[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
-    be[0].binding = 0;
-    be[0].buffer = g_scratch;
-    be[0].size = WGPU_WHOLE_SIZE;
-    be[1].binding = 1;
-    be[1].buffer = g_blit_params;
-    be[1].size = 32;
-    WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-    bd.layout = layout;
-    bd.entryCount = 2;
-    bd.entries = be;
-    g_blit_group = wgpuDeviceCreateBindGroup(g_device, &bd);
-    wgpuBindGroupLayoutRelease(layout);
-    return g_blit != nullptr;
+    if (g_mode != Mode::primary || !g_dev) return false;
+    return g_dev->attach_surface(target);
 }
 
-void resize_surface(std::uint32_t width, std::uint32_t height) {
-    if (!g_surface || (width == g_surface_width && height == g_surface_height)) return;
-    g_surface_width = width;
-    g_surface_height = height;
-    configure_surface();
-}
+void resize_surface(std::uint32_t width, std::uint32_t height) { g_dev->resize_surface(width, height); }
 
-bool has_surface() { return g_surface != nullptr; }
+bool has_surface() { return g_dev && g_dev->has_surface(); }
 
 bool present(const DisplaySource &src) {
-    if (!g_surface) return false;
+    if (!has_surface()) return false;
     flush_all();
     const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
     static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
     const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
     const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, current});
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
-    const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
+    const float sw = static_cast<float>(g_dev->surface_width()), sh = static_cast<float>(g_dev->surface_height());
     const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
     const float vw = std::min(sw, sh * aspect), vh = vw / aspect;
-    const std::uint32_t blit[8] = {src.width * g_scale, src.height * g_scale, current, previous, blend ? 1u : 0u, static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), 0};
-    wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, blit, sizeof blit);
+    const Blit blit = {{src.width * g_scale, src.height * g_scale, current, previous, blend ? 1u : 0u, static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), 0}};
+    g_dev->set_blit(blit);
     ++g_field;
     g_have_previous = true;
     g_last_width = src.width;
     g_last_height = src.height;
-    WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
-    wgpuSurfaceGetCurrentTexture(g_surface, &st);
-    if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
-        if (st.texture) wgpuTextureRelease(st.texture);
-        submit();
-        configure_surface();
-        return true;
-    }
-    WGPUTextureView target = wgpuTextureCreateView(st.texture, nullptr);
-    submit(target);
-#ifndef __EMSCRIPTEN__
-    wgpuSurfacePresent(g_surface);
-#endif
-    wgpuTextureViewRelease(target);
-    wgpuTextureRelease(st.texture);
+    submit(true);
     return true;
 }
 
-double busy_ms() {
-    if (!g_measured) return 0.0;
-    return static_cast<double>(g_measured_ns) / static_cast<double>(g_measured) * static_cast<double>(g_total_passes) / 1e6;
-}
+double busy_ms() { return g_dev ? g_dev->busy_ms() : 0.0; }
 
 struct Copy {
-    WGPUBuffer buffer = nullptr;
-    std::uint64_t size = 0, order = 0;
+    int slot = -1;
+    std::uint64_t order = 0;
     std::uint32_t width = 0, height = 0;
-    bool busy = false, ready = false;
+    std::vector<std::uint32_t> pixels;
+    bool ready = false;
 };
 Copy g_copies[3];
 std::uint64_t g_copy_order = 0;
 
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
-#ifdef __EMSCRIPTEN__
-    wgpuInstanceProcessEvents(g_instance);
-#else
-    wgpuDevicePoll(g_device, false, nullptr);
-#endif
+    for (Copy &c : g_copies) {
+        if (c.slot < 0 || c.ready) continue;
+        const int r = g_dev->poll_read(c.slot, c.pixels.data());
+        if (r > 0) c.ready = true;
+        else if (r < 0) c.slot = -1;
+    }
     Copy *newest = nullptr;
     for (Copy &c : g_copies)
         if (c.ready && (!newest || c.order > newest->order)) newest = &c;
     if (newest) {
-        const std::uint64_t bytes = static_cast<std::uint64_t>(newest->width) * newest->height * 4;
-        const void *mapped = wgpuBufferGetConstMappedRange(newest->buffer, 0, bytes);
-        if (mapped) {
-            rgba.resize(static_cast<std::size_t>(newest->width) * newest->height);
-            std::memcpy(rgba.data(), mapped, bytes);
-            width = newest->width;
-            height = newest->height;
-        }
+        rgba.swap(newest->pixels);
+        rgba.resize(static_cast<std::size_t>(newest->width) * newest->height);
+        width = newest->width;
+        height = newest->height;
         for (Copy &c : g_copies)
             if (c.ready && c.order <= newest->order) {
-                wgpuBufferUnmap(c.buffer);
-                c.ready = c.busy = false;
+                c.ready = false;
+                c.slot = -1;
             }
-        if (!mapped) newest = nullptr;
     }
     Copy *slot = nullptr;
     for (Copy &c : g_copies)
-        if (!c.busy) slot = &c;
+        if (c.slot < 0) slot = &c;
     if (slot) {
         const std::uint64_t bytes = static_cast<std::uint64_t>(src.width) * src.height * g_scale * g_scale * 4;
-        if (slot->size < bytes) {
-            if (slot->buffer) wgpuBufferRelease(slot->buffer);
-            slot->size = bytes;
-            slot->buffer = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
-        }
         flush_all();
         const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
         g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
         submit();
-        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, g_scratch, 0, slot->buffer, 0, bytes);
-        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
-        wgpuQueueSubmit(g_queue, 1, &cmd);
-        wgpuCommandBufferRelease(cmd);
-        wgpuCommandEncoderRelease(enc);
-        slot->busy = true;
-        slot->order = ++g_copy_order;
-        slot->width = src.width * g_scale;
-        slot->height = src.height * g_scale;
-        WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
-        cb.mode = WGPUCallbackMode_AllowProcessEvents;
-        cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *copy, void *) {
-            Copy &c = *static_cast<Copy *>(copy);
-            if (status == WGPUMapAsyncStatus_Success) c.ready = true;
-            else c.busy = false;
-        };
-        cb.userdata1 = slot;
-        wgpuBufferMapAsync(slot->buffer, WGPUMapMode_Read, 0, bytes, cb);
+        slot->pixels.resize(static_cast<std::size_t>(bytes / 4));
+        slot->slot = g_dev->begin_read(Buffer::Scratch, 0, bytes);
+        if (slot->slot >= 0) {
+            slot->order = ++g_copy_order;
+            slot->width = src.width * g_scale;
+            slot->height = src.height * g_scale;
+            slot->ready = false;
+        }
     }
     return newest != nullptr;
 }
@@ -1855,7 +1319,7 @@ bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::ui
     width = src.width * g_scale;
     height = src.height * g_scale;
     rgba.resize(static_cast<std::size_t>(width) * height);
-    read_back(g_scratch, rgba.size() * 4, rgba.data());
+    read_back(Buffer::Scratch, rgba.size() * 4, rgba.data());
     return true;
 }
 

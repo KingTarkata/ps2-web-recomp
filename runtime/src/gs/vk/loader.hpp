@@ -92,7 +92,14 @@ namespace ps2::gs::vk {
     X(vkCmdSetViewport) \
     X(vkCmdSetScissor) \
     X(vkCmdDraw) \
-    X(vkCmdFillBuffer)
+    X(vkCmdFillBuffer) \
+    X(vkGetFenceStatus) \
+    X(vkCreateQueryPool) \
+    X(vkDestroyQueryPool) \
+    X(vkCmdResetQueryPool) \
+    X(vkCmdWriteTimestamp) \
+    X(vkGetQueryPoolResults) \
+    X(vkFreeCommandBuffers)
 
 #define PS2_VK_DECLARE(name) extern PFN_##name name;
 PS2_VK_GLOBAL_FUNCTIONS(PS2_VK_DECLARE)
