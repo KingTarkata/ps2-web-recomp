@@ -265,21 +265,41 @@ now. The runtime's queue and threads do not change.
   buffer loads per fragment (the fragment shader also reloads the setup
   record per fragment); then DATE through stencil; then the depth copies.
 
-### 2026-10-27, afternoon: Switch measurements invalid from 09:19
+### 2026-10-27, afternoon: a 10x shader regression, found and fixed
 
-Every run on the Switch from the hw9 profile (09:19) onward is 7-15x slower
-than the morning runs, on the hardware path and on the compute path alike
-(compute: 978 ms of GPU time per frame against a 57-67 ms baseline), with
-the hardware build fully reverted to the hw8 state as well. `tegrastats`
-under load shows GR3D at 99% with EMC_FREQ at 0%, and the GPU devfreq at
-768 MHz: the memory controller clock is stuck low. No package changed and
-nothing is in the kernel log; the device needs a reboot (or a root-level
-`jetson_clocks --show`) before any number is trusted again. Consequences:
+The texture-cache commit (a00568b) refactored `load_setup` in gs.wgsl into a
+`make_setup(d: array<u32, 25>)` helper so the hardware path could build the
+same struct from its uniform copy. On the Tegra compiler an array passed by
+value lands in per-fragment local memory, and every shader that reads a
+setup record goes through it: the hardware fragment shaders, `decode_tex`,
+and the compute rasterizer. Measured on the Switch: hardware raster 35.6 ->
+372 ms per frame, decode 5.4 -> 36 ms, compute-path GPU time 57-67 -> 978 ms.
 
-- The effect of carrying the setup record in the per-run uniform block
-  (commit a00568b) is unmeasured. The hw9 figures (raster 372 ms) are not a
-  property of the code.
-- A loop over `hw.setup` with computed indices was tried as the cause and
-  ruled out; so was reading the record from the data arena.
-- Background `ssh` runs that finish while the link is idle can hang on
-  return: use `-o ServerAliveInterval=15` and read the logs on the device.
+Finding it took most of the day because the first suspects were wrong: a
+loop with computed indices over `hw.setup` (rewritten, no change), the
+uniform read itself (replaced by an arena read, no change), the uniform
+struct size (fully reverted, no change), then the device (clocks checked
+with root: GPU 768 MHz, EMC 1600 MHz, GPU 99% busy; rebooted, no change).
+The compute path being slow with a binary whose only shared change was
+gs.wgsl pointed at `load_setup`. The fix reads the fields directly in both
+`load_setup` and `setup_u` (hw.wgsl). A first version of the fix dropped the
+three derived `fmt_of` fields and rendered black frames on both machines
+with very fast numbers; the frame check caught it. Lessons: measure every
+shader refactor on the device, never only on llvmpipe; a performance run
+needs a rendered-frame check next to it; and the compute path is a useful
+control because it shares gs.wgsl with the hardware path.
+
+Results with the fix (race from the saved state, frames 6050-6650, native
+frames bit-identical to the verified st-hw3 run):
+
+| Measurement | before texture cache | hw8 (cache, setup from arena) | now (cache, setup in uniform) |
+|---|---|---|---|
+| GPU time per frame, profile | 48.3 ms (raster 36.7) | 44.2 ms (raster 35.6) | 41.6 ms (raster 32.9, load_clut 4.0, decode 2.4, upload 2.2) |
+| threaded, unpaced, windowed | 45-49 ms | 48-56 ms | 46.8-56.2 ms, CPU 174-186%, GPU 69-81% |
+| single-threaded (`PS2_TIME`, no profiler) | 70.5 ms | - | 90.2 ms |
+
+The GPU is no longer the bottleneck in the threaded run (busy under 100%
+for the first time); the texture cache costs about 20 ms of CPU per frame
+in the single-threaded figure, which is the next thing to cut: block-id
+validation over the sampled footprint, `blocks_of` per upload chunk, and
+the linear key search in `texture_slot`.

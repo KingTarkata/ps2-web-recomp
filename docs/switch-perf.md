@@ -80,5 +80,8 @@ second). On the Switch over SSH: `DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority
 | 2026-10-27 | Race from saved state, threaded, unpaced, windowed, compute path (`PS2_GS=gpu`) | 80-86 | CPU 75-85% of one core, GPU busy 61% |
 | 2026-10-27 | same, hardware path with resident surfaces (`PS2_GS=hw`) | 45-49 | CPU 150-185% (EE and GS threads both busy), GPU busy over 100%: GPU-bound; GPU profile 48 ms/frame (raster 37, decode 5.4, load_clut 4.0, upload 2.0) |
 | 2026-10-27 | same, single-threaded (`PS2_TIME`), hardware path, for comparison with the rows above | 70.5 | down from 74.3 with per-batch import/export |
+| 2026-10-27 | same, threaded, hardware path with the texture cache and the setup record in the per-run uniform (a00568b plus the `load_setup` fix) | 46.8-56.2 | CPU 174-186%, GPU busy 69-81%: CPU-bound now; GPU profile 41.6 ms/frame (raster 32.9, load_clut 4.0, decode 2.4, upload 2.2) |
+| 2026-10-27 | same, single-threaded (`PS2_TIME`, no profiler), hardware path with the texture cache | 90.2 | the cache costs ~20 ms of CPU per frame single-threaded; the GPU gain (48.3 -> 41.6) is hidden behind it |
+| 2026-10-27 | (invalid) runs hw9-hw14 between 09:19 and 12:30 | 132-560 | `load_setup` routed through an array by value: 10x shader slowdown on Tegra, both renderers; see gs-hw-renderer.md |
 
 Mode 0 "Console" (768 MHz GPU) throughout. Target remains 16.7 ms.

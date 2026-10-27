@@ -466,55 +466,47 @@ const F_TCC: u32 = 8192u;
 const F_BILINEAR: u32 = 16384u;
 const F_AEM: u32 = 32768u;
 
-fn make_setup(d: array<u32, 25>) -> Setup {
+// Reads a setup record from the data arena, field by field. Do not route
+// this through an array<u32, 25>: passed by value it lands in per-fragment
+// local memory on Tegra and every shader slows down about ten times.
+fn load_setup(at: u32) -> Setup {
     var s: Setup;
-    s.flags = d[0];
-    s.fbp = d[1];
-    s.fbw = d[2];
-    s.fpsm = d[3];
-    s.fbmsk = d[4];
-    s.zbp = d[5];
-    s.zpsm = d[6];
-    s.modes = d[7];
-    s.aref = d[8];
-    s.fix = d[9];
-    s.scax0 = i32(d[10] & 0xFFFFu);
-    s.scax1 = i32(d[10] >> 16u);
-    s.scay0 = i32(d[11] & 0xFFFFu);
-    s.scay1 = i32(d[11] >> 16u);
-    s.tbp = d[12];
-    s.tbw = d[13];
-    s.tpsm = d[14];
-    s.tw = d[15] & 0xFFu;
-    s.th = d[15] >> 8u;
-    s.cpsm = d[16];
-    s.csa = d[17];
-    s.minu = d[18] & 0xFFFFu;
-    s.maxu = d[18] >> 16u;
-    s.minv = d[19] & 0xFFFFu;
-    s.maxv = d[19] >> 16u;
-    s.ta0 = d[20] & 0xFFu;
-    s.ta1 = (d[20] >> 8u) & 0xFFu;
-    s.fogcol = d[21];
-    s.clut = d[22] & 0xFFFu;  // the high bits name the CLUT load (texture caches)
-    s.zmax = d[23];
-    s.dec = d[24];
+    s.flags = data[at];
+    s.fbp = data[at + 1u];
+    s.fbw = data[at + 2u];
+    s.fpsm = data[at + 3u];
+    s.fbmsk = data[at + 4u];
+    s.zbp = data[at + 5u];
+    s.zpsm = data[at + 6u];
+    s.modes = data[at + 7u];
+    s.aref = data[at + 8u];
+    s.fix = data[at + 9u];
+    s.scax0 = i32(data[at + 10u] & 0xFFFFu);
+    s.scax1 = i32(data[at + 10u] >> 16u);
+    s.scay0 = i32(data[at + 11u] & 0xFFFFu);
+    s.scay1 = i32(data[at + 11u] >> 16u);
+    s.tbp = data[at + 12u];
+    s.tbw = data[at + 13u];
+    s.tpsm = data[at + 14u];
+    s.tw = data[at + 15u] & 0xFFu;
+    s.th = data[at + 15u] >> 8u;
+    s.cpsm = data[at + 16u];
+    s.csa = data[at + 17u];
+    s.minu = data[at + 18u] & 0xFFFFu;
+    s.maxu = data[at + 18u] >> 16u;
+    s.minv = data[at + 19u] & 0xFFFFu;
+    s.maxv = data[at + 19u] >> 16u;
+    s.ta0 = data[at + 20u] & 0xFFu;
+    s.ta1 = (data[at + 20u] >> 8u) & 0xFFu;
+    s.fogcol = data[at + 21u];
+    s.clut = data[at + 22u] & 0xFFFu;  // the high bits name the CLUT load (texture caches)
+    s.zmax = data[at + 23u];
+    s.dec = data[at + 24u];
     s.tf = fmt_of(s.tpsm, s.tbp, s.tbw);
     s.ff = fmt_of(s.fpsm, s.fbp, s.fbw);
     s.zf = fmt_of(s.zpsm, s.zbp, s.fbw);
     return s;
 }
-
-// Reads a setup record from the data arena; the hardware path builds the
-// same struct from a uniform copy (hw.wgsl) so fragments avoid these loads.
-fn load_setup(at: u32) -> Setup {
-    var d: array<u32, 25>;
-    for (var i = 0u; i < 25u; i = i + 1u) {
-        d[i] = data[at + i];
-    }
-    return make_setup(d);
-}
-
 
 fn has(s: Setup, f: u32) -> bool {
     return (s.flags & f) != 0u;

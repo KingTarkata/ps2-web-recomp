@@ -28,16 +28,45 @@ struct HwParams {
     setup: array<vec4<u32>, 7>,  // draws: the setup record itself, so no fragment loads it from `data`
 };
 
+// The setup record from the uniform copy, field by field (see load_setup in
+// gs.wgsl for why there is no intermediate array).
 fn setup_u() -> Setup {
-    var d: array<u32, 25>;
-    for (var i = 0u; i < 7u; i = i + 1u) {
-        let v = hw.setup[i];
-        d[i * 4u] = v.x;
-        if (i * 4u + 1u < 25u) { d[i * 4u + 1u] = v.y; }
-        if (i * 4u + 2u < 25u) { d[i * 4u + 2u] = v.z; }
-        if (i * 4u + 3u < 25u) { d[i * 4u + 3u] = v.w; }
-    }
-    return make_setup(d);
+    var s: Setup;
+    s.flags = hw.setup[0].x;
+    s.fbp = hw.setup[0].y;
+    s.fbw = hw.setup[0].z;
+    s.fpsm = hw.setup[0].w;
+    s.fbmsk = hw.setup[1].x;
+    s.zbp = hw.setup[1].y;
+    s.zpsm = hw.setup[1].z;
+    s.modes = hw.setup[1].w;
+    s.aref = hw.setup[2].x;
+    s.fix = hw.setup[2].y;
+    s.scax0 = i32(hw.setup[2].z & 0xFFFFu);
+    s.scax1 = i32(hw.setup[2].z >> 16u);
+    s.scay0 = i32(hw.setup[2].w & 0xFFFFu);
+    s.scay1 = i32(hw.setup[2].w >> 16u);
+    s.tbp = hw.setup[3].x;
+    s.tbw = hw.setup[3].y;
+    s.tpsm = hw.setup[3].z;
+    s.tw = hw.setup[3].w & 0xFFu;
+    s.th = hw.setup[3].w >> 8u;
+    s.cpsm = hw.setup[4].x;
+    s.csa = hw.setup[4].y;
+    s.minu = hw.setup[4].z & 0xFFFFu;
+    s.maxu = hw.setup[4].z >> 16u;
+    s.minv = hw.setup[4].w & 0xFFFFu;
+    s.maxv = hw.setup[4].w >> 16u;
+    s.ta0 = hw.setup[5].x & 0xFFu;
+    s.ta1 = (hw.setup[5].x >> 8u) & 0xFFu;
+    s.fogcol = hw.setup[5].y;
+    s.clut = hw.setup[5].z & 0xFFFu;  // the high bits name the CLUT load (texture caches)
+    s.zmax = hw.setup[5].w;
+    s.dec = hw.setup[6].x;
+    s.tf = fmt_of(s.tpsm, s.tbp, s.tbw);
+    s.ff = fmt_of(s.fpsm, s.fbp, s.fbw);
+    s.zf = fmt_of(s.zpsm, s.zbp, s.fbw);
+    return s;
 }
 
 @group(1) @binding(0) var<uniform> hw: HwParams;
