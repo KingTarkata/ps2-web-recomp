@@ -53,6 +53,8 @@ private:
     bool build_pipelines(VkShaderModule module);
     VkShaderModule module_ = VK_NULL_HANDLE;
     bool ensure_target(std::uint32_t width, std::uint32_t height);
+    bool draw_part(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, const std::uint32_t *setups, std::uint32_t zmode,
+                   std::uint32_t param_index);
     bool supported(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params, const std::uint32_t *&setups, std::uint32_t &zmode) const;
     std::uint32_t push_uniform(FrameScratch &f, const std::uint32_t words[8]);
     void append_prims(FrameScratch &f, const std::uint32_t *prims, std::uint32_t count, std::vector<std::uint32_t> &first, std::vector<std::uint32_t> &counts);

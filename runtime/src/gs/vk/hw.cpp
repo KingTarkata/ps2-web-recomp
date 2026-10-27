@@ -373,7 +373,6 @@ bool HwRaster::supported(const gpu::Command &cmd, const std::uint32_t *arena, co
             if ((flags & F_PABE) || !(flags & F_COLCLAMP) || !blend_key(w, ctx_->features.dualSrcBlend == VK_TRUE)) return no(3);
         }
         if (flags & F_DATE) return no(4);
-        if (w[4] != setups[4]) return no(5);  // one frame mask per batch, applied at export
         if (w[3] != 0x00u && w[3] != 0x01u) return no(6);
         if (flags & F_ZTE) {
             const std::uint32_t ztst = (w[7] >> 8) & 3u;
@@ -472,6 +471,37 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     const std::uint32_t *p = params + cmd.param * (gpu::kParamStride / 4);
     const std::uint32_t *prims = arena + p[1];
     const std::uint32_t setup_offset = p[2];
+    // Frame masks apply at export, so a batch whose setups mask differently is
+    // drawn as one mini-batch per run of primitives sharing a setup.
+    bool mixed_masks = false;
+    for (std::uint32_t i = 1; i < cmd.setups; ++i) mixed_masks = mixed_masks || setups[i * kSetupWords + 4] != setups[4];
+    if (mixed_masks && cmd.prims > 1) {
+        std::uint32_t i = 0;
+        while (i < cmd.prims) {
+            const std::uint32_t si = prims[i * kPrimWords];
+            std::uint32_t j = i + 1;
+            while (j < cmd.prims && prims[j * kPrimWords] == si) ++j;
+            gpu::Command part = cmd;
+            part.prims = j - i;
+            // Point the part at its primitives through a private parameter copy.
+            std::uint32_t words[gpu::kParamStride / 4];
+            std::memcpy(words, p, sizeof words);
+            words[1] = p[1] + i * kPrimWords;
+            part.param = 0;
+            if (!draw_part(cb, part, set0, arena, words, setups, zmode, cmd.param)) return false;
+            i = j;
+        }
+        return true;
+    }
+    return draw_part(cb, cmd, set0, arena, p, setups, zmode, cmd.param);
+}
+
+bool HwRaster::draw_part(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *p, const std::uint32_t *setups, std::uint32_t zmode,
+                         std::uint32_t param_index) {
+    static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
+    FrameScratch &f = *frame_;
+    const std::uint32_t *prims = arena + p[1];
+    const std::uint32_t setup_offset = p[2];
     // The batch rectangle, from the primitive boxes.
     std::uint32_t minx = ~0u, miny = ~0u, maxx = 0, maxy = 0;
     for (std::uint32_t i = 0; i < cmd.prims; ++i) {
@@ -496,7 +526,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     }
     const bool with_depth = zmode != 0;
     const std::uint32_t first_setup = setup_offset;  // all setups share frame and depth buffers
-    const std::uint32_t rect_words[8] = {first_setup, setups[4], scale_, with_depth ? 1u : 0u, minx, miny, rw, rh};
+    const std::uint32_t rect_words[8] = {first_setup, setups[prims[0] * kSetupWords + 4], scale_, with_depth ? 1u : 0u, minx, miny, rw, rh};
     const std::uint32_t rect_uniform = push_uniform(f, rect_words);
     const std::uint32_t draw_words[8] = {first_setup, 0, scale_, with_depth ? 1u : 0u, 0, 0, target_.width, target_.height};
     const std::uint32_t draw_uniform = push_uniform(f, draw_words);
@@ -505,7 +535,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     const VkDescriptorSet sets[2] = {set0, f.set1};
     // Set 0 carries the compute renderer's dynamic parameter block too, so
     // two dynamic offsets go with the two sets.
-    const std::uint32_t param_offset = cmd.param * gpu::kParamStride;
+    const std::uint32_t param_offset = param_index * gpu::kParamStride;
     const auto bind = [&](VkPipelineBindPoint point, std::uint32_t uniform) {
         const std::uint32_t offsets[2] = {param_offset, uniform};
         vkCmdBindDescriptorSets(cb, point, layout_, 0, 2, sets, 2, offsets);
