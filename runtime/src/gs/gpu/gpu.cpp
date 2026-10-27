@@ -3,10 +3,12 @@
 // resulting command lists on wgpu-native or Vulkan.
 #include "gpu.hpp"
 #include "device.hpp"
+#include "../gs.hpp"
 #include "ps2/system.hpp"
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +47,7 @@ std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1
 
 std::uint32_t g_decoded_used = 0;
 bool g_rendered[512] = {};
+std::uint64_t g_uploads = 0;
 bool g_decode = true;
 struct CommandInfo {
     std::size_t index;
@@ -80,6 +83,8 @@ struct Arena {
     std::uint32_t &operator[](std::size_t i) { return words[i]; }
 } g_arena;
 std::uint32_t g_clut_slot = 0, g_clut_loads = 0, g_texflushes = 0;
+std::map<std::array<std::uint32_t, 6>, std::uint32_t> g_clut_sources;  // (cbp, cbw, cpsm, csm, cou, cov) -> id, for texture caches
+std::uint32_t g_clut_source_id = 0;  // of the latest load
 
 struct Image {
     bool active = false;
@@ -669,6 +674,19 @@ void queue_pre(const PreOp &op) {
     g_pre.push_back(op);
 }
 
+// The 256-byte blocks a rectangle of a buffer touches, exact per format
+// (one probe per block cell), sorted and unique.
+void blocks_of(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, int x0, int y0, int x1, int y1, std::vector<std::uint32_t> &out) {
+    out.clear();
+    std::uint32_t cw, ch;
+    block_cell(psm, cw, ch);
+    for (int y = y0 - y0 % static_cast<int>(ch); y <= y1; y += static_cast<int>(ch))
+        for (int x = x0 - x0 % static_cast<int>(cw); x <= x1; x += static_cast<int>(cw))
+            out.push_back(pixel_address(psm, bp, bw, static_cast<std::uint32_t>(std::max(x, 0)), static_cast<std::uint32_t>(std::max(y, 0))) >> 8);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+}
+
 std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uint32_t lead_bits) {
     Image &im = g_image;
     const std::uint64_t bits = static_cast<std::uint64_t>(size) * 8;
@@ -690,6 +708,15 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     const std::uint32_t first = im.done / im.rrw, last = (im.done + pixels - 1) / im.rrw;
     op.range = region(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1),
                       static_cast<int>(im.dsay + last));
+    // Tell the device which blocks this chunk writes and with what content,
+    // so textures decoded from them survive the same upload next frame.
+    {
+        static std::vector<std::uint32_t> blocks;
+        blocks_of(im.dpsm, im.dbp, im.dbw, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1), static_cast<int>(im.dsay + last), blocks);
+        const std::uint64_t id = content_key(bytes, n) ^ (static_cast<std::uint64_t>(im.done) << 40) ^ (static_cast<std::uint64_t>(im.dbp) << 20) ^ 0x9E3779B97F4A7C15ull;
+        g_dev->blocks_written(blocks.data(), blocks.size(), id);
+    }
+    ++g_uploads;
     op.x0 = im.dsax;
     op.x1 = im.dsax + im.rrw - 1;
     op.y0 = im.dsay + first;
@@ -814,7 +841,7 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     w[19] = (static_cast<std::uint32_t>(c.clamp >> 24) & 0x3FFu) | ((static_cast<std::uint32_t>(c.clamp >> 34) & 0x3FFu) << 16);
     w[20] = (static_cast<std::uint32_t>(st.texa) & 0xFFu) | ((static_cast<std::uint32_t>(st.texa >> 32) & 0xFFu) << 8);
     w[21] = static_cast<std::uint32_t>(st.fogcol) & 0xFFFFFFu;
-    w[22] = g_clut_slot;
+    w[22] = g_clut_slot | (g_clut_source_id << 12);  // slot in the low 12 bits (kClutSlots), the CLUT source id above
     w[23] = z_max(zpsm);
     w[24] = 0xFFFFFFFFu;
     return flags;
@@ -1200,6 +1227,13 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     queue_pre(op);
     g_clut_slot = next;
     ++g_clut_loads;
+    const std::array<std::uint32_t, 6> source{cbp, cbw, cpsm, csm, cou, cov};
+    auto it = g_clut_sources.find(source);
+    if (it == g_clut_sources.end()) {
+        it = g_clut_sources.emplace(source, static_cast<std::uint32_t>(g_clut_sources.size() + 1)).first;
+        g_dev->clut_source(it->second, span_of(op.range));
+    }
+    g_clut_source_id = it->second;
 }
 
 void texflush() { ++g_texflushes; }

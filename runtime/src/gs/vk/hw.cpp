@@ -1,5 +1,6 @@
 #include "hw.hpp"
 #include "ps2/system.hpp"
+#include "../gs.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -14,6 +15,7 @@ namespace {
 constexpr std::uint32_t kPrimWords = 28, kSetupWords = 25;
 constexpr std::uint64_t kVertexBytes = 16u << 20, kUniformBytes = 16u << 20;
 constexpr std::uint32_t kUniformStride = 256;
+constexpr std::uint32_t kUniformWords = 12 + 28;  // HwParams: 12 words plus the setup record padded to 7 vec4s
 constexpr std::uint32_t kMaxFailModePrims = 1024;
 
 constexpr std::uint32_t F_TME = 2, F_ABE = 8, F_ZMSK = 32, F_ATE = 64, F_DATE = 128, F_ZTE = 512, F_PABE = 1024, F_COLCLAMP = 2048;
@@ -77,9 +79,28 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     lci.bindingCount = 6;
     lci.pBindings = b;
     if (vkCreateDescriptorSetLayout(ctx.device, &lci, nullptr, &set1_layout_) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout sets[2] = {set0, set1_layout_};
+    // Samplers for the cached-texture path: bilinear, REPEAT or CLAMP per axis.
+    for (int i = 0; i < 4; ++i) {
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = (i & 2) ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.addressModeV = (i & 1) ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = 0.0f;
+        if (vkCreateSampler(ctx.device, &sci, nullptr, &samplers_[i]) != VK_SUCCESS) return false;
+    }
+    VkDescriptorSetLayoutBinding t[6] = {};
+    t[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    t[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    for (int i = 0; i < 4; ++i) t[2 + i] = {static_cast<std::uint32_t>(2 + i), VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, &samplers_[i]};
+    VkDescriptorSetLayoutCreateInfo tci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    tci.bindingCount = 6;
+    tci.pBindings = t;
+    if (vkCreateDescriptorSetLayout(ctx.device, &tci, nullptr, &set2_layout_) != VK_SUCCESS) return false;
+    VkDescriptorSetLayout sets[3] = {set0, set1_layout_, set2_layout_};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    pli.setLayoutCount = 2;
+    pli.setLayoutCount = 3;
     pli.pSetLayouts = sets;
     if (vkCreatePipelineLayout(ctx.device, &pli, nullptr, &layout_) != VK_SUCCESS) return false;
     // One set per surface and frame slot; surfaces come and go, so sets are freed.
@@ -91,6 +112,14 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     dpi.poolSizeCount = 4;
     dpi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx.device, &dpi, nullptr, &pool_) != VK_SUCCESS) return false;
+    const std::uint32_t max_tex = static_cast<std::uint32_t>(kMaxTextures + kMaxSurfaces) * 2 + 8;
+    VkDescriptorPoolSize sizes2[3] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, max_tex}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, max_tex}, {VK_DESCRIPTOR_TYPE_SAMPLER, max_tex * 4}};
+    VkDescriptorPoolCreateInfo dpi2{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi2.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpi2.maxSets = max_tex;
+    dpi2.poolSizeCount = 3;
+    dpi2.pPoolSizes = sizes2;
+    if (vkCreateDescriptorPool(ctx.device, &dpi2, nullptr, &pool2_) != VK_SUCCESS) return false;
     for (FrameScratch &f : frames_) {
         if (!ctx.create_buffer(f.vertices, kVertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true)) return false;
         if (!ctx.create_buffer(f.uniforms, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true)) return false;
@@ -135,7 +164,7 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
 }
 
 bool HwRaster::write_set1(VkDescriptorSet set, int slot, VkImageView surface_view) {
-    VkDescriptorBufferInfo ub{frames_[slot].uniforms.buffer, 0, 48};
+    VkDescriptorBufferInfo ub{frames_[slot].uniforms.buffer, 0, kUniformWords * 4};
     VkDescriptorImageInfo image{VK_NULL_HANDLE, surface_view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo stage{depth_stage_.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorImageInfo dec{VK_NULL_HANDLE, decoded_.view, VK_IMAGE_LAYOUT_GENERAL};
@@ -199,9 +228,9 @@ bool HwRaster::build_pipelines(VkShaderModule module) {
         if (vkCreateRenderPass(ctx_->device, &rpi, nullptr, with_depth ? &pass_depth_ : &pass_nodepth_) != VK_SUCCESS) return false;
     }
     // Compute pipelines for the import/export passes.
-    const char *compute_names[5] = {"import_frame", "export_frame", "export_depth", "import_depth", "decode"};
-    VkPipeline *compute_out[5] = {&import_frame_, &export_frame_, &export_depth_, &import_depth_, &decode_};
-    for (int i = 0; i < 5; ++i) {
+    const char *compute_names[6] = {"import_frame", "export_frame", "export_depth", "import_depth", "decode", "decode_tex"};
+    VkPipeline *compute_out[6] = {&import_frame_, &export_frame_, &export_depth_, &import_depth_, &decode_, &decode_tex_};
+    for (int i = 0; i < 6; ++i) {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -348,7 +377,7 @@ VkPipeline HwRaster::pipeline_for(const PipelineKey &key) {
     stages[0].pName = "hw_vs";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = module_;
-    stages[1].pName = "hw_fs";
+    stages[1].pName = key.shader ? "hw_fs_cached" : "hw_fs";
     const VkCompareOp ops[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
     VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     // Vulkan drops depth writes whenever the depth test is off, so a GS
@@ -392,12 +421,13 @@ void HwRaster::begin_frame(int slot) {
         }
         if (r.framebuffer) vkDestroyFramebuffer(ctx_->device, r.framebuffer, nullptr);
         if (r.sets[0]) vkFreeDescriptorSets(ctx_->device, pool_, 2, r.sets);
+        if (r.set2) vkFreeDescriptorSets(ctx_->device, pool2_, 1, &r.set2);
         if (r.image.image) ctx_->destroy_image(r.image);
     }
     retired_.resize(kept);
 }
 
-std::uint32_t HwRaster::push_uniform(FrameScratch &f, const std::uint32_t words[12]) {
+std::uint32_t HwRaster::push_uniform(FrameScratch &f, const std::uint32_t words[kUniformWords]) {
     if (f.uniform_used + kUniformStride > kUniformBytes) {
         // Out of room: reuse the last slot. Whatever is recorded with it is
         // wrong, which beats writing past the buffer; the counter shows it.
@@ -405,7 +435,7 @@ std::uint32_t HwRaster::push_uniform(FrameScratch &f, const std::uint32_t words[
         f.uniform_used -= kUniformStride;
     }
     const std::uint32_t offset = static_cast<std::uint32_t>(f.uniform_used);
-    std::memcpy(static_cast<std::uint8_t *>(f.uniforms.mapped) + offset, words, 48);
+    std::memcpy(static_cast<std::uint8_t *>(f.uniforms.mapped) + offset, words, kUniformWords * 4);
     f.uniform_used += kUniformStride;
     return offset;
 }
@@ -419,10 +449,42 @@ const char *const kReasons[12] = {"scale", "empty", "snapshot", "blend", "date",
 void HwRaster::print_reasons() const {
     std::fprintf(stderr, "[vk] surfaces: %zu resident, %.1f Mpx imported, %.1f Mpx written back, %llu evictions, %llu aliased batches, %llu uniform overflows\n", surfaces_.size(), static_cast<double>(imported_px_) / 1e6,
                  static_cast<double>(exported_px_) / 1e6, static_cast<unsigned long long>(evictions_), static_cast<unsigned long long>(alias_batches_), static_cast<unsigned long long>(uniform_overflows_));
+    std::fprintf(stderr, "[vk] textures: %zu resident, %llu decoded, %llu hits, %llu sampled from surfaces, %llu copied from own surface; block writes by commands %llu, write-backs %llu, own draws %llu; evictions %llu, stale at lookup %llu\n", textures_.size(),
+                 static_cast<unsigned long long>(decoded_textures_), static_cast<unsigned long long>(texture_hits_), static_cast<unsigned long long>(surface_samples_), static_cast<unsigned long long>(surface_copies_), static_cast<unsigned long long>(tex_drops_[0]), static_cast<unsigned long long>(tex_drops_[1]),
+                 static_cast<unsigned long long>(tex_drops_[2]), static_cast<unsigned long long>(tex_drops_[3]), static_cast<unsigned long long>(tex_drops_[4]));
     std::fprintf(stderr, "[vk] fallback reasons:");
     for (int i = 0; i < 12; ++i)
         if (reasons_[i]) std::fprintf(stderr, " %s %llu", kReasons[i], static_cast<unsigned long long>(reasons_[i]));
     std::fprintf(stderr, "\n");
+}
+
+bool HwRaster::would_draw(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) const {
+    const std::uint32_t *setups = nullptr;
+    std::uint32_t zmode = 0;
+    const std::uint64_t saved[12] = {reasons_[0], reasons_[1], reasons_[2], reasons_[3], reasons_[4], reasons_[5], reasons_[6], reasons_[7], reasons_[8], reasons_[9], reasons_[10], reasons_[11]};
+    const bool ok = cmd.pipeline == gpu::kRaster && supported(cmd, arena, params, setups, zmode);
+    for (int i = 0; i < 12; ++i) reasons_[i] = saved[i];  // a probe, not a decision
+    return ok;
+}
+
+bool HwRaster::decodes_unneeded(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) const {
+    if (!would_draw(cmd, arena, params)) return false;
+    const std::uint32_t *p = params + cmd.param * (gpu::kParamStride / 4);
+    const std::uint32_t *setups = arena + p[2];
+    for (std::uint32_t i = 0; i < cmd.setups; ++i) {
+        const std::uint32_t *w = setups + i * kSetupWords;
+        if ((w[0] & F_TME) && !texture_cacheable(w)) return false;
+    }
+    return true;
+}
+
+gpu::Span HwRaster::texture_span(const std::uint32_t *w) const {
+    std::uint32_t pw, ph;
+    page_size(w[14], pw, ph);
+    const std::uint32_t width = 1u << (w[15] & 0xFFu), height = 1u << (w[15] >> 8);
+    const std::uint64_t per_row = std::max<std::uint32_t>(1, w[13] * 64 / pw);
+    const std::uint64_t base = static_cast<std::uint64_t>(w[12]) * 256;
+    return {static_cast<std::uint32_t>(std::min<std::uint64_t>(base, kMemoryBytes)), static_cast<std::uint32_t>(std::min<std::uint64_t>(base + ((width - 1) / pw + static_cast<std::uint64_t>((height - 1) / ph) * per_row + 1) * 8192, kMemoryBytes))};
 }
 
 bool HwRaster::setup_supported(const std::uint32_t *w) const {
@@ -586,6 +648,27 @@ bool HwRaster::allocate(Surface &s, std::uint32_t width, std::uint32_t height) {
         return false;
     }
     for (int i = 0; i < 2; ++i) write_set1(s.set1[i], i, s.depth ? dummy_.view : s.image.view);
+    if (!s.depth) {
+        VkDescriptorSetAllocateInfo tai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        tai.descriptorPool = pool2_;
+        tai.descriptorSetCount = 1;
+        tai.pSetLayouts = &set2_layout_;
+        if (vkAllocateDescriptorSets(ctx_->device, &tai, &s.set2) == VK_SUCCESS) {
+            VkDescriptorImageInfo image{VK_NULL_HANDLE, s.image.view, VK_IMAGE_LAYOUT_GENERAL};
+            VkWriteDescriptorSet ws[2] = {};
+            for (int i = 0; i < 2; ++i) {
+                ws[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                ws[i].dstSet = s.set2;
+                ws[i].dstBinding = static_cast<std::uint32_t>(i);
+                ws[i].descriptorCount = 1;
+                ws[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                ws[i].pImageInfo = &image;
+            }
+            vkUpdateDescriptorSets(ctx_->device, 2, ws, 0, nullptr);
+        } else {
+            s.set2 = VK_NULL_HANDLE;
+        }
+    }
     s.plane.valid.reset();
     s.plane.dirty.reset();
     return true;
@@ -598,8 +681,10 @@ void HwRaster::retire(Surface &s) {
     r.image = s.image;
     r.sets[0] = s.set1[0];
     r.sets[1] = s.set1[1];
+    r.set2 = s.set2;
     r.at = submits_ + 3;
     retired_.push_back(r);
+    s.set2 = VK_NULL_HANDLE;
     for (auto it = framebuffers_.begin(); it != framebuffers_.end();) {
         if (it->first.first == s.image.view || it->first.second == s.image.view) {
             Retired fb;
@@ -771,7 +856,7 @@ void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
         if (r0.x0 >= s.width || r0.y0 >= s.height) continue;
         const Rect r{r0.x0, r0.y0, std::min(r0.x1, s.width - 1), std::min(r0.y1, s.height - 1)};
         const std::uint32_t rw = (r.x1 - r.x0 + 1) * scale_, rh = (r.y1 - r.y0 + 1) * scale_;
-        const std::uint32_t words[12] = {s.bp, s.bw, s.psm, 0, r.x0, r.y0, rw, rh, scale_, 0, 0, 0};
+        std::uint32_t words[kUniformWords] = {s.bp, s.bw, s.psm, 0, r.x0, r.y0, rw, rh, scale_, 0, 0, 0};
         const std::uint32_t uniform = push_uniform(f, words);
         const std::uint32_t gx = (rw + 15) / 16, gy = (rh + 15) / 16;
         const VkBufferImageCopy region{0, rw, rh, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {static_cast<std::int32_t>(r.x0 * scale_), static_cast<std::int32_t>(r.y0 * scale_), 0}, {rw, rh, 1}};
@@ -848,6 +933,8 @@ void HwRaster::write_back(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
     // written this surface back and dropped it already), so store it
     // before dropping it rather than lose it.
     for (const Rect &r : rects) {
+        tex_drop_cause_ = 1;
+        textures_written(rect_span(s, r));
         if (!drop_aliases) break;
         const gpu::Span span = rect_span(s, r);
         Rect o;
@@ -887,6 +974,8 @@ void HwRaster::memory_read(VkCommandBuffer cb, VkDescriptorSet set0, const gpu::
 }
 
 void HwRaster::memory_written(VkCommandBuffer cb, VkDescriptorSet set0, const gpu::Span &span, const Surface *except_a, const Surface *except_b) {
+    tex_drop_cause_ = 0;
+    if (!keep_textures_) textures_written(span);
     Rect r;
     for (auto &s : surfaces_)
         if (s.get() != except_a && s.get() != except_b && span_rect(*s, span, r)) {
@@ -910,6 +999,8 @@ void HwRaster::barrier_after_copies(VkCommandBuffer cb, const Surface &color, co
     }
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, 0, 0, nullptr, 0, nullptr,
                          depth ? 2 : 1, bars);
+    // Imports into other surfaces this batch samples (texture_set) are made
+    // visible to the fragment stage by the decode barrier in draw().
 }
 
 // After a render pass: its attachment writes must be visible to the next
@@ -928,8 +1019,9 @@ void HwRaster::barrier_after_draw(VkCommandBuffer cb, const Surface &color, cons
         bars[i].subresourceRange = {static_cast<VkImageAspectFlags>(i ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
     }
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                         nullptr, depth ? 2 : 1, bars);
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, depth ? 2 : 1, bars);
 }
 
 // After write-backs: the GS memory they stored is read by what follows.
@@ -940,8 +1032,11 @@ void HwRaster::barrier_copies_visible(VkCommandBuffer cb) {
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
 }
 
-void HwRaster::before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params) {
+void HwRaster::before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, bool next_is_hw_raster) {
     if (surfaces_.empty()) return;
+    // The snapshot before a hardware-drawn batch copies memory the batch
+    // will not read (it samples the surface image): no write-back for it.
+    if (cmd.pipeline == gpu::kSnapshot && next_is_hw_raster) return;
     const std::uint64_t before = exported_px_;
     bool any_dirty = false;
     for (auto &s : surfaces_) any_dirty = any_dirty || s->plane.dirty.any();
@@ -990,7 +1085,9 @@ void HwRaster::before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDes
             }
         }
         for (const gpu::Span &sp : cmd.reads) memory_read(cb, set0, sp);
+        keep_textures_ = cmd.pipeline == gpu::kUpload;  // block ids decide for uploads
         for (const gpu::Span &sp : cmd.writes) memory_written(cb, set0, sp, own_color, own_depth);
+        keep_textures_ = false;
     }
     if (any_dirty && exported_px_ != before) {
         static const bool trace = std::getenv("PS2_HW_TRACE") != nullptr;
@@ -1018,9 +1115,369 @@ void HwRaster::flush_sync(VkDescriptorSet set0, const gpu::Span &span) {
 }
 
 void HwRaster::drop_all() {
+    for (auto &t : textures_) retire_texture(*t);
+    textures_.clear();
     for (auto &s : surfaces_) {
         s->plane.valid.reset();
         s->plane.dirty.reset();
+    }
+}
+
+// ---- Textures --------------------------------------------------------------
+
+// Cacheable when the decode can cover the whole texture: region modes must
+// stay inside it (the compute path's plan_decodes makes the same check).
+bool HwRaster::texture_cacheable(const std::uint32_t *w) const {
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+    const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
+    const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
+    // Tiny textures (palette-swapped glyphs and the like, often with a
+    // palette rendered per use) cost more to decode than to sample.
+    return tw <= 10 && th <= 10 && tw + th >= 12 && inside(mu, w[18], tw) && inside(mv, w[19], th);
+}
+
+void HwRaster::retire_texture(Texture &t) {
+    Retired r;
+    r.image = t.image;
+    r.set2 = t.set2;
+    r.at = submits_ + 3;
+    retired_.push_back(r);
+    t.image = Image{};
+    t.set2 = VK_NULL_HANDLE;
+}
+
+// Memory in `span` changed by something other than an upload: give its
+// blocks a fresh id. Textures decoded from them fail their stamp check at
+// the next lookup and are decoded again; if an upload restores the same
+// content first, their stamps match again and nothing is redone.
+void HwRaster::textures_written(const gpu::Span &span) {
+    if (span.hi <= span.lo) return;
+    const std::uint64_t id = ++write_counter_ | (1ull << 63);
+    const std::uint32_t lo = span.lo >> 8, hi = std::min<std::uint32_t>((span.hi + 255) >> 8, 16384);
+    for (std::uint32_t b = lo; b < hi; ++b) block_ids_[b] = id;
+    ++tex_drops_[tex_drop_cause_];
+}
+
+// The texel rectangle a batch's primitives of `setup_index` can sample:
+// the UV extent over the vertices (bounded by them, perspective included),
+// widened by one for bilinear, then wrapped the way the clamp modes wrap.
+bool HwRaster::texture_texels(const std::uint32_t *w, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, Rect &texels) const {
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+    const int sw = 1 << tw, sh = 1 << th;
+    const bool fst = w[0] & 16u;
+    float u0 = 1e30f, v0 = 1e30f, u1 = -1e30f, v1 = -1e30f;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t *rec = prims + i * kPrimWords;
+        if (rec[0] != setup_index) continue;
+        const std::uint32_t verts = rec[1] == 0 ? 3u : 2u;
+        for (std::uint32_t k = 0; k < verts; ++k) {
+            const float sc = fat(rec[15 + k * 3]), tc = fat(rec[16 + k * 3]);
+            float q = fat(rec[17 + k * 3]);
+            float u, v;
+            if (fst) {
+                u = sc / 16.0f;
+                v = tc / 16.0f;
+            } else {
+                if (q == 0.0f) q = 1.0f;
+                u = sc / q * static_cast<float>(sw);
+                v = tc / q * static_cast<float>(sh);
+            }
+            u0 = std::min(u0, u);
+            u1 = std::max(u1, u);
+            v0 = std::min(v0, v);
+            v1 = std::max(v1, v);
+        }
+    }
+    if (u0 > u1 || v0 > v1) return false;
+    const float pad = (w[0] & 16384u) ? 1.5f : 0.0f;
+    const auto axis = [](float lo, float hi, int size, std::uint32_t mode, std::uint32_t region, int &x0, int &x1) {
+        if (!(lo > -1e8f && hi < 1e8f)) {
+            x0 = 0;
+            x1 = size - 1;
+            return;
+        }
+        x0 = static_cast<int>(std::floor(lo));
+        x1 = static_cast<int>(std::floor(hi));
+        switch (mode) {
+        case 0:  // REPEAT
+            if (x1 - x0 + 1 >= size || (x0 & ~(size - 1)) != (x1 & ~(size - 1))) {
+                x0 = 0;
+                x1 = size - 1;
+            } else {
+                x0 &= size - 1;
+                x1 &= size - 1;
+            }
+            break;
+        case 1:  // CLAMP
+            x0 = std::clamp(x0, 0, size - 1);
+            x1 = std::clamp(x1, 0, size - 1);
+            break;
+        case 2:  // REGION_CLAMP
+            x0 = std::clamp(x0, static_cast<int>(region & 0x3FFu), std::min(static_cast<int>(region >> 16), size - 1));
+            x1 = std::clamp(x1, static_cast<int>(region & 0x3FFu), std::min(static_cast<int>(region >> 16), size - 1));
+            break;
+        default:  // REGION_REPEAT
+            x0 = 0;
+            x1 = size - 1;
+        }
+    };
+    int x0, x1, y0, y1;
+    axis(u0 - pad, u1 + pad, sw, (w[7] >> 24) & 3u, w[18], x0, x1);
+    axis(v0 - pad, v1 + pad, sh, (w[7] >> 26) & 3u, w[19], y0, y1);
+    texels = Rect{static_cast<std::uint32_t>(std::max(x0, 0)), static_cast<std::uint32_t>(std::max(y0, 0)), static_cast<std::uint32_t>(std::max(x1, 0)), static_cast<std::uint32_t>(std::max(y1, 0))};
+    return texels.x0 <= texels.x1 && texels.y0 <= texels.y1;
+}
+
+void HwRaster::texel_blocks(const std::uint32_t *w, const Rect &texels, std::vector<std::uint32_t> &blocks) const {
+    blocks.clear();
+    std::uint32_t cw, ch;
+    block_cell(w[14], cw, ch);
+    for (std::uint32_t y = texels.y0 - texels.y0 % ch; y <= texels.y1; y += ch)
+        for (std::uint32_t x = texels.x0 - texels.x0 % cw; x <= texels.x1; x += cw) blocks.push_back(pixel_address(w[14], w[12], w[13], x, y) >> 8);
+    std::sort(blocks.begin(), blocks.end());
+    blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+}
+
+// Still matches memory where this batch samples it: every footprint block
+// (and the whole CLUT) carries the id it had when the texture was decoded.
+bool HwRaster::texture_current(const Texture &t, const std::vector<std::uint32_t> &footprint) const {
+    for (std::uint32_t b : footprint) {
+        const auto it = std::lower_bound(t.blocks.begin(), t.blocks.end(), b);
+        if (it == t.blocks.end() || *it != b) return false;
+        if (t.ids[static_cast<std::size_t>(it - t.blocks.begin())] != block_ids_[b & 16383u]) return false;
+    }
+    for (std::size_t i = 0; i < t.clut_blocks.size(); ++i)
+        if (t.clut_ids[i] != block_ids_[t.clut_blocks[i] & 16383u]) return false;
+    return true;
+}
+
+void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture &t, std::uint32_t setup_offset) {
+    // The decode reads memory: surfaces holding newer pixels there store them first.
+    const std::uint64_t before = exported_px_;
+    memory_read(cb, set0, gpu::Span{t.lo, t.hi});
+    if (t.chi > t.clo) memory_read(cb, set0, gpu::Span{t.clo, t.chi});
+    if (exported_px_ != before) barrier_copies_visible(cb);
+    for (std::size_t i = 0; i < t.blocks.size(); ++i) t.ids[i] = block_ids_[t.blocks[i] & 16383u];
+    for (std::size_t i = 0; i < t.clut_blocks.size(); ++i) t.clut_ids[i] = block_ids_[t.clut_blocks[i] & 16383u];
+    const std::uint32_t width = 1u << t.tw, height = 1u << t.th;
+    std::uint32_t words[kUniformWords] = {setup_offset, 0, 0, 0, 0, 0, width, height, scale_, 0, 0, 0};
+    const std::uint32_t uniform = push_uniform(*frame_, words);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, decode_tex_);
+    bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, set0, misc_set1_[slot_], 0, uniform);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 2, 1, &t.set2, 0, nullptr);
+    vkCmdDispatch(cb, (width + 15) / 16, (height + 15) / 16, 1);
+    ++decoded_textures_;
+}
+
+VkDescriptorSet HwRaster::texture_set(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *w, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, const Surface *color,
+                                      const Surface *depth) {
+    // A surface in the texture's own layout holds the newest pixels: sample
+    // it in place (after importing what memory still owns there), unless the
+    // batch draws into it, which Vulkan forbids and the snapshot path serves.
+    if (Surface *src = find_surface(w[12], w[13], w[14], false); src && src->image.image && src->set2) {
+        Rect texels;
+        if (texture_texels(w, prims, count, setup_index, texels) && texels.x1 < src->width && texels.y1 < src->height) {
+            import_tiles(cb, set0, *src, texels);
+            src->last_use = ++use_counter_;
+            if (src != color && src != depth) {
+                ++surface_samples_;
+                return src->set2;
+            }
+            // The batch draws into this surface: sample a copy of the texels
+            // it reads, taken now (the snapshot semantics of the compute path).
+            bool created = false;
+            if (Texture *t = texture_slot(cb, w, true, created)) {
+                copy_surface_texels(cb, set0, *src, *t, texels);
+                ++surface_copies_;
+                return t->set2;
+            }
+        }
+        static int shown = 0;
+        if (std::getenv("PS2_TEX_TRACE") && shown++ < 20)
+            std::fprintf(stderr, "[tex] surface %u/%u/%02x %ux%u rejected: texels %u,%u-%u,%u (prims %u, setup %u)\n", w[12], w[13], w[14], src->width, src->height, texels.x0, texels.y0, texels.x1, texels.y1, count, setup_index);
+    }
+    const Texture *t = texture_for(cb, set0, w, setup_offset, prims, count, setup_index);
+    return t ? t->set2 : VK_NULL_HANDLE;
+}
+
+// The cached image of a setup's texture, decoded now if it is not resident
+// or no longer matches memory where the batch samples it. Records compute
+// work into `cb` (call outside render passes).
+// Finds or creates (image, descriptor set, block lists) the cache entry
+// for a setup's texture without filling it.
+HwRaster::Texture *HwRaster::texture_slot(VkCommandBuffer cb, const std::uint32_t *w, bool from_surface, bool &created) {
+    created = false;
+    std::uint32_t key[11];
+    for (int i = 0; i < 9; ++i) key[i] = w[12 + i];
+    key[9] = from_surface ? 0xFFFFFFFFu : w[22] >> 12;  // the CLUT source, not the slot it was loaded into
+    key[10] = (w[0] & 32768u) | (from_surface ? 1u : 0u);  // AEM
+    for (auto &tp : textures_)
+        if (std::memcmp(tp->key, key, sizeof key) == 0) {
+            tp->last_use = ++use_counter_;
+            return tp.get();
+        }
+    created = true;
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+    const std::uint32_t width = 1u << tw, height = 1u << th;
+    if (textures_.size() >= kMaxTextures) {
+        // Evict the least recently used; its image and set stay for reuse.
+        std::size_t victim = 0;
+        for (std::size_t i = 1; i < textures_.size(); ++i)
+            if (textures_[i]->last_use < textures_[victim]->last_use) victim = i;
+        ++tex_drops_[3];
+        free_textures_.push_back(std::move(textures_[victim]));
+        textures_.erase(textures_.begin() + static_cast<std::ptrdiff_t>(victim));
+    }
+    std::unique_ptr<Texture> t;
+    for (std::size_t i = 0; i < free_textures_.size(); ++i)
+        if (free_textures_[i]->tw == tw && free_textures_[i]->th == th) {
+            t = std::move(free_textures_[i]);
+            free_textures_.erase(free_textures_.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    if (t) {
+        // Whatever still samples the old contents in this command buffer
+        // finishes before they are overwritten.
+        VkImageMemoryBarrier war{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        war.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        war.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        war.oldLayout = war.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        war.srcQueueFamilyIndex = war.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        war.image = t->image.image;
+        war.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &war);
+        const Image image = t->image;
+        const VkDescriptorSet set2 = t->set2;
+        *t = Texture{};
+        t->image = image;
+        t->set2 = set2;
+    } else {
+        t = std::make_unique<Texture>();
+        if (!ctx_->create_image(t->image, width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return nullptr;
+        // New image: its layout transition goes into this command buffer.
+        VkImageMemoryBarrier bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        bar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bar.image = t->image.image;
+        bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        bar.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+        t->image.layout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = pool2_;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &set2_layout_;
+        if (vkAllocateDescriptorSets(ctx_->device, &dai, &t->set2) != VK_SUCCESS) {
+            ctx_->destroy_image(t->image);
+            return nullptr;
+        }
+        VkDescriptorImageInfo image{VK_NULL_HANDLE, t->image.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet ws[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            ws[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            ws[i].dstSet = t->set2;
+            ws[i].dstBinding = static_cast<std::uint32_t>(i);
+            ws[i].descriptorCount = 1;
+            ws[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            ws[i].pImageInfo = &image;
+        }
+        vkUpdateDescriptorSets(ctx_->device, 2, ws, 0, nullptr);
+    }
+    std::memcpy(t->key, key, sizeof key);
+    t->from_surface = from_surface;
+    t->tw = tw;
+    t->th = th;
+    const std::uint32_t tpsm = w[14];
+    if (!from_surface) {
+        std::uint32_t pw, ph;
+        page_size(tpsm, pw, ph);
+        const std::uint64_t per_row = std::max<std::uint32_t>(1, w[13] * 64 / pw);
+        const std::uint64_t base = static_cast<std::uint64_t>(w[12]) * 256;
+        t->lo = static_cast<std::uint32_t>(std::min<std::uint64_t>(base, kMemoryBytes));
+        t->hi = static_cast<std::uint32_t>(std::min<std::uint64_t>(base + ((width - 1) / pw + static_cast<std::uint64_t>((height - 1) / ph) * per_row + 1) * 8192, kMemoryBytes));
+        if (tpsm == 0x13u || tpsm == 0x14u || tpsm == 0x1Bu || tpsm == 0x24u || tpsm == 0x2Cu) {
+            const std::uint32_t id = w[22] >> 12;
+            if (id < clut_spans_.size()) {
+                t->clo = clut_spans_[id].lo;
+                t->chi = clut_spans_[id].hi;
+            }
+        }
+        std::uint32_t cw, ch;
+        block_cell(tpsm, cw, ch);
+        for (std::uint32_t y = 0; y < height; y += ch)
+            for (std::uint32_t x = 0; x < width; x += cw) t->blocks.push_back(pixel_address(tpsm, w[12], w[13], x, y) >> 8);
+        std::sort(t->blocks.begin(), t->blocks.end());
+        t->blocks.erase(std::unique(t->blocks.begin(), t->blocks.end()), t->blocks.end());
+        t->ids.resize(t->blocks.size());
+        for (std::uint32_t b = t->clo >> 8; b < (t->chi + 255) >> 8; ++b) t->clut_blocks.push_back(b);
+        t->clut_ids.resize(t->clut_blocks.size());
+    }
+    t->last_use = ++use_counter_;
+    textures_.push_back(std::move(t));
+    return textures_.back().get();
+}
+
+// Copies the texels a batch reads from the surface it also draws into.
+void HwRaster::copy_surface_texels(VkCommandBuffer cb, VkDescriptorSet set0, Surface &src, Texture &t, const Rect &texels) {
+    (void)set0;
+    // Earlier sampling of the copy (fragment reads) must finish before it is
+    // overwritten; the surface's attachment writes are already visible to
+    // transfers (barrier_after_draw), its imports too (copies barrier).
+    VkImageMemoryBarrier war{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    war.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    war.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    war.oldLayout = war.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    war.srcQueueFamilyIndex = war.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    war.image = t.image.image;
+    war.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkMemoryBarrier imports{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    imports.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    imports.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &imports, 0, nullptr, 1, &war);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.srcOffset = {static_cast<std::int32_t>(texels.x0 * scale_), static_cast<std::int32_t>(texels.y0 * scale_), 0};
+    region.dstOffset = region.srcOffset;
+    region.extent = {(texels.x1 - texels.x0 + 1) * scale_, (texels.y1 - texels.y0 + 1) * scale_, 1};
+    vkCmdCopyImage(cb, src.image.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+}
+
+HwRaster::Texture *HwRaster::texture_for(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *w, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index) {
+    static std::vector<std::uint32_t> footprint;
+    Rect texels;
+    const bool sampled = texture_texels(w, prims, count, setup_index, texels);
+    bool fresh = false;
+    Texture *slot = texture_slot(cb, w, false, fresh);
+    if (!slot) return nullptr;
+    if (!fresh && sampled) texel_blocks(w, texels, footprint);
+    if (!sampled) footprint.clear();
+    {
+        Texture &t = *slot;
+        static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
+        if (!fresh && ((debug & 131072u) || texture_current(t, footprint))) {  // 131072: timing only, never re-decode
+            ++texture_hits_;
+            return &t;
+        }
+        if (!fresh) ++tex_drops_[4];
+        static int shown = 0;
+        if (std::getenv("PS2_TEX_TRACE") && shown < 4000 && frame_count() == 5404) {
+            ++shown;
+            std::fprintf(stderr, "[tex] f%llu stale tbp %u tbw %u psm %02x %ux%u clut %u footprint %zu blocks:", static_cast<unsigned long long>(frame_count()), w[12], w[13], w[14], 1u << t.tw, 1u << t.th, w[22] >> 12, footprint.size());
+            int listed = 0;
+            for (std::uint32_t b : footprint) {
+                const auto it = std::lower_bound(t.blocks.begin(), t.blocks.end(), b);
+                if (it == t.blocks.end() || *it != b) { std::fprintf(stderr, " [%u not in texture]", b); continue; }
+                const std::uint64_t was = t.ids[static_cast<std::size_t>(it - t.blocks.begin())], now = block_ids_[b & 16383u];
+                if (was != now && listed++ < 4) std::fprintf(stderr, " [%u: %s%llx -> %s%llx]", b, (was >> 63) ? "w" : "u", (unsigned long long)(was & 0xFFFFFFFFull), (now >> 63) ? "w" : "u", (unsigned long long)(now & 0xFFFFFFFFull));
+            }
+            for (std::size_t i = 0; i < t.clut_blocks.size() && listed < 6; ++i)
+                if (t.clut_ids[i] != block_ids_[t.clut_blocks[i] & 16383u]) { ++listed; std::fprintf(stderr, " [clut %u: %llx -> %llx]", t.clut_blocks[i], (unsigned long long)(t.clut_ids[i] & 0xFFFFFFFFull), (unsigned long long)(block_ids_[t.clut_blocks[i] & 16383u] & 0xFFFFFFFFull)); }
+            std::fprintf(stderr, "\n");
+        }
+        decode_texture(cb, set0, t, setup_offset);
+        return &t;
     }
 }
 
@@ -1087,7 +1544,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     }
     FrameScratch &f = *frame_;
     const std::uint64_t need = static_cast<std::uint64_t>(cmd.prims) * 6 * sizeof(Vertex);
-    if (f.vertex_used + need > kVertexBytes || f.uniform_used + (cmd.setups + 2 * std::min(cmd.prims, kMaxFailModePrims) + 64) * kUniformStride > kUniformBytes) {
+    if (f.vertex_used + need > kVertexBytes || f.uniform_used + (2 * cmd.setups + 2 * std::min(cmd.prims, kMaxFailModePrims) + 64) * kUniformStride > kUniformBytes) {
         ++reasons_[11];
         ++fallback_;
         return false;
@@ -1162,8 +1619,14 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         }
         color = find_surface(first[1], first[2], first[3], false);  // the vector may have shifted
     }
+    // Textures sampled from memory by the fragment shader (not cached, not a
+    // surface) need the memory current; cached ones write back in their
+    // decode, surfaces need nothing. Depth tests read the depth surface.
     const std::uint64_t exported_before = exported_px_;
-    for (const gpu::Span &sp : cmd.reads) memory_read(cb, set0, sp);
+    for (std::uint32_t i = 0; i < cmd.setups; ++i) {
+        const std::uint32_t *w = setups + i * kSetupWords;
+        if ((w[0] & F_TME) && ((debug & 65536u) || !texture_cacheable(w))) memory_read(cb, set0, texture_span(w));
+    }
     for (const gpu::Span &sp : cmd.writes) memory_written(cb, set0, sp, color, depth);
     // The imports below read memory the write-backs above may have stored.
     if (exported_px_ != exported_before) {
@@ -1174,6 +1637,25 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     }
     if (color_any) import_tiles(cb, set0, *color, rect);
     if (depth) import_tiles(cb, set0, *depth, rect);
+    // Textures: resolve (and decode, which reads memory the write-backs
+    // above just stored) every textured setup's image before the pass.
+    std::vector<VkDescriptorSet> textures(cmd.setups, VK_NULL_HANDLE);
+    bool decoded_any = false;
+    if (!(debug & 65536u))
+        for (std::uint32_t i = 0; i < cmd.setups; ++i) {
+            const std::uint32_t *w = setups + i * kSetupWords;
+            if (!(w[0] & F_TME) || !texture_cacheable(w)) continue;
+            const std::uint64_t before_decodes = decoded_textures_, before_imports = imported_px_;
+            textures[i] = texture_set(cb, set0, w, setup_offset + i * kSetupWords, prims, cmd.prims, i, color, depth);
+            decoded_any = decoded_any || decoded_textures_ != before_decodes || imported_px_ != before_imports;
+        }
+    if (decoded_any) {
+        // Decodes and imports (compute stores, transfer writes) feed sampling.
+        VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mem.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        mem.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
+    }
     barrier_after_copies(cb, *color, depth);
     VkFramebuffer framebuffer = framebuffer_for(*color, depth);
     if (!framebuffer) {
@@ -1216,11 +1698,14 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         }
         std::uint32_t wmask = 0;
         write_mask(w[4], wmask);
-        const std::uint32_t base_flags = (with_depth ? 1u : 0u) | ((debug & 8u) ? 2u : 0u) | ((debug & 16u) ? 4u : 0u) | ((blend >> 15) & 1u) << 4 | ((blend >> 16) & 1u) << 5 | ((debug & 16384u) ? 128u : 0u);
+        const VkDescriptorSet texture = textures[si];
+        if (texture) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 2, 1, &texture, 0, nullptr);
+        const std::uint32_t base_flags = (with_depth ? 1u : 0u) | ((debug & 8u) ? 2u : 0u) | ((debug & 16u) ? 4u : 0u) | ((blend >> 15) & 1u) << 4 | ((blend >> 16) & 1u) << 5 | ((debug & 16384u) ? 128u : 0u) | (texture ? 256u : 0u);
         const auto bind_draw = [&](std::uint32_t flags, bool write_z, std::uint32_t mask) -> bool {
-            const std::uint32_t words[12] = {setup_offset + si * kSetupWords, 0, 0, flags, 0, 0, kTargetSize * scale_, kTargetSize * scale_, scale_, 0, 0, 0};
+            std::uint32_t words[kUniformWords] = {setup_offset + si * kSetupWords, 0, 0, flags, 0, 0, kTargetSize * scale_, kTargetSize * scale_, scale_, p[5], p[6], 0};
+            std::memcpy(words + 12, w, kSetupWords * 4);
             const std::uint32_t uniform = push_uniform(f, words);
-            VkPipeline pipeline = pipeline_for({ztst, write_z ? 1u : 0u, with_depth ? 1u : 0u, blend & 0x7FFFu, mask});
+            VkPipeline pipeline = pipeline_for({ztst, write_z ? 1u : 0u, with_depth ? 1u : 0u, blend & 0x7FFFu, mask, (flags & 256u) && !(debug & 262144u) ? 1u : 0u});
             if (!pipeline) return false;
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             bind(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, set0, color->set1[slot_], param_offset, uniform);
@@ -1278,9 +1763,13 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     vkCmdEndRenderPass(cb);
     barrier_after_draw(cb, *color, depth);
 
-    // 3. Bookkeeping: the rectangle is now newer than memory.
+    // 3. Bookkeeping: the rectangle is now newer than memory, and any
+    // texture decoded from it no longer matches.
     if (color_any) mark_dirty(*color, rect);
     if (depth && zwrite_any) mark_dirty(*depth, rect);
+    tex_drop_cause_ = 2;
+    if (color_any) textures_written(rect_span(*color, rect));
+    if (depth && zwrite_any) textures_written(rect_span(*depth, rect));
     if (depth && zwrite_any && color_any) {
         // Frame and depth buffers that overlap in memory (a clear trick):
         // the GS writes the colour word, then Z, so Z wins where they meet.
@@ -1314,9 +1803,15 @@ void HwRaster::destroy() {
     vkDeviceWaitIdle(ctx_->device);
     for (auto &[key, p] : draw_)
         if (p) vkDestroyPipeline(ctx_->device, p, nullptr);
-    for (VkPipeline p : {import_frame_, export_frame_, export_depth_, import_depth_, decode_})
+    for (VkPipeline p : {import_frame_, export_frame_, export_depth_, import_depth_, decode_, decode_tex_})
         if (p) vkDestroyPipeline(ctx_->device, p, nullptr);
     ctx_->destroy_image(decoded_);
+    for (auto &t : textures_) ctx_->destroy_image(t->image);
+    textures_.clear();
+    for (VkSampler sm : samplers_)
+        if (sm) vkDestroySampler(ctx_->device, sm, nullptr);
+    if (pool2_) vkDestroyDescriptorPool(ctx_->device, pool2_, nullptr);
+    if (set2_layout_) vkDestroyDescriptorSetLayout(ctx_->device, set2_layout_, nullptr);
     for (auto &[key, fb] : framebuffers_) vkDestroyFramebuffer(ctx_->device, fb, nullptr);
     for (Retired &r : retired_) {
         if (r.framebuffer) vkDestroyFramebuffer(ctx_->device, r.framebuffer, nullptr);

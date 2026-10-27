@@ -66,6 +66,10 @@ bool interlaced_odd_field();
 
 std::uint32_t address32(std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y);
 std::uint32_t read_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y);
+// Byte address of a pixel in GS memory (the 4-bit formats address the byte
+// holding the nibble), and the pixel size of a 256-byte block in `psm`.
+std::uint32_t pixel_address(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y);
+void block_cell(std::uint32_t psm, std::uint32_t &cw, std::uint32_t &ch);
 void write_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y, std::uint32_t value);
 
 struct DisplayRegs {

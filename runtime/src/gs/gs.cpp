@@ -385,6 +385,28 @@ std::uint32_t read_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, 
     }
 }
 
+std::uint32_t pixel_address(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y) {
+    switch (psm) {
+    case PSMZ32: case PSMZ24: return wrap(page_address(bp, bw, x, y, 64, 32) + g_offz32[y & 31][x & 63]);
+    case PSMCT16: return wrap(page_address(bp, bw, x, y, 64, 64) + g_off16[y & 63][x & 63]);
+    case PSMCT16S: return wrap(page_address(bp, bw, x, y, 64, 64) + g_off16s[y & 63][x & 63]);
+    case PSMZ16: return wrap(page_address(bp, bw, x, y, 64, 64) + g_offz16[y & 63][x & 63]);
+    case PSMZ16S: return wrap(page_address(bp, bw, x, y, 64, 64) + g_offz16s[y & 63][x & 63]);
+    case PSMT8: return wrap(page_address(bp, bw, x, y, 128, 64) + g_off8[y & 63][x & 127]);
+    case PSMT4: return wrap(page_address(bp, bw, x, y, 128, 128) + g_off4[y & 127][x & 127] / 2);
+    default: return wrap(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63]);
+    }
+}
+
+void block_cell(std::uint32_t psm, std::uint32_t &cw, std::uint32_t &ch) {
+    switch (psm) {
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: cw = 16; ch = 8; break;
+    case PSMT8: cw = 16; ch = 16; break;
+    case PSMT4: cw = 32; ch = 16; break;
+    default: cw = 8; ch = 8; break;
+    }
+}
+
 void write_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y, std::uint32_t value) {
     switch (psm) {
     case PSMCT32: put<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63], value); break;

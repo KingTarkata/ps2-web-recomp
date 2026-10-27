@@ -43,7 +43,15 @@ public:
     // Called before every command the device runs itself: writes back the
     // dirty tiles whose memory the command reads, and drops the tiles whose
     // memory it writes.
-    void before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params);
+    // `next_is_hw_raster`: the command after this one is a raster batch the
+    // hardware path will draw; a snapshot copy before it then skips its
+    // write-back (the batch samples the surface image instead).
+    void before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, bool next_is_hw_raster = false);
+    bool would_draw(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) const;
+    // Whether the hardware path would draw `cmd` without the per-submit
+    // decode the batching layer emitted for it (every texture it samples is
+    // served by the texture cache or a surface).
+    bool decodes_unneeded(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) const;
     // GS memory is about to be read outside the command stream (a download
     // or a state save): write back what overlaps, synchronously.
     void flush_sync(VkDescriptorSet set0, const gpu::Span &span);
@@ -74,6 +82,7 @@ private:
         std::uint32_t width = 0, height = 0;  // GS pixels
         Plane plane;
         VkDescriptorSet set1[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};  // per frame slot
+        VkDescriptorSet set2 = VK_NULL_HANDLE;                        // the surface as a texture
         std::uint64_t last_use = 0;
     };
     struct FrameScratch {
@@ -86,17 +95,34 @@ private:
         float r, g, b, a;
         float s, t, q, f;
     };
+    // A texture decoded from GS memory into an image, keyed by everything
+    // that decides its texels: the setup's texture words, the CLUT load and
+    // the alpha expansion flag. Dropped when its memory is written.
+    struct Texture {
+        std::uint32_t key[11] = {};
+        Image image;
+        std::uint32_t lo = 0, hi = 0;    // GS memory span of the texels
+        std::uint32_t clo = 0, chi = 0;  // and of the CLUT source, for indexed formats
+        std::vector<std::uint32_t> blocks, clut_blocks;  // the blocks the texels (and CLUT) were decoded from, sorted
+        std::vector<std::uint64_t> ids, clut_ids;        // their block ids at decode time
+        std::uint32_t tw = 0, th = 0;
+        bool from_surface = false;  // filled by image copies from a surface, not decoded
+        VkDescriptorSet set2 = VK_NULL_HANDLE;
+        std::uint64_t last_use = 0;
+    };
+    static constexpr std::size_t kMaxTextures = 1536;
     // Objects a recorded command buffer may still reference.
     struct Retired {
         Image image;
         VkFramebuffer framebuffer = VK_NULL_HANDLE;
         VkDescriptorSet sets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+        VkDescriptorSet set2 = VK_NULL_HANDLE;
         std::uint64_t at = 0;  // submit counter when it may be destroyed
     };
 
     bool build_pipelines(VkShaderModule module);
     bool supported(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params, const std::uint32_t *&setups, std::uint32_t &zmode) const;
-    std::uint32_t push_uniform(FrameScratch &f, const std::uint32_t words[12]);
+    std::uint32_t push_uniform(FrameScratch &f, const std::uint32_t *words);
     void append_prims(FrameScratch &f, const std::uint32_t *prims, std::uint32_t count, std::vector<std::uint32_t> &first, std::vector<std::uint32_t> &counts);
     void bind(VkCommandBuffer cb, VkPipelineBindPoint point, VkDescriptorSet set0, VkDescriptorSet set1, std::uint32_t param_offset, std::uint32_t uniform);
 
@@ -122,6 +148,42 @@ private:
     void barrier_after_draw(VkCommandBuffer cb, const Surface &color, const Surface *depth);
     void barrier_copies_visible(VkCommandBuffer cb);
 
+    // Textures.
+    bool texture_cacheable(const std::uint32_t *setup) const;
+    gpu::Span texture_span(const std::uint32_t *setup) const;
+    Texture *texture_for(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *setup, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index);
+    // The texel rectangle a batch's primitives of `setup_index` can sample
+    // (false when none do), and the blocks of memory holding a texel rectangle.
+    bool texture_texels(const std::uint32_t *setup, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, Rect &texels) const;
+    void texel_blocks(const std::uint32_t *setup, const Rect &texels, std::vector<std::uint32_t> &blocks) const;
+    Texture *texture_slot(VkCommandBuffer cb, const std::uint32_t *setup, bool from_surface, bool &created);
+    // Resolves what set 2 binds for a textured setup: a surface sampled in
+    // place when one mirrors the texture's buffer in the same layout, else
+    // a cached texture. Null when neither can serve (memory sampling then).
+    VkDescriptorSet texture_set(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *setup, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, const Surface *color,
+                                const Surface *depth);
+    bool texture_current(const Texture &t, const std::vector<std::uint32_t> &footprint) const;
+    void decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture &t, std::uint32_t setup_offset);
+    void copy_surface_texels(VkCommandBuffer cb, VkDescriptorSet set0, Surface &src, Texture &t, const Rect &texels);
+    void textures_written(const gpu::Span &span);
+
+public:
+    void clut_source(std::uint32_t id, gpu::Span span) {
+        if (id >= clut_spans_.size()) clut_spans_.resize(id + 1);
+        clut_spans_[id] = span;
+    }
+    void blocks_written(const std::uint32_t *blocks, std::size_t n, std::uint64_t id) {
+        for (std::size_t i = 0; i < n; ++i) block_ids_[blocks[i] & 16383u] = id;
+    }
+
+private:
+    std::vector<gpu::Span> clut_spans_;
+    // Content id of every 256-byte block of GS memory as last uploaded;
+    // a texture remembers a hash of its blocks' ids from when it was decoded.
+    std::uint64_t block_ids_[16384] = {};
+    std::uint64_t write_counter_ = 0;
+    void retire_texture(Texture &t);
+
     Context *ctx_ = nullptr;
     std::uint32_t scale_ = 1;
     VkDescriptorSetLayout set1_layout_ = VK_NULL_HANDLE;
@@ -133,8 +195,8 @@ private:
     // Draw pipelines by state: depth mode and write, depth attachment, the
     // blend equation (0 when off) and the colour write mask, built on first use.
     struct PipelineKey {
-        std::uint32_t ztst, zwrite, with_depth, blend, wmask;
-        bool operator<(const PipelineKey &o) const { return std::tie(ztst, zwrite, with_depth, blend, wmask) < std::tie(o.ztst, o.zwrite, o.with_depth, o.blend, o.wmask); }
+        std::uint32_t ztst, zwrite, with_depth, blend, wmask, shader;  // shader 0: hw_fs, 1: hw_fs_cached
+        bool operator<(const PipelineKey &o) const { return std::tie(ztst, zwrite, with_depth, blend, wmask, shader) < std::tie(o.ztst, o.zwrite, o.with_depth, o.blend, o.wmask, o.shader); }
     };
     std::map<PipelineKey, VkPipeline> draw_;
     VkPipeline pipeline_for(const PipelineKey &key);
@@ -145,8 +207,17 @@ private:
     Image dummy_;         // stands in for the image bindings of depth surfaces
     Image decoded_;       // the decoded texture cache as a 2048-wide R32_UINT image
     VkDescriptorSet misc_set1_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};  // set 1 without a surface, for decodes
-    VkPipeline decode_ = VK_NULL_HANDLE;
+    VkPipeline decode_ = VK_NULL_HANDLE, decode_tex_ = VK_NULL_HANDLE;
     bool write_set1(VkDescriptorSet set, int slot, VkImageView surface_view);
+    VkDescriptorSetLayout set2_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool pool2_ = VK_NULL_HANDLE;
+    VkSampler samplers_[4] = {};
+    std::vector<std::unique_ptr<Texture>> textures_;
+    std::vector<std::unique_ptr<Texture>> free_textures_;  // evicted entries, images kept for reuse by size
+    std::uint64_t decoded_textures_ = 0, texture_hits_ = 0, surface_samples_ = 0, surface_copies_ = 0;
+    std::uint64_t tex_drops_[5] = {};  // by memory_written, write_back, own draw, eviction, changed blocks
+    int tex_drop_cause_ = 0;
+    bool keep_textures_ = false;  // uploads: textures are kept or dropped by block ids, not spans
     std::vector<std::unique_ptr<Surface>> surfaces_;
     std::map<std::pair<VkImageView, VkImageView>, VkFramebuffer> framebuffers_;
     std::vector<Retired> retired_;

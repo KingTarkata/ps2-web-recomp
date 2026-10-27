@@ -63,6 +63,8 @@ public:
     bool init(const Limits &limits, const std::vector<std::uint32_t> &tables) override;
     bool timestamps() const override { return ctx_.has_timestamps; }
     bool setup_unsupported(const std::uint32_t *setup) const override { return hw_on_ && !hw_.setup_supported(setup); }
+    void clut_source(std::uint32_t id, gpu::Span span) override { hw_.clut_source(id, span); }
+    void blocks_written(const std::uint32_t *blocks, std::size_t n, std::uint64_t id) override { hw_.blocks_written(blocks, n, id); }
     void write(gpu::Buffer b, std::uint64_t offset, const void *data, std::uint64_t bytes) override;
     void submit(const std::vector<Command> &commands, const void *params, std::size_t param_bytes, const std::uint32_t *arena, std::size_t arena_words, bool present) override;
     void submit_profiled(const std::vector<Command> &commands, const void *params, std::size_t param_bytes, const std::uint32_t *arena, std::size_t arena_words,
@@ -343,6 +345,7 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
     between.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT;
     const VkPipelineStageFlags shader_stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     Pipeline current = kPipelines;
+    std::size_t skipped_from = ~static_cast<std::size_t>(0);  // first decode/snapshot skipped for the coming batch
     for (std::uint32_t i = 0; i < commands.size(); ++i) {
         const Command &c = commands[i];
         // Every command writes both of its timestamps, drawn here or not: a
@@ -350,14 +353,45 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
         const bool timed = queries && per_command && i < n;
         if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, i * 2);
         if (c.pipeline == kRaster && hw_on_ && hw_.draw(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), f.data.buffer)) {
+            skipped_from = ~static_cast<std::size_t>(0);
             current = kPipelines;  // the draw rebinds compute pipelines
             vk::vkCmdPipelineBarrier(cb, shader_stages, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
             if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
             continue;
         }
         if (hw_on_) {
+            // The per-submit decodes and the snapshot the batching layer put
+            // before a raster batch are skipped when the hardware path will
+            // draw it from its own texture cache and surfaces. If it then
+            // declines the batch after all, they are run here first.
+            if (c.pipeline == kDecode || c.pipeline == kSnapshot) {
+                std::size_t next = i + 1;
+                while (next < commands.size() && (commands[next].pipeline == kDecode || commands[next].pipeline == kSnapshot)) ++next;
+                if (next < commands.size() && commands[next].pipeline == kRaster && hw_.decodes_unneeded(commands[next], arena, static_cast<const std::uint32_t *>(params))) {
+                    if (skipped_from > i) skipped_from = i;
+                    if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
+                    continue;
+                }
+            }
+            const auto run_compute = [&](const Command &k) {
+                hw_.before_command(cb, k, f.set, arena, static_cast<const std::uint32_t *>(params), false);
+                if (k.pipeline == kDecode) {
+                    hw_.dispatch_decode(cb, k, f.set);
+                } else {
+                    vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[k.pipeline]);
+                    const std::uint32_t off = k.param * kParamStride;
+                    vk::vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &f.set, 1, &off);
+                    vk::vkCmdDispatch(cb, k.x, k.y, 1);
+                }
+                vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
+            };
+            if (c.pipeline == kRaster && skipped_from < i) {
+                // Declined after all: replay what was skipped.
+                for (std::size_t k = skipped_from; k < i; ++k) run_compute(commands[k]);
+            }
+            skipped_from = ~static_cast<std::size_t>(0);
             // The resident surfaces may hold memory this command reads or writes.
-            hw_.before_command(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params));
+            hw_.before_command(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
             current = kPipelines;
             if (c.pipeline == kDecode) {
                 // Decodes fill the cache image the fragment shader reads too.

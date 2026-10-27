@@ -82,6 +82,7 @@ namespace ps2::gs::vk {
     X(vkCmdPipelineBarrier) \
     X(vkCmdCopyBuffer) \
     X(vkCmdCopyBufferToImage) \
+    X(vkCmdCopyImage) \
     X(vkCmdCopyImageToBuffer) \
     X(vkCmdBindPipeline) \
     X(vkCmdBindDescriptorSets) \

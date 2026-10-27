@@ -100,6 +100,14 @@ struct Device {
     // so the batching layer keeps them out of batches it can (gpu.cpp emits
     // a batch boundary when this answer changes).
     virtual bool setup_unsupported(const std::uint32_t *) const { return false; }
+    // Names a CLUT source (its GS memory span) for `id`, the value setup
+    // word 22 carries above the slot bits; a texture cache keys on it.
+    virtual void clut_source(std::uint32_t, Span) {}
+    // An upload wrote these 256-byte blocks (addresses / 256) with content
+    // identified by `id` (a hash of the bytes and their place in the image):
+    // the same upload repeated gives the same ids, so a texture cache can
+    // tell a texture re-streamed unchanged from one that changed.
+    virtual void blocks_written(const std::uint32_t *, std::size_t, std::uint64_t) {}
 
     virtual bool attach_surface(const SurfaceTarget &target) = 0;
     virtual void resize_surface(std::uint32_t width, std::uint32_t height) = 0;

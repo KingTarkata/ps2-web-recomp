@@ -22,10 +22,23 @@ struct HwParams {
     width: u32,      // rectangle size in samples (copies), target size in samples (draws)
     height: u32,
     scale: u32,
-    pad0: u32,
-    pad1: u32,
+    snap_lo: u32,    // draws: the snapshot window (compute `raster` reads it from params)
+    snap_hi: u32,
     pad2: u32,
+    setup: array<vec4<u32>, 7>,  // draws: the setup record itself, so no fragment loads it from `data`
 };
+
+fn setup_u() -> Setup {
+    var d: array<u32, 25>;
+    for (var i = 0u; i < 7u; i = i + 1u) {
+        let v = hw.setup[i];
+        d[i * 4u] = v.x;
+        if (i * 4u + 1u < 25u) { d[i * 4u + 1u] = v.y; }
+        if (i * 4u + 2u < 25u) { d[i * 4u + 2u] = v.z; }
+        if (i * 4u + 3u < 25u) { d[i * 4u + 3u] = v.w; }
+    }
+    return make_setup(d);
+}
 
 @group(1) @binding(0) var<uniform> hw: HwParams;
 @group(1) @binding(1) var target_store: texture_storage_2d<rgba8unorm, write>;
@@ -38,6 +51,16 @@ struct HwParams {
 // as `decoded`, which is kept in step for the compute rasterizer.
 @group(1) @binding(4) var decoded_write: texture_storage_2d<r32uint, write>;
 @group(1) @binding(5) var decoded_read: texture_2d<u32>;
+
+// Set 2 is one cached texture: decoded once from GS memory into an RGBA8
+// image (decode_tex), then sampled with the texture unit. The samplers
+// cover REPEAT and CLAMP per axis; region modes fetch texels directly.
+@group(2) @binding(0) var tex_image: texture_2d<f32>;
+@group(2) @binding(1) var tex_store: texture_storage_2d<rgba8unorm, write>;
+@group(2) @binding(2) var samp_rr: sampler;
+@group(2) @binding(3) var samp_rc: sampler;
+@group(2) @binding(4) var samp_cr: sampler;
+@group(2) @binding(5) var samp_cc: sampler;
 
 fn decoded_load(i: u32) -> u32 {
     return textureLoad(decoded_read, vec2<i32>(i32(i & 2047u), i32(i >> 11u)), 0).x;
@@ -71,7 +94,7 @@ fn hw_vs(v: VsIn) -> VsOut {
     let x = (v.pos.x + 0.5) / w * 2.0 - 1.0;
     let y = (v.pos.y + 0.5) / h * 2.0 - 1.0;
     // Z is clamped to the depth buffer format's maximum, as plot() does.
-    let s = load_setup(hw.base);
+    let s = setup_u();
     o.clip = vec4<f32>(x, y, f32(min(v.z, s.zmax)) / 4294967296.0, 1.0);
     o.color = v.color;
     o.tex = v.tex;
@@ -110,11 +133,11 @@ fn hw_fs(i: VsOut) -> FsOut {
     if ((hw.flags & 2u) != 0u) {
         return debug_out(0x80FF00FFu);  // debug: paint every fragment, before any test
     }
-    let s = load_setup(hw.base);
+    let s = setup_u();
     // Batches that read what they draw sample the snapshot the compute
     // `snapshot` pass copied to scratch, like the compute raster does.
-    snapshot_lo = prm(5u);
-    snapshot_hi = prm(6u);
+    snapshot_lo = hw.snap_lo;
+    snapshot_hi = hw.snap_hi;
     let sx = u32(i.clip.x);
     let sy = u32(i.clip.y);
     let x = i32(sx / hw.scale);
@@ -145,7 +168,12 @@ fn hw_fs(i: VsOut) -> FsOut {
             u = i.tex.x / q * f32(1u << s.tw);
             v = i.tex.y / q * f32(1u << s.th);
         }
-        let t = sample(s, u, v, k);
+        var t: u32;
+        if ((hw.flags & 256u) != 0u) {
+            t = sample_cached(s, u, v);
+        } else {
+            t = sample(s, u, v, k);
+        }
         if ((hw.flags & 4u) != 0u) {
             return debug_out(t | 0xFF000000u);  // debug: the raw texel
         }
@@ -251,6 +279,202 @@ fn hw_fs(i: VsOut) -> FsOut {
         }
     }
     return o;
+}
+
+// hw_fs for runs whose texture is a cached image: the same shader without
+// the memory-sampling path, so the compiler sees a much smaller program.
+@fragment
+fn hw_fs_cached(i: VsOut) -> FsOut {
+    if ((hw.flags & 2u) != 0u) {
+        return debug_out(0x80FF00FFu);  // debug: paint every fragment, before any test
+    }
+    let s = setup_u();
+    // Batches that read what they draw sample the snapshot the compute
+    // `snapshot` pass copied to scratch, like the compute raster does.
+    snapshot_lo = hw.snap_lo;
+    snapshot_hi = hw.snap_hi;
+    let sx = u32(i.clip.x);
+    let sy = u32(i.clip.y);
+    let x = i32(sx / hw.scale);
+    let y = i32(sy / hw.scale);
+    if (x < s.scax0 || x > s.scax1 || y < s.scay0 || y > s.scay1) {
+        discard;
+    }
+    let scanmsk = mode(s, 28u, 2u);
+    if ((scanmsk == 2u && (y & 1) == 0) || (scanmsk == 3u && (y & 1) != 0)) {
+        discard;
+    }
+    let k = (sy % hw.scale) * hw.scale + sx % hw.scale;
+    var r = i32(i.color.x);
+    var g = i32(i.color.y);
+    var b = i32(i.color.z);
+    var a = i32(i.color.w);
+    if (has(s, F_TME) && (hw.flags & 128u) == 0u) {  // bit 7: debug, skip sampling
+        var u: f32;
+        var v: f32;
+        if (has(s, F_FST)) {
+            u = i.tex.x / 16.0;
+            v = i.tex.y / 16.0;
+        } else {
+            var q = i.tex.z;
+            if (q == 0.0) {
+                q = 1.0;
+            }
+            u = i.tex.x / q * f32(1u << s.tw);
+            v = i.tex.y / q * f32(1u << s.th);
+        }
+        let t = sample_cached(s, u, v);  // this variant only ever samples the bound texture image
+        if ((hw.flags & 4u) != 0u) {
+            return debug_out(t | 0xFF000000u);  // debug: the raw texel
+        }
+        let tr = i32(t & 0xFFu);
+        let tg = i32((t >> 8u) & 0xFFu);
+        let tb = i32((t >> 16u) & 0xFFu);
+        let ta = i32(t >> 24u);
+        let tcc = has(s, F_TCC);
+        switch mode(s, 20u, 2u) {
+            case 0u {
+                r = clamp255((tr * r) >> 7u);
+                g = clamp255((tg * g) >> 7u);
+                b = clamp255((tb * b) >> 7u);
+                if (tcc) {
+                    a = clamp255((ta * a) >> 7u);
+                }
+            }
+            case 1u {
+                r = tr;
+                g = tg;
+                b = tb;
+                if (tcc) {
+                    a = ta;
+                }
+            }
+            case 2u {
+                r = clamp255(((tr * r) >> 7u) + a);
+                g = clamp255(((tg * g) >> 7u) + a);
+                b = clamp255(((tb * b) >> 7u) + a);
+                if (tcc) {
+                    a = clamp255(ta + a);
+                }
+            }
+            default {
+                r = clamp255(((tr * r) >> 7u) + a);
+                g = clamp255(((tg * g) >> 7u) + a);
+                b = clamp255(((tb * b) >> 7u) + a);
+                if (tcc) {
+                    a = ta;
+                }
+            }
+        }
+    }
+    if (has(s, F_FGE)) {
+        let f = i32(i.tex.w);
+        let fr = i32(s.fogcol & 0xFFu);
+        let fg = i32((s.fogcol >> 8u) & 0xFFu);
+        let fb = i32((s.fogcol >> 16u) & 0xFFu);
+        r = (f * r + (255 - f) * fr) >> 8u;
+        g = (f * g + (255 - f) * fg) >> 8u;
+        b = (f * b + (255 - f) * fb) >> 8u;
+    }
+    if (has(s, F_ATE)) {
+        let av = u32(a);
+        var ok = false;
+        switch mode(s, 0u, 3u) {
+            case 0u { ok = false; }
+            case 1u { ok = true; }
+            case 2u { ok = av < s.aref; }
+            case 3u { ok = av <= s.aref; }
+            case 4u { ok = av == s.aref; }
+            case 5u { ok = av >= s.aref; }
+            case 6u { ok = av > s.aref; }
+            default { ok = av != s.aref; }
+        }
+        // Fail modes that still write something are drawn twice: once
+        // keeping the passing fragments, once (bit 3) keeping the failing
+        // ones with the writes the mode allows.
+        if (ok == ((hw.flags & 8u) != 0u)) {
+            discard;
+        }
+    }
+    if (!has(s, F_COLCLAMP)) {
+        r = r & 0xFF;
+        g = g & 0xFF;
+        b = b & 0xFF;
+    }
+    var out_a = u32(a & 0xFF);
+    if (has(s, F_FBA)) {
+        out_a = out_a | 0x80u;
+    }
+    var o: FsOut;
+    o.color = vec4<f32>(f32(r), f32(g), f32(b), f32(out_a)) / 255.0;
+    o.factor = vec4<f32>(min(f32(a) / 128.0, 1.0));
+    if ((hw.flags & 64u) != 0u) {
+        // Second step of a destination-alpha blend: the unit's DST_ALPHA is
+        // Ad/255, the GS wants Ad/128, so Cs*Ad/255 is added once as is and
+        // once scaled by 127/128 (two monotone steps, no clamping surprises).
+        o.color = vec4<f32>(vec3<f32>(f32(r), f32(g), f32(b)) * (127.0 / 128.0) / 255.0, f32(out_a) / 255.0);
+    }
+    if ((hw.flags & 48u) != 0u) {
+        // Blend forms the unit cannot express with Cs as the source colour:
+        // Cd * (1 + C) wants the factor itself as the source (bit 4), and
+        // Cs * (1 + C) wants the scaled colour (bit 5). C is As/128 or FIX/128.
+        var c = f32(a) / 128.0;
+        if (mode(s, 16u, 2u) == 2u) {
+            c = f32(s.fix) / 128.0;
+        }
+        if ((hw.flags & 16u) != 0u) {
+            o.color = vec4<f32>(c, c, c, f32(out_a) / 255.0);
+        } else {
+            o.color = vec4<f32>(vec3<f32>(f32(r), f32(g), f32(b)) * (1.0 + c) / 255.0, f32(out_a) / 255.0);
+        }
+    }
+    return o;
+}
+
+fn fetch_cached(s: Setup, xi: i32, yi: i32) -> u32 {
+    let x = texel_x(s, xi);
+    let y = texel_y(s, yi);
+    return pack_word(textureLoad(tex_image, vec2<i32>(i32(x), i32(y)), 0));
+}
+
+// `sample` over the cached image: nearest through texelFetch with the GS
+// wrap rules, bilinear through the sampler when the modes are REPEAT or
+// CLAMP (the unit's own bilinear, 8-bit weights), four fetches otherwise.
+fn sample_cached(s: Setup, uin: f32, vin: f32) -> u32 {
+    if (!has(s, F_BILINEAR)) {
+        return fetch_cached(s, i32(floor(uin)), i32(floor(vin)));
+    }
+    let mu = mode(s, 24u, 2u);
+    let mv = mode(s, 26u, 2u);
+    if (mu <= 1u && mv <= 1u) {
+        let uv = vec2<f32>(uin, vin) / vec2<f32>(f32(1u << s.tw), f32(1u << s.th));
+        var c: vec4<f32>;
+        if (mu == 0u && mv == 0u) {
+            c = textureSampleLevel(tex_image, samp_rr, uv, 0.0);
+        } else if (mu == 0u) {
+            c = textureSampleLevel(tex_image, samp_rc, uv, 0.0);
+        } else if (mv == 0u) {
+            c = textureSampleLevel(tex_image, samp_cr, uv, 0.0);
+        } else {
+            c = textureSampleLevel(tex_image, samp_cc, uv, 0.0);
+        }
+        return pack_word(c);
+    }
+    let u = uin - 0.5;
+    let v = vin - 0.5;
+    let x0 = i32(floor(u));
+    let y0 = i32(floor(v));
+    return blend4(fetch_cached(s, x0, y0), fetch_cached(s, x0 + 1, y0), fetch_cached(s, x0, y0 + 1), fetch_cached(s, x0 + 1, y0 + 1), u - f32(x0), v - f32(y0));
+}
+
+// Decodes one texture (the setup at hw.base) into the set-2 image.
+@compute @workgroup_size(16, 16)
+fn decode_tex(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let s = load_setup(hw.base);
+    if (gid.x >= (1u << s.tw) || gid.y >= (1u << s.th)) {
+        return;
+    }
+    textureStore(tex_store, vec2<i32>(i32(gid.x), i32(gid.y)), unpack_word(convert(s, load_texel(addr(s.tf, gid.x, gid.y), 0u))));
 }
 
 // The copies below address GS memory through the frame or depth buffer
