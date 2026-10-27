@@ -105,6 +105,7 @@ struct Batch {
     int minx = 1 << 30, miny = 1 << 30, maxx = -1, maxy = -1;
     std::uint32_t fbp = 0, fbw = 0, fpsm = 0, zbp = 0, zpsm = 0;
     bool zte = false, zwrite = false;
+    bool unsupported = false;  // the device's own rasterizer cannot draw this batch's setups
     std::uint32_t texflushes = 0;
     int rx0 = 0, ry0 = 0, rx1 = -2, ry1 = -2;
     Range fb_range, z_range;
@@ -194,10 +195,37 @@ std::uint32_t push_params(const std::initializer_list<std::uint32_t> values) {
     return static_cast<std::uint32_t>(g_param_records.size() - 1);
 }
 
-void dispatch_linear(Pipeline p, std::uint32_t items, std::uint32_t param) {
+Command *dispatch_linear(Pipeline p, std::uint32_t items, std::uint32_t param) {
     const std::uint32_t groups = (items + 63) / 64;
-    if (!groups) return;
+    if (!groups) return nullptr;
     g_commands.push_back({p, std::min(groups, 1024u), (groups + 1023) / 1024, param});
+    return &g_commands.back();
+}
+
+Span span_of(const Range &r) {
+    const std::uint64_t lo = std::min<std::uint64_t>(r.lo, kMemorySize), hi = std::min<std::uint64_t>(r.hi, kMemorySize);
+    return {static_cast<std::uint32_t>(lo), static_cast<std::uint32_t>(std::max(lo, hi))};
+}
+
+// Records what a command touches; extra reads fold into the last slot.
+void note_ranges(Command *c, const std::vector<Range> &reads, const std::vector<Range> &writes) {
+    if (!c) return;
+    c->ranged = true;
+    std::size_t n = 0;
+    for (const Range &r : reads) {
+        if (r.lo >= r.hi) continue;
+        if (n < 4) {
+            c->reads[n++] = span_of(r);
+        } else {
+            Span &last = c->reads[3];
+            const Span s = span_of(r);
+            last.lo = std::min(last.lo, s.lo);
+            last.hi = std::max(last.hi, s.hi);
+        }
+    }
+    n = 0;
+    for (const Range &r : writes)
+        if (r.lo < r.hi && n < 2) c->writes[n++] = span_of(r);
 }
 
 constexpr std::uint32_t kCacheWords = 4u << 20;
@@ -469,7 +497,9 @@ std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32
     hi = static_cast<std::uint32_t>(std::min<std::uint64_t>(shared.hi, kMemorySize) / 4);
     if (hi <= lo) return 0;
     const std::uint32_t words = (hi - lo) * g_scale * g_scale;
-    dispatch_linear(kSnapshot, words, push_params({lo, words}));
+    Range read;
+    read.add(static_cast<std::uint64_t>(lo) * 4, static_cast<std::uint64_t>(hi) * 4);
+    note_ranges(dispatch_linear(kSnapshot, words, push_params({lo, words})), {read}, {});
     return words;
 }
 
@@ -481,6 +511,8 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
     for (std::uint32_t i = 0; i < prims; ++i) textured += (b.setups[b.prims[i * kPrimWords] * kSetupWords] & 2u) ? 1u : 0u;
     g_command_info.push_back({g_commands.size(), {prims, tiles, entries, snapshot, b.prims[1], first[3] | (first[14] << 8) | (first[6] << 16), first[0], textured}});
 }
+
+void batch_ranges();
 
 void flush_batch() {
     Batch &b = g_batch;
@@ -506,7 +538,11 @@ void flush_batch() {
     plan_decodes(prims);
     const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
-    for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
+    for (const Decode &d : g_decodes) {
+        const std::uint32_t *w = b.setups.data() + d.setup * kSetupWords;
+        const int tw = 1 << (w[15] & 0xFFu), th = 1 << (w[15] >> 8);
+        note_ranges(dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words})), {region(w[12], w[13], w[14], 0, 0, tw - 1, th - 1)}, {});
+    }
     std::uint32_t total = 0;
     for (std::uint32_t t : g_touched) total += g_tile_count[t];
     const std::uint32_t tiles = static_cast<std::uint32_t>(g_touched.size());
@@ -540,6 +576,17 @@ void flush_batch() {
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi});
     note_raster(prims, tiles, total, snapshot);
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param, prims, static_cast<std::uint32_t>(b.setups.size() / kSetupWords)});
+    batch_ranges();
+    // Z memory is written when any setup writes it, and only read when a
+    // setup tests against it (ZTST other than ALWAYS).
+    bool ztest = false;
+    for (std::size_t i = 0; i < b.setups.size() / kSetupWords; ++i) {
+        const std::uint32_t *w = b.setups.data() + i * kSetupWords;
+        ztest = ztest || ((w[0] & 512u) && ((w[7] >> 8) & 3u) != 1u);
+    }
+    std::vector<Range> reads = g_batch_reads;
+    if (ztest && !b.zwrite) reads.push_back(b.z_range);
+    note_ranges(&g_commands.back(), reads, b.zwrite ? std::vector<Range>{b.fb_range, b.z_range} : std::vector<Range>{b.fb_range});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     b.prims.clear();
@@ -597,8 +644,14 @@ void emit_pre() {
                 total += g_pre[k].rec[7];
             }
         }
-        if (clut) g_commands.push_back({kLoadClut, 1, 1, push_params({offset, count})});
-        else dispatch_linear(kUpload, total, push_params({offset, count, total}));
+        Range touched;
+        for (std::size_t k = i; k < j; ++k) touched.add(g_pre[k].range.lo, g_pre[k].range.hi);
+        if (clut) {
+            g_commands.push_back({kLoadClut, 1, 1, push_params({offset, count})});
+            note_ranges(&g_commands.back(), {touched}, {});
+        } else {
+            note_ranges(dispatch_linear(kUpload, total, push_params({offset, count, total})), {}, {touched});
+        }
         i = j;
     }
     g_pre.clear();
@@ -1004,6 +1057,10 @@ void draw(const State &st, const Vertex *v, int count) {
     const bool zte = flags & 512u;
     const std::uint64_t key = cache.key;
     if (b.key != ~0ull && b.key != key) emit_all();
+    // Keep setups the device cannot draw itself out of batches it can, so
+    // one odd blend does not send a whole scene through the compute path.
+    const bool unsupported = g_dev->setup_unsupported(setup);
+    if (!b.prims.empty() && unsupported != b.unsupported) emit_all();
     const Range &tex = cache.tex;
     if (flags & 2u) {
         if (!b.prims.empty()) {
@@ -1033,6 +1090,7 @@ void draw(const State &st, const Vertex *v, int count) {
         b.zpsm = setup[6];
         b.zte = false;
         b.zwrite = false;
+        b.unsupported = unsupported;
         b.rx1 = -2;
     }
     b.zte = b.zte || zte;
@@ -1109,8 +1167,14 @@ void local_copy(const State &s) {
     const std::uint32_t write = push_params({static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
                                              static_cast<std::uint32_t>(pos >> 32) & 0x7FFu, static_cast<std::uint32_t>(pos >> 48) & 0x7FFu, w, h,
                                              static_cast<std::uint32_t>(pos >> 59) & 3u});
-    dispatch_linear(kCopyRead, w * h * g_scale * g_scale, read);
-    dispatch_linear(kCopyWrite, w * h * g_scale * g_scale, write);
+    const Range src = region(static_cast<std::uint32_t>(buf) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 16) & 0x3Fu, static_cast<std::uint32_t>(buf >> 24) & 0x3Fu,
+                             static_cast<int>(pos) & 0x7FF, static_cast<int>(pos >> 16) & 0x7FF, (static_cast<int>(pos) & 0x7FF) + static_cast<int>(w) - 1,
+                             (static_cast<int>(pos >> 16) & 0x7FF) + static_cast<int>(h) - 1);
+    const Range dst = region(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
+                             static_cast<int>(pos >> 32) & 0x7FF, static_cast<int>(pos >> 48) & 0x7FF, (static_cast<int>(pos >> 32) & 0x7FF) + static_cast<int>(w) - 1,
+                             (static_cast<int>(pos >> 48) & 0x7FF) + static_cast<int>(h) - 1);
+    note_ranges(dispatch_linear(kCopyRead, w * h * g_scale * g_scale, read), {src}, {});
+    note_ranges(dispatch_linear(kCopyWrite, w * h * g_scale * g_scale, write), {}, {dst});
 }
 
 void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
@@ -1245,6 +1309,7 @@ bool present(const DisplaySource &src) {
     const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
     const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, current});
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
+    note_ranges(&g_commands.back(), {region(src.fbp, src.fbw, src.psm, static_cast<int>(src.dbx), static_cast<int>(src.dby), static_cast<int>(src.dbx + src.width) - 1, static_cast<int>(src.dby + src.height) - 1)}, {});
     const float sw = static_cast<float>(g_dev->surface_width()), sh = static_cast<float>(g_dev->surface_height());
     const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
     const float vw = std::min(sw, sh * aspect), vh = vw / aspect;
@@ -1299,6 +1364,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
         flush_all();
         const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
         g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
+    note_ranges(&g_commands.back(), {region(src.fbp, src.fbw, src.psm, static_cast<int>(src.dbx), static_cast<int>(src.dby), static_cast<int>(src.dbx + src.width) - 1, static_cast<int>(src.dby + src.height) - 1)}, {});
         submit();
         slot->pixels.resize(static_cast<std::size_t>(bytes / 4));
         slot->slot = g_dev->begin_read(Buffer::Scratch, 0, bytes);
@@ -1316,6 +1382,7 @@ bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::ui
     flush_all();
     const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
+    note_ranges(&g_commands.back(), {region(src.fbp, src.fbw, src.psm, static_cast<int>(src.dbx), static_cast<int>(src.dby), static_cast<int>(src.dbx + src.width) - 1, static_cast<int>(src.dby + src.height) - 1)}, {});
     submit();
     width = src.width * g_scale;
     height = src.height * g_scale;

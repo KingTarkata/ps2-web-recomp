@@ -13,14 +13,18 @@
 // tracks which pages a target owns to skip the copies.
 
 struct HwParams {
-    setup: u32,      // setup record offset in `data`
-    fbmsk: u32,      // frame mask applied when exporting (bits kept from memory)
-    scale: u32,
-    flags: u32,      // bit 0: depth attachment present
-    ox: i32,         // rectangle origin in GS pixels (import/export)
+    base: u32,       // draws: setup record offset in `data`; copies: frame or depth base (block address)
+    bw: u32,         // copies: buffer width (64-pixel units)
+    psm: u32,        // copies: pixel format
+    flags: u32,      // bit 0: depth attachment present; bits 1, 2: debug paints; bit 3: keep the fragments the alpha test fails (and drop the rest); bit 4: output the blend factor C as the colour; bit 5: output Cs * (1 + C); bit 6: output Cs * 127/128
+    ox: i32,         // rectangle origin in GS pixels (copies)
     oy: i32,
-    width: u32,      // rectangle size in samples (import/export), target size (draw)
+    width: u32,      // rectangle size in samples (copies), target size in samples (draws)
     height: u32,
+    scale: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 };
 
 @group(1) @binding(0) var<uniform> hw: HwParams;
@@ -54,7 +58,7 @@ fn hw_vs(v: VsIn) -> VsOut {
     let x = (v.pos.x + 0.5) / w * 2.0 - 1.0;
     let y = (v.pos.y + 0.5) / h * 2.0 - 1.0;
     // Z is clamped to the depth buffer format's maximum, as plot() does.
-    let s = load_setup(hw.setup);
+    let s = load_setup(hw.base);
     o.clip = vec4<f32>(x, y, f32(min(v.z, s.zmax)) / 4294967296.0, 1.0);
     o.color = v.color;
     o.tex = v.tex;
@@ -93,7 +97,11 @@ fn hw_fs(i: VsOut) -> FsOut {
     if ((hw.flags & 2u) != 0u) {
         return debug_out(0x80FF00FFu);  // debug: paint every fragment, before any test
     }
-    let s = load_setup(hw.setup);
+    let s = load_setup(hw.base);
+    // Batches that read what they draw sample the snapshot the compute
+    // `snapshot` pass copied to scratch, like the compute raster does.
+    snapshot_lo = prm(5u);
+    snapshot_hi = prm(6u);
     let sx = u32(i.clip.x);
     let sy = u32(i.clip.y);
     let x = i32(sx / hw.scale);
@@ -190,7 +198,10 @@ fn hw_fs(i: VsOut) -> FsOut {
             case 6u { ok = av > s.aref; }
             default { ok = av != s.aref; }
         }
-        if (!ok) {
+        // Fail modes that still write something are drawn twice: once
+        // keeping the passing fragments, once (bit 3) keeping the failing
+        // ones with the writes the mode allows.
+        if (ok == ((hw.flags & 8u) != 0u)) {
             discard;
         }
     }
@@ -206,7 +217,36 @@ fn hw_fs(i: VsOut) -> FsOut {
     var o: FsOut;
     o.color = vec4<f32>(f32(r), f32(g), f32(b), f32(out_a)) / 255.0;
     o.factor = vec4<f32>(min(f32(a) / 128.0, 1.0));
+    if ((hw.flags & 64u) != 0u) {
+        // Second step of a destination-alpha blend: the unit's DST_ALPHA is
+        // Ad/255, the GS wants Ad/128, so Cs*Ad/255 is added once as is and
+        // once scaled by 127/128 (two monotone steps, no clamping surprises).
+        o.color = vec4<f32>(vec3<f32>(f32(r), f32(g), f32(b)) * (127.0 / 128.0) / 255.0, f32(out_a) / 255.0);
+    }
+    if ((hw.flags & 48u) != 0u) {
+        // Blend forms the unit cannot express with Cs as the source colour:
+        // Cd * (1 + C) wants the factor itself as the source (bit 4), and
+        // Cs * (1 + C) wants the scaled colour (bit 5). C is As/128 or FIX/128.
+        var c = f32(a) / 128.0;
+        if (mode(s, 16u, 2u) == 2u) {
+            c = f32(s.fix) / 128.0;
+        }
+        if ((hw.flags & 16u) != 0u) {
+            o.color = vec4<f32>(c, c, c, f32(out_a) / 255.0);
+        } else {
+            o.color = vec4<f32>(vec3<f32>(f32(r), f32(g), f32(b)) * (1.0 + c) / 255.0, f32(out_a) / 255.0);
+        }
+    }
     return o;
+}
+
+// The copies below address GS memory through the frame or depth buffer
+// named in `hw` alone, so a target can be written back long after the
+// batch that drew it (its setup record is gone by then).
+fn copy_sample(gid: vec3<u32>) -> vec4<u32> {
+    let tx = u32(hw.ox) * hw.scale + gid.x;
+    let ty = u32(hw.oy) * hw.scale + gid.y;
+    return vec4<u32>(tx, ty, (ty % hw.scale) * hw.scale + tx % hw.scale, 0u);
 }
 
 // Fills a target from GS memory: one invocation per sample.
@@ -215,20 +255,28 @@ fn import_frame(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= hw.width || gid.y >= hw.height) {
         return;
     }
-    let s = load_setup(hw.setup);
-    let tx = u32(hw.ox) * hw.scale + gid.x;
-    let ty = u32(hw.oy) * hw.scale + gid.y;
-    let x = tx / hw.scale;
-    let y = ty / hw.scale;
-    let k = (ty % hw.scale) * hw.scale + tx % hw.scale;
-    let l = addr(s.ff, x, y);
-    textureStore(target_store, vec2<i32>(i32(tx), i32(ty)), unpack_word(load_at(l, k)));
+    let c = copy_sample(gid);
+    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / hw.scale, c.y / hw.scale);
+    textureStore(target_store, vec2<i32>(i32(c.x), i32(c.y)), unpack_word(load_at(l, c.z)));
 }
 
-// Writes a target back into GS memory through the frame format's own store
-// (24-bit frames keep their top byte, 16-bit frames pack), with no mask.
-fn write_frame_word(s: Setup, l: Loc, k: u32, word: u32) {
-    write_frame(s, l, k, word, hw.fbmsk);
+// Writes a target back into GS memory through the frame format's own store:
+// 24-bit frames keep their top byte, 16-bit frames pack. Frame masks were
+// applied as colour write masks when drawing, so nothing is masked here.
+fn store_frame(psm: u32, l: Loc, k: u32, c: u32) {
+    switch psm {
+        case 0x02u, 0x0Au {
+            store(l, k, pack16(c));
+        }
+        case 0x01u {
+            let l32 = Loc(l.word, 0u, 0xFFFFFFFFu);
+            let old = load_at(l32, k);
+            store(l32, k, (c & 0x00FFFFFFu) | (old & 0xFF000000u));
+        }
+        default {
+            store(l, k, c);
+        }
+    }
 }
 
 @compute @workgroup_size(16, 16)
@@ -236,15 +284,18 @@ fn export_frame(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= hw.width || gid.y >= hw.height) {
         return;
     }
-    let s = load_setup(hw.setup);
-    let tx = u32(hw.ox) * hw.scale + gid.x;
-    let ty = u32(hw.oy) * hw.scale + gid.y;
-    let x = tx / hw.scale;
-    let y = ty / hw.scale;
-    let k = (ty % hw.scale) * hw.scale + tx % hw.scale;
-    let l = addr(s.ff, x, y);
-    let word = pack_word(textureLoad(target_load, vec2<i32>(i32(tx), i32(ty)), 0));
-    write_frame_word(s, l, k, word);
+    let c = copy_sample(gid);
+    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / hw.scale, c.y / hw.scale);
+    let word = pack_word(textureLoad(target_load, vec2<i32>(i32(c.x), i32(c.y)), 0));
+    store_frame(hw.psm, l, c.z, word);
+}
+
+fn depth_max(psm: u32) -> u32 {
+    switch psm {
+        case 0x31u { return 0xFFFFFFu; }
+        case 0x32u, 0x3Au { return 0xFFFFu; }
+        default { return 0xFFFFFFFFu; }
+    }
 }
 
 // Depth cannot be a storage image, so it goes through depth_stage and a
@@ -254,14 +305,9 @@ fn import_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= hw.width || gid.y >= hw.height) {
         return;
     }
-    let s = load_setup(hw.setup);
-    let tx = u32(hw.ox) * hw.scale + gid.x;
-    let ty = u32(hw.oy) * hw.scale + gid.y;
-    let x = tx / hw.scale;
-    let y = ty / hw.scale;
-    let k = (ty % hw.scale) * hw.scale + tx % hw.scale;
-    let l = addr(s.zf, x, y);
-    depth_stage[gid.y * hw.width + gid.x] = bitcast<u32>(f32(load_at(l, k) & s.zmax) / 4294967296.0);
+    let c = copy_sample(gid);
+    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / hw.scale, c.y / hw.scale);
+    depth_stage[gid.y * hw.width + gid.x] = bitcast<u32>(f32(load_at(l, c.z) & depth_max(hw.psm)) / 4294967296.0);
 }
 
 @compute @workgroup_size(16, 16)
@@ -269,13 +315,8 @@ fn export_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= hw.width || gid.y >= hw.height) {
         return;
     }
-    let s = load_setup(hw.setup);
-    let tx = u32(hw.ox) * hw.scale + gid.x;
-    let ty = u32(hw.oy) * hw.scale + gid.y;
-    let x = tx / hw.scale;
-    let y = ty / hw.scale;
-    let k = (ty % hw.scale) * hw.scale + tx % hw.scale;
-    let l = addr(s.zf, x, y);
+    let c = copy_sample(gid);
+    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / hw.scale, c.y / hw.scale);
     // The rasterizer interpolates depth between integer vertex values; the
     // GS keeps the integer part, so floor it back (round would lift half of
     // the pixels by one and break greater-or-equal tests on coplanar draws).
@@ -284,5 +325,5 @@ fn export_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (d < 1.0) {
         z = u32(floor(d * 4294967296.0 + 0.001));
     }
-    store(l, k, z & s.zmax);
+    store(l, c.z, z & depth_max(hw.psm));
 }

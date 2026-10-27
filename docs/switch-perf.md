@@ -62,3 +62,23 @@ a few hundred triangles, which is the cost of four full-screen passes over
 swizzled memory, not of drawing. Page ownership tracking, so a target stays
 resident across batches and is only written back when something reads the
 memory, is the next step (docs/gs-hw-renderer.md).
+
+## Correction (2026-10-27): the numbers above are single-threaded
+
+`PS2_TIME` and `--frames-dir` make the runner run on one thread, and a
+headless run (no `--window`) never starts the render and VU threads, so
+every row above measured EE emulation, GS batching and GPU waits in series
+on one core (`top` showed the process at 100% of one core while the machine
+was 75% idle). The threaded path only runs windowed, and it paces to the
+audio clock, so measuring it needs the new `PS2_NO_PACE=1` (run flat out)
+and `PS2_SPEED_LOG=1` (print the window title's fps line to stderr each
+second). On the Switch over SSH: `DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority
+... --window`.
+
+| Date | Scene | ms/frame | Notes |
+|---|---|---|---|
+| 2026-10-27 | Race from saved state, threaded, unpaced, windowed, compute path (`PS2_GS=gpu`) | 80-86 | CPU 75-85% of one core, GPU busy 61% |
+| 2026-10-27 | same, hardware path with resident surfaces (`PS2_GS=hw`) | 45-49 | CPU 150-185% (EE and GS threads both busy), GPU busy over 100%: GPU-bound; GPU profile 48 ms/frame (raster 37, decode 5.4, load_clut 4.0, upload 2.0) |
+| 2026-10-27 | same, single-threaded (`PS2_TIME`), hardware path, for comparison with the rows above | 70.5 | down from 74.3 with per-batch import/export |
+
+Mode 0 "Console" (768 MHz GPU) throughout. Target remains 16.7 ms.

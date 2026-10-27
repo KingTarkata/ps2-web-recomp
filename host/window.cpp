@@ -239,6 +239,9 @@ void present() {
 constexpr Uint32 kAudioBytesPerMs = 48 * 4;
 
 void pace() {
+    // PS2_NO_PACE runs the threaded path flat out, for measuring it.
+    static const bool unpaced = std::getenv("PS2_NO_PACE") != nullptr;
+    if (unpaced) return;
     if (g_audio) {
         // The audio device clock paces emulation: wait while more than ~80 ms of sound is queued.
         while (SDL_GetQueuedAudioSize(g_audio) > 80 * kAudioBytesPerMs) SDL_Delay(1);
@@ -288,6 +291,8 @@ void show_speed() {
     std::snprintf(title, sizeof title, "ps2-web-recomp  %.1f fps  CPU %.0f%%  GPU %.0f%%  RAM %.0f MB  audio %.0f ms", static_cast<double>(frames) / seconds,
                   (cpu - cpu_start) / seconds * 100.0, (gpu - gpu_start) / (seconds * 10.0), resident_mb(), queued);
     SDL_SetWindowTitle(g_window, title);
+    static const bool log = std::getenv("PS2_SPEED_LOG") != nullptr;
+    if (log) std::fprintf(stderr, "[speed] %s (%.2f ms/frame)\n", title, seconds * 1000.0 / static_cast<double>(frames));
     start = now;
     frames = 0;
     cpu_start = cpu;

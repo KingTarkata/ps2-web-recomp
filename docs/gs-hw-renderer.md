@@ -232,7 +232,35 @@ now. The runtime's queue and threads do not change.
   95.0 on the compute path the same day (`docs/switch-perf.md`). GPU time
   is still 72 ms per frame, almost all of it the per-batch import and
   export passes rather than drawing, which settles what comes next.
-- Next: page ownership so import/export only run when memory and target
-  disagree, which is where the time is; then the remaining fallbacks
-  (batches reading their own target, destination-alpha factors, DATE,
-  alpha-test fail modes, 16-bit frames, upscaling, lines and points).
+- 2026-10-27, resident surfaces (stage 5 in substance). Frame and depth
+  buffers are now `Surface`s in `hw.cpp`: one image per (base, width,
+  format), sized to the buffer, with a 32x32-tile map of what is valid
+  (image matches memory) and dirty (image newer). Every `gpu::Command`
+  carries the GS memory spans it reads and writes (`gpu.cpp` fills them
+  from the ranges it already computes); the device writes dirty tiles back
+  before a command reads their memory and drops tiles when one writes it,
+  rectangle-precise for compute-drawn batches on the same buffers. Downloads
+  and state saves flush synchronously. Lessons: a surface write-back must
+  write back, not drop, aliasing tiles of other surfaces; the viewport must
+  stay the full 2048 drawing space or clipping at the surface edge shifts
+  texel picks; a 24-bit frame and a Z buffer that overlap in memory (the
+  game's clear trick) are stored colour-then-depth right after the draw.
+  Also drawn in hardware now: batches reading their own target (the
+  fragment shader sets the compute path's snapshot window), alpha-test fail
+  modes (two draws per primitive, exact), the blend forms Cs(1+C), Cd(1+C)
+  and Cs·Ad/128+Cd (the last as two monotone steps, since DST_ALPHA is /255),
+  Z formats used as frames; and `gpu.cpp` starts a new batch when a setup
+  switches between hardware-drawable and not, so one odd blend no longer
+  sends a 6000-primitive scene through compute. Fallbacks left in a race:
+  DATE (about 20 small batches a frame), partial frame masks, lines.
+- 2026-10-27, measurement correction: `PS2_TIME` (and `--frames-dir`) run
+  the runner single-threaded, and headless runs never start the render
+  thread, so every Switch number before today was one thread doing EE, GS
+  and GPU waits in series. `PS2_NO_PACE=1 PS2_SPEED_LOG=1 --window` measures
+  the threaded path flat out: the race runs at 45-49 ms per frame on the
+  hardware path and 80-86 ms on the compute path (`docs/switch-perf.md`).
+  The GPU profile of the hardware path is 48 ms per frame (raster 37), so
+  the GPU is the limit again.
+- Next: textures as images sampled with texelFetch instead of swizzled
+  buffer loads per fragment (the fragment shader also reloads the setup
+  record per fragment); then DATE through stencil; then the depth copies.

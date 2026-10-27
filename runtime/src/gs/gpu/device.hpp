@@ -19,6 +19,11 @@ extern const char *const kEntryPoints[kPipelines];
 // Each parameter record is one uniform block this long, indexed by Command::param.
 constexpr std::uint32_t kParamStride = 256;
 
+// A byte range of GS memory, `hi` exclusive.
+struct Span {
+    std::uint32_t lo = 0, hi = 0;
+};
+
 struct Command {
     Pipeline pipeline;
     std::uint32_t x, y;  // workgroups
@@ -26,6 +31,13 @@ struct Command {
     // For kRaster: the batch's primitive and setup record counts, so a device
     // with a rasterizer of its own can rebuild the draw from the arena.
     std::uint32_t prims = 0, setups = 0;
+    // The GS memory the command reads and writes, for a device that keeps
+    // render targets outside GS memory and has to write them back before
+    // memory is read and drop them when memory is written. `ranged` false
+    // means unknown: assume everything.
+    bool ranged = false;
+    Span reads[4] = {};
+    Span writes[2] = {};
 };
 
 // The storage buffers the shaders bind, in binding order; plus the
@@ -84,6 +96,10 @@ struct Device {
     virtual double busy_ms() = 0;
     // Prints the device's own counters at exit, after the renderer's.
     virtual void stats() {}
+    // A device with a rasterizer of its own says which setups it cannot draw,
+    // so the batching layer keeps them out of batches it can (gpu.cpp emits
+    // a batch boundary when this answer changes).
+    virtual bool setup_unsupported(const std::uint32_t *) const { return false; }
 
     virtual bool attach_surface(const SurfaceTarget &target) = 0;
     virtual void resize_surface(std::uint32_t width, std::uint32_t height) = 0;

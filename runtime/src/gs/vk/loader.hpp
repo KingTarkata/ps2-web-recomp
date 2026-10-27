@@ -71,6 +71,7 @@ namespace ps2::gs::vk {
     X(vkCreateDescriptorPool) \
     X(vkDestroyDescriptorPool) \
     X(vkAllocateDescriptorSets) \
+    X(vkFreeDescriptorSets) \
     X(vkUpdateDescriptorSets) \
     X(vkCreateRenderPass) \
     X(vkDestroyRenderPass) \

@@ -62,6 +62,7 @@ public:
     }
     bool init(const Limits &limits, const std::vector<std::uint32_t> &tables) override;
     bool timestamps() const override { return ctx_.has_timestamps; }
+    bool setup_unsupported(const std::uint32_t *setup) const override { return hw_on_ && !hw_.setup_supported(setup); }
     void write(gpu::Buffer b, std::uint64_t offset, const void *data, std::uint64_t bytes) override;
     void submit(const std::vector<Command> &commands, const void *params, std::size_t param_bytes, const std::uint32_t *arena, std::size_t arena_words, bool present) override;
     void submit_profiled(const std::vector<Command> &commands, const void *params, std::size_t param_bytes, const std::uint32_t *arena, std::size_t arena_words,
@@ -295,6 +296,7 @@ bool VkDevice_::init(const Limits &limits, const std::vector<std::uint32_t> &tab
 }
 
 void VkDevice_::write(gpu::Buffer b, std::uint64_t offset, const void *data, std::uint64_t bytes) {
+    if (b == gpu::Buffer::Vram && hw_on_) hw_.drop_all();
     Buffer &target = buffer(b, &frames_[frame_]);
     if (target.mapped) {
         vk::vkQueueWaitIdle(ctx_.queue);
@@ -352,6 +354,11 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
             vk::vkCmdPipelineBarrier(cb, shader_stages, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
             if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
             continue;
+        }
+        if (hw_on_) {
+            // The resident target may hold memory this command reads or writes.
+            hw_.before_command(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params));
+            current = kPipelines;
         }
         if (c.pipeline != current) {
             vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[c.pipeline]);
@@ -444,6 +451,7 @@ void VkDevice_::submit_profiled(const std::vector<Command> &commands, const void
 }
 
 void VkDevice_::read_back(gpu::Buffer b, std::uint64_t offset, std::uint64_t bytes, void *out) {
+    if (b == gpu::Buffer::Vram && hw_on_) hw_.flush_sync(frames_[(frame_ + kFrames - 1) % kFrames].set, {static_cast<std::uint32_t>(offset), static_cast<std::uint32_t>(offset + bytes)});
     Buffer &src = buffer(b, &frames_[(frame_ + kFrames - 1) % kFrames]);
     auto *dst = static_cast<std::uint8_t *>(out);
     while (bytes) {
@@ -478,6 +486,7 @@ int VkDevice_::begin_read(gpu::Buffer b, std::uint64_t offset, std::uint64_t byt
         if (!ctx_.create_buffer(r.staging, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true)) return -1;
     }
     vk::vkResetFences(ctx_.device, 1, &r.fence);
+    if (b == gpu::Buffer::Vram && hw_on_) hw_.flush_sync(frames_[(frame_ + kFrames - 1) % kFrames].set, {static_cast<std::uint32_t>(offset), static_cast<std::uint32_t>(offset + bytes)});
     Buffer &src = buffer(b, &frames_[(frame_ + kFrames - 1) % kFrames]);
     if (!copy_once(src.buffer, offset, r.staging.buffer, 0, bytes, r.fence, r.cb)) return -1;
     r.bytes = bytes;
