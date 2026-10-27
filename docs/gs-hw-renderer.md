@@ -221,6 +221,13 @@ now. The runtime's queue and threads do not change.
   the graphics entry points (`kGsSpv` and `kHwSpv` are separate), depth is
   exported with floor rather than round (coplanar greater-or-equal draws),
   and the vertex shader clamps Z to the format's maximum as `plot` does.
+- Full 6000-frame Spec II session (title, menus, Nürburgring race) on the
+  hardware path versus the compute renderer: 521k batches drawn, 61k
+  through compute; every menu frame within a channel delta of 7, race
+  frames within blend rounding plus 4 to 22 edge pixels each, no visible
+  difference and no behavioural divergence over the session. EE RAM
+  differs in 305 small ranges (40 KB) that hold pixel data the game reads
+  back from GS memory, by the same rounding.
 - Next: page ownership so import/export only run when memory and target
   disagree, which is where the time will be; then the remaining fallbacks
   (batches reading their own target, destination-alpha factors, DATE,
