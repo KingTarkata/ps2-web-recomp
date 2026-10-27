@@ -6,6 +6,9 @@
 #include "../hw.hpp"
 #ifdef PS2_GPU
 #include "gpu/gpu.hpp"
+#ifdef PS2_GS_VK
+#include "vk/vk.hpp"
+#endif
 #endif
 
 #include "ps2/state.hpp"
@@ -440,6 +443,11 @@ void init() {
     const char *backend = std::getenv("PS2_GS");
     const gpu::Mode wanted = !backend || std::strcmp(backend, "gpu") == 0 ? gpu::Mode::primary : std::strcmp(backend, "both") == 0 ? gpu::Mode::mirror : gpu::Mode::off;
     if (wanted != gpu::Mode::off && !gpu::init(wanted)) std::fprintf(stderr, "[gs] WebGPU unavailable, using the software renderer\n");
+#endif
+#ifdef PS2_GS_VK
+    // The hardware backend (docs/gs-hw-renderer.md) is brought up next to the
+    // compute renderer while it grows; drawing still goes through the latter.
+    if (vk::wanted() && !vk::init(1u)) std::fprintf(stderr, "[gs] hardware GS backend unavailable\n");
 #endif
 }
 
