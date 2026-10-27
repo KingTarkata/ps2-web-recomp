@@ -48,7 +48,7 @@ std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1
 
 std::uint32_t g_decoded_used = 0;
 bool g_rendered[512] = {};
-std::uint64_t g_uploads = 0;
+std::uint64_t g_uploads = 0, g_hardware_batches = 0;  // batches emitted without compute tile lists
 bool g_decode = true;
 struct CommandInfo {
     std::size_t index;
@@ -576,61 +576,74 @@ void flush_batch() {
         return;
     }
     const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
-    g_touched.clear();
-    g_spans.clear();
-    g_span_start.resize(prims + 1);
-    for (std::uint32_t i = 0; i < prims; ++i) {
-        g_span_start[i] = static_cast<std::uint32_t>(g_spans.size());
-        add_spans(b.prims.data() + i * kPrimWords, b.boxes[i * 2], b.boxes[i * 2 + 1]);
-        for (std::size_t k = g_span_start[i]; k < g_spans.size(); ++k) {
-            const Span &sp = g_spans[k];
-            std::uint32_t t = static_cast<std::uint32_t>(sp.ty * g_tiles_per_row + sp.tx0);
-            for (int tx = sp.tx0; tx <= sp.tx1; ++tx, ++t)
-                if (!g_tile_count[t]++) g_touched.push_back(t);
+    // A batch the device draws itself needs none of the compute rasterizer's
+    // tile lists, decode plans or snapshot: just its primitives and setups.
+    const bool hardware = g_dev->batch_hardware(b.setups.data(), static_cast<std::uint32_t>(b.setups.size() / kSetupWords), b.prims.data(), prims);
+    if (hardware) {
+        const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
+        const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
+        const std::uint32_t param = push_params({0, prim_offset, setup_offset, 0, 0, 0, 0});
+        note_raster(prims, 0, 0, 0);
+        g_commands.push_back({kRaster, 0, 0, param, prims, static_cast<std::uint32_t>(b.setups.size() / kSetupWords)});
+        g_commands.back().hardware = true;
+        ++g_hardware_batches;
+    } else {
+        g_touched.clear();
+        g_spans.clear();
+        g_span_start.resize(prims + 1);
+        for (std::uint32_t i = 0; i < prims; ++i) {
+            g_span_start[i] = static_cast<std::uint32_t>(g_spans.size());
+            add_spans(b.prims.data() + i * kPrimWords, b.boxes[i * 2], b.boxes[i * 2 + 1]);
+            for (std::size_t k = g_span_start[i]; k < g_spans.size(); ++k) {
+                const Span &sp = g_spans[k];
+                std::uint32_t t = static_cast<std::uint32_t>(sp.ty * g_tiles_per_row + sp.tx0);
+                for (int tx = sp.tx0; tx <= sp.tx1; ++tx, ++t)
+                    if (!g_tile_count[t]++) g_touched.push_back(t);
+            }
         }
-    }
-    g_span_start[prims] = static_cast<std::uint32_t>(g_spans.size());
-    plan_decodes(prims);
-    const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
-    const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
-    for (const Decode &d : g_decodes) {
-        const std::uint32_t *w = b.setups.data() + d.setup * kSetupWords;
-        const int tw = 1 << (w[15] & 0xFFu), th = 1 << (w[15] >> 8);
-        note_ranges(dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words})), {region(w[12], w[13], w[14], 0, 0, tw - 1, th - 1)}, {});
-    }
-    std::uint32_t total = 0;
-    for (std::uint32_t t : g_touched) total += g_tile_count[t];
-    const std::uint32_t tiles = static_cast<std::uint32_t>(g_touched.size());
-    const std::uint32_t tile_offset = static_cast<std::uint32_t>(g_arena.size());
-    const std::uint32_t list_offset = tile_offset + tiles * 2 + 2;
-    const std::uint32_t list_words = (total + 1) / 2;
-    std::uint32_t *grown = g_arena.grow(tiles * 2 + 2 + list_words);
-    if (list_words) grown[tiles * 2 + 2 + list_words - 1] = 0;
-    std::uint32_t cursor = 0;
-    for (std::uint32_t i = 0; i < tiles; ++i) {
-        const std::uint32_t t = g_touched[i];
-        grown[i * 2] = (t % static_cast<std::uint32_t>(g_tiles_per_row)) | ((t / static_cast<std::uint32_t>(g_tiles_per_row)) << 16);
-        grown[i * 2 + 1] = cursor;
-        g_tile_fill[t] = cursor;
-        cursor += g_tile_count[t];
-    }
-    grown[tiles * 2] = 0;
-    grown[tiles * 2 + 1] = cursor;
-    auto *halves = reinterpret_cast<unsigned char *>(grown + tiles * 2 + 2);
-    for (std::uint32_t i = 0; i < prims; ++i) {
-        const auto index = static_cast<std::uint16_t>(i);
-        for (std::uint32_t k = g_span_start[i]; k < g_span_start[i + 1]; ++k) {
-            const Span &sp = g_spans[k];
-            std::uint32_t t = static_cast<std::uint32_t>(sp.ty * g_tiles_per_row + sp.tx0);
-            for (int tx = sp.tx0; tx <= sp.tx1; ++tx, ++t) std::memcpy(halves + 2u * g_tile_fill[t]++, &index, 2);
+        g_span_start[prims] = static_cast<std::uint32_t>(g_spans.size());
+        plan_decodes(prims);
+        const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
+        const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
+        for (const Decode &d : g_decodes) {
+            const std::uint32_t *w = b.setups.data() + d.setup * kSetupWords;
+            const int tw = 1 << (w[15] & 0xFFu), th = 1 << (w[15] >> 8);
+            note_ranges(dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words})), {region(w[12], w[13], w[14], 0, 0, tw - 1, th - 1)}, {});
         }
+        std::uint32_t total = 0;
+        for (std::uint32_t t : g_touched) total += g_tile_count[t];
+        const std::uint32_t tiles = static_cast<std::uint32_t>(g_touched.size());
+        const std::uint32_t tile_offset = static_cast<std::uint32_t>(g_arena.size());
+        const std::uint32_t list_offset = tile_offset + tiles * 2 + 2;
+        const std::uint32_t list_words = (total + 1) / 2;
+        std::uint32_t *grown = g_arena.grow(tiles * 2 + 2 + list_words);
+        if (list_words) grown[tiles * 2 + 2 + list_words - 1] = 0;
+        std::uint32_t cursor = 0;
+        for (std::uint32_t i = 0; i < tiles; ++i) {
+            const std::uint32_t t = g_touched[i];
+            grown[i * 2] = (t % static_cast<std::uint32_t>(g_tiles_per_row)) | ((t / static_cast<std::uint32_t>(g_tiles_per_row)) << 16);
+            grown[i * 2 + 1] = cursor;
+            g_tile_fill[t] = cursor;
+            cursor += g_tile_count[t];
+        }
+        grown[tiles * 2] = 0;
+        grown[tiles * 2 + 1] = cursor;
+        auto *halves = reinterpret_cast<unsigned char *>(grown + tiles * 2 + 2);
+        for (std::uint32_t i = 0; i < prims; ++i) {
+            const auto index = static_cast<std::uint16_t>(i);
+            for (std::uint32_t k = g_span_start[i]; k < g_span_start[i + 1]; ++k) {
+                const Span &sp = g_spans[k];
+                std::uint32_t t = static_cast<std::uint32_t>(sp.ty * g_tiles_per_row + sp.tx0);
+                for (int tx = sp.tx0; tx <= sp.tx1; ++tx, ++t) std::memcpy(halves + 2u * g_tile_fill[t]++, &index, 2);
+            }
+        }
+        for (std::uint32_t t : g_touched) g_tile_count[t] = 0;
+        std::uint32_t snapshot_lo, snapshot_hi;
+        const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
+        const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi});
+        note_raster(prims, tiles, total, snapshot);
+        g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param, prims, static_cast<std::uint32_t>(b.setups.size() / kSetupWords)});
     }
-    for (std::uint32_t t : g_touched) g_tile_count[t] = 0;
-    std::uint32_t snapshot_lo, snapshot_hi;
-    const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
-    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi});
-    note_raster(prims, tiles, total, snapshot);
-    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param, prims, static_cast<std::uint32_t>(b.setups.size() / kSetupWords)});
     batch_ranges();
     // Z memory is written when any setup writes it, and only read when a
     // setup tests against it (ZTST other than ALWAYS).
@@ -1455,7 +1468,7 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
 
 void stats() {
     if (g_mode == Mode::off) return;
-    std::fprintf(stderr, "[gpu] clut loads: %llu emitted, %llu reused\n", static_cast<unsigned long long>(g_clut_emitted), static_cast<unsigned long long>(g_clut_reused));
+    std::fprintf(stderr, "[gpu] clut loads: %llu emitted, %llu reused; %llu batches promised to the hardware path\n", static_cast<unsigned long long>(g_clut_emitted), static_cast<unsigned long long>(g_clut_reused), static_cast<unsigned long long>(g_hardware_batches));
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");

@@ -84,5 +84,6 @@ second). On the Switch over SSH: `DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority
 | 2026-10-27 | same, single-threaded (`PS2_TIME`, no profiler), hardware path with the texture cache | 90.2 | the cache costs ~20 ms of CPU per frame single-threaded; the GPU gain (48.3 -> 41.6) is hidden behind it |
 | 2026-10-27 | (invalid) runs hw9-hw14 between 09:19 and 12:30 | 132-560 | `load_setup` routed through an array by value: 10x shader slowdown on Tegra, both renderers; see gs-hw-renderer.md |
 | 2026-10-27 | same, threaded, hardware path after the render-thread work (texture key index and LRU list, cell-grid validity, dirty counters, arena built in mapped memory) | 41-42.5 | main thread was the limit at 98% of a core; now about 50 ms of work per frame there against 41.6 ms of GPU time |
+| 2026-10-27 | same, threaded, hardware path with batches promised to the hardware path skipping the compute tile lists, decode plans and snapshots | 38-42 | main thread flush_batch+emit_all 6-8 -> 2.6 ms; 0 batches lost (descriptor pool enlarged for the race-start surface churn); CPU and GPU now both near 41 ms |
 
 Mode 0 "Console" (768 MHz GPU) throughout. Target remains 16.7 ms.

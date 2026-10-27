@@ -64,6 +64,7 @@ public:
             std::fprintf(stderr, "[vk] hardware raster: %llu batches drawn, %llu through the compute rasterizer\n", static_cast<unsigned long long>(hw_.drawn_batches()),
                          static_cast<unsigned long long>(hw_.fallback_batches()));
         if (hw_on_) hw_.print_reasons();
+        if (dropped_batches_) std::fprintf(stderr, "[vk] %llu batches promised to the hardware path were declined and lost\n", static_cast<unsigned long long>(dropped_batches_));
         if (hw_on_) {
             std::fprintf(stderr, "[vk] passes closed by commands:");
             for (int i = 0; i < kPipelines; ++i)
@@ -75,6 +76,7 @@ public:
     bool init(const Limits &limits, const std::vector<std::uint32_t> &tables) override;
     bool timestamps() const override { return ctx_.has_timestamps; }
     bool setup_unsupported(const std::uint32_t *setup) const override { return hw_on_ && !hw_.setup_supported(setup); }
+    bool batch_hardware(const std::uint32_t *setups, std::uint32_t nsetups, const std::uint32_t *prims, std::uint32_t nprims) const override { return hw_on_ && hw_.batch_supported(setups, nsetups, prims, nprims); }
     void clut_source(std::uint32_t id, gpu::Span span) override { hw_.clut_source(id, span); }
     void blocks_written(const std::uint32_t *blocks, std::size_t n, std::uint64_t id) override { hw_.blocks_written(blocks, n, id); }
     bool arena_storage(std::uint32_t *&words, std::size_t &capacity) override {
@@ -131,6 +133,7 @@ private:
     Context ctx_;
     vk::HwRaster hw_;
     bool hw_on_ = false;
+    std::uint64_t dropped_batches_ = 0;  // hardware-promised batches the hardware path then declined
     std::uint64_t closes_by_pipeline_[kPipelines] = {};  // passes closed by a command the device could not hold back
     Buffer vram_, tables_, clut_, scratch_, cache_, decoded_, readback_, staging_;
     VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;
@@ -416,6 +419,13 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
             dispatch(commands[k], static_cast<std::uint32_t>(k), false, false);
         }
     };
+    // A batch the batching layer promised to the hardware path has no tile
+    // lists; if the hardware path declines it after all, the compute
+    // rasterizer draws nothing from it. Scratch is sized so this stays rare.
+    const auto note_lost = [&](const Command &c) {
+        static const bool trace = std::getenv("PS2_HW_LOST_TRACE") != nullptr;
+        if (!dropped_batches_++ || trace) std::fprintf(stderr, "[vk] warning: f%llu a batch promised to the hardware path was declined (%s, %u prims, %u setups); it is lost\n", static_cast<unsigned long long>(ps2::frame_count()), hw_.last_reason_name(), c.prims, c.setups);
+    };
     const auto draw_held = [&](const Deferred &d) {
         if (d.timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, d.index * 2);
         if (hw_.draw(cb, d.c, f.set, arena, static_cast<const std::uint32_t *>(params), f.data.buffer)) {
@@ -425,6 +435,7 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
         }
         static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
         if (ps2::frame_count() == trace_frame) std::fprintf(stderr, "[pass] f%llu held batch %u declined at flush\n", static_cast<unsigned long long>(ps2::frame_count()), d.index);
+        if (d.c.hardware) note_lost(d.c);
         if (d.skipped_from < d.index) replay(d.skipped_from, d.index);
         hw_.close_pass(cb);
         hw_.before_command(cb, d.c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
@@ -487,6 +498,7 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
                 }
             }
             if (c.pipeline == kRaster && skipped_from < i) replay(skipped_from, i);  // declined after all
+            if (c.hardware) note_lost(c);
             skipped_from = ~static_cast<std::size_t>(0);
             if (hw_.pass_open() && c.pipeline != kRaster && c.ranged && !hw_.held_conflict(c)) {
                 hw_.note_deferred(c);

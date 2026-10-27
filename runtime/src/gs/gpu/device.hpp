@@ -31,6 +31,9 @@ struct Command {
     // For kRaster: the batch's primitive and setup record counts, so a device
     // with a rasterizer of its own can rebuild the draw from the arena.
     std::uint32_t prims = 0, setups = 0;
+    // The batching layer built no tile lists for this raster batch because the
+    // device promised (batch_hardware) to draw it itself.
+    bool hardware = false;
     // The GS memory the command reads and writes, for a device that keeps
     // render targets outside GS memory and has to write them back before
     // memory is read and drop them when memory is written. `ranged` false
@@ -101,6 +104,10 @@ struct Device {
     // so the batching layer keeps them out of batches it can (gpu.cpp emits
     // a batch boundary when this answer changes).
     virtual bool setup_unsupported(const std::uint32_t *) const { return false; }
+    // Will the device draw this batch itself (not through the compute
+    // rasterizer)? Then the batching layer skips the tile lists, decode plans
+    // and snapshots that only the compute rasterizer reads.
+    virtual bool batch_hardware(const std::uint32_t *, std::uint32_t, const std::uint32_t *, std::uint32_t) const { return false; }
     // Names a CLUT source (its GS memory span) for `id`, the value setup
     // word 22 carries above the slot bits; a texture cache keys on it.
     virtual void clut_source(std::uint32_t, Span) {}

@@ -56,6 +56,9 @@ public:
     bool held_conflict(const gpu::Command &cmd) const;
     // Whether a setup record alone (blend, tests, formats) is drawable here.
     bool setup_supported(const std::uint32_t *setup) const;
+    const char *last_reason_name() const;
+    // The whole batch, by the same rules draw() applies (supported()).
+    bool batch_supported(const std::uint32_t *setups, std::uint32_t nsetups, const std::uint32_t *prims, std::uint32_t nprims) const;
     // Runs the texture decode of `cmd` with the hardware module's pipeline,
     // which writes the decoded cache image as well as the buffer.
     void dispatch_decode(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0);
@@ -343,7 +346,7 @@ private:
     std::uint64_t drawn_ = 0, fallback_ = 0;
     std::uint64_t imported_px_ = 0, exported_px_ = 0, evictions_ = 0, uniform_overflows_ = 0, alias_batches_ = 0;
     // Why batches fell back, by the first reason met (see hw.cpp kReasons).
-    mutable std::uint64_t reasons_[12] = {};
+    mutable std::uint64_t reasons_[14] = {};
     mutable int last_reason_ = 0;
 };
 

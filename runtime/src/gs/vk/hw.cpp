@@ -14,7 +14,7 @@ namespace ps2::gs::vk {
 namespace {
 
 constexpr std::uint32_t kPrimWords = 28, kSetupWords = 25;
-constexpr std::uint64_t kVertexBytes = 16u << 20, kUniformBytes = 16u << 20;
+constexpr std::uint64_t kVertexBytes = 32u << 20, kUniformBytes = 32u << 20;  // a batch promised to the hardware path (no tile lists) must not run out of scratch
 constexpr std::uint32_t kUniformStride = 256;
 constexpr std::uint32_t kUniformWords = 20 + 28;  // HwParams: 20 words plus the setup record padded to 7 vec4s
 constexpr std::uint32_t kMaxFailModePrims = 1024;
@@ -118,8 +118,12 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     pli.setLayoutCount = 3;
     pli.pSetLayouts = sets;
     if (vkCreatePipelineLayout(ctx.device, &pli, nullptr, &layout_) != VK_SUCCESS) return false;
-    // One set per surface and frame slot; surfaces come and go, so sets are freed.
-    const std::uint32_t max_sets = static_cast<std::uint32_t>(kMaxSurfaces) * 4 + 2;
+    // One set per surface and frame slot; surfaces come and go, so sets are
+    // freed, but only two submits after their surface was retired. A burst of
+    // short-lived targets (GT4 creates hundreds of one-page buffers over the
+    // race-start frames) must not exhaust the pool meanwhile: a batch promised
+    // to the hardware path has nothing to fall back on.
+    const std::uint32_t max_sets = static_cast<std::uint32_t>(kMaxSurfaces) * 4 * 32 + 2;
     VkDescriptorPoolSize sizes[4] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, max_sets}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, max_sets * 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, max_sets * 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, max_sets}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -127,7 +131,7 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     dpi.poolSizeCount = 4;
     dpi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx.device, &dpi, nullptr, &pool_) != VK_SUCCESS) return false;
-    const std::uint32_t max_tex = static_cast<std::uint32_t>(kMaxTextures + kMaxSurfaces) * 2 + 8;
+    const std::uint32_t max_tex = static_cast<std::uint32_t>(kMaxTextures + kMaxSurfaces) * 4 + 8;  // texture sets are freed late too
     VkDescriptorPoolSize sizes2[3] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, max_tex}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, max_tex}, {VK_DESCRIPTOR_TYPE_SAMPLER, max_tex * 4}};
     VkDescriptorPoolCreateInfo dpi2{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi2.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -474,7 +478,7 @@ std::uint32_t HwRaster::push_uniform(FrameScratch &f, const std::uint32_t words[
 // the compute rasterizer: blending, destination alpha, frame masks, frame
 // formats other than 32-bit, 32-bit depth, alpha-test fail modes that keep
 // writing, lines, points, upscaling, and batches that read their own target.
-const char *const kReasons[12] = {"scale", "empty", "snapshot", "blend", "date", "fbmsk", "fpsm", "ztst never", "zpsm", "atest fail mode", "prim kind", "scratch full"};
+const char *const kReasons[14] = {"scale", "empty", "snapshot", "blend", "date", "fbmsk", "fpsm", "ztst never", "zpsm", "atest fail mode", "prim kind", "scratch full", "no surface", "no framebuffer"};
 
 void HwRaster::note_deferred(const gpu::Command &cmd) {
     ++deferred_count_;
@@ -610,7 +614,7 @@ void HwRaster::print_reasons() const {
                  static_cast<unsigned long long>(decoded_textures_), static_cast<unsigned long long>(texture_hits_), static_cast<unsigned long long>(surface_samples_), static_cast<unsigned long long>(surface_copies_), static_cast<unsigned long long>(surface_views_), static_cast<unsigned long long>(tex_drops_[0]), static_cast<unsigned long long>(tex_drops_[1]),
                  static_cast<unsigned long long>(tex_drops_[2]), static_cast<unsigned long long>(tex_drops_[3]), static_cast<unsigned long long>(tex_drops_[4]));
     std::fprintf(stderr, "[vk] fallback reasons:");
-    for (int i = 0; i < 12; ++i)
+    for (int i = 0; i < 14; ++i)
         if (reasons_[i]) std::fprintf(stderr, " %s %llu", kReasons[i], static_cast<unsigned long long>(reasons_[i]));
     std::fprintf(stderr, "\n");
 }
@@ -618,9 +622,9 @@ void HwRaster::print_reasons() const {
 bool HwRaster::would_draw(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) const {
     const std::uint32_t *setups = nullptr;
     std::uint32_t zmode = 0;
-    const std::uint64_t saved[12] = {reasons_[0], reasons_[1], reasons_[2], reasons_[3], reasons_[4], reasons_[5], reasons_[6], reasons_[7], reasons_[8], reasons_[9], reasons_[10], reasons_[11]};
+    const std::uint64_t saved[14] = {reasons_[0], reasons_[1], reasons_[2], reasons_[3], reasons_[4], reasons_[5], reasons_[6], reasons_[7], reasons_[8], reasons_[9], reasons_[10], reasons_[11], reasons_[12], reasons_[13]};
     const bool ok = cmd.pipeline == gpu::kRaster && supported(cmd, arena, params, setups, zmode);
-    for (int i = 0; i < 12; ++i) reasons_[i] = saved[i];  // a probe, not a decision
+    for (int i = 0; i < 14; ++i) reasons_[i] = saved[i];  // a probe, not a decision
     return ok;
 }
 
@@ -662,6 +666,22 @@ bool HwRaster::setup_supported(const std::uint32_t *w) const {
         // 32-bit Z rides in a float depth attachment with 24 bits of mantissa; exact for Z24 and Z16.
         if (w[6] != 0x30u && w[6] != 0x31u && w[6] != 0x32u && w[6] != 0x3Au) return false;
     }
+    return true;
+}
+
+const char *HwRaster::last_reason_name() const { return kReasons[last_reason_]; }
+
+bool HwRaster::batch_supported(const std::uint32_t *setups, std::uint32_t nsetups, const std::uint32_t *prims, std::uint32_t nprims) const {
+    if (scale_ != 1 || !nprims || !nsetups) return false;
+    for (std::uint32_t i = 0; i < nsetups; ++i) {
+        const std::uint32_t *w = setups + i * kSetupWords;
+        if (!setup_supported(w)) return false;
+        const std::uint32_t flags = w[0];
+        if ((flags & F_ATE) && ((w[7] & 7u) != 1u) && ((w[7] >> 4) & 3u) != 0 && nprims > kMaxFailModePrims) return false;
+        if ((flags & F_ABE) && (blend_key(w, ctx_->features.dualSrcBlend == VK_TRUE) & (1u << 17)) && nprims > kMaxFailModePrims) return false;
+    }
+    for (std::uint32_t i = 0; i < nprims; ++i)
+        if (prims[i * kPrimWords + 1] > 1u) return false;
     return true;
 }
 
@@ -896,6 +916,7 @@ HwRaster::Surface *HwRaster::surface_for(VkCommandBuffer cb, VkDescriptorSet set
             retire(*s);
         }
         if (!allocate(*s, width, height)) {
+            std::fprintf(stderr, "[hw] f%llu surface %u/%u/%02x%s: no %ux%u image (had %ux%u, needed to x %u y %u)\n", static_cast<unsigned long long>(frame_count()), bp, bw, psm, depth ? " depth" : "", width, height, s->width, s->height, needed.x1, needed.y1);
             retire(*s);
             return nullptr;
         }
@@ -1726,6 +1747,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     const std::uint64_t need = static_cast<std::uint64_t>(cmd.prims) * 6 * sizeof(Vertex);
     if (f.vertex_used + need > kVertexBytes || f.uniform_used + (2 * cmd.setups + 2 * std::min(cmd.prims, kMaxFailModePrims) + 64) * kUniformStride > kUniformBytes) {
         ++reasons_[11];
+        last_reason_ = 11;
         ++fallback_;
         return false;
     }
@@ -1788,7 +1810,8 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     const std::uint32_t *first = setups;
     Surface *color = surface_for(cb, set0, first[1], first[2], first[3], false, rect);
     if (!color) {
-        ++reasons_[11];
+        ++reasons_[12];
+        last_reason_ = 12;
         ++fallback_;
         return false;
     }
@@ -1796,7 +1819,8 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     if (with_depth) {
         depth = surface_for(cb, set0, first[5], first[2], first[6], true, rect);
         if (!depth) {
-            ++reasons_[11];
+            ++reasons_[12];
+            last_reason_ = 12;
             ++fallback_;
             return false;
         }
@@ -1893,7 +1917,8 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         barrier_after_copies(cb, *color, depth);
         framebuffer = framebuffer_for(*color, depth);
         if (!framebuffer) {
-            ++reasons_[11];
+            ++reasons_[13];
+            last_reason_ = 13;
             ++fallback_;
             return false;
         }

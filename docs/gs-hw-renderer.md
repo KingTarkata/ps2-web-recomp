@@ -457,7 +457,7 @@ block draws form one pass and the 70 tile draws another. That is the next
 GPU stage; its payoff is most of the 13.5 ms drain floor. DATE on the
 stencil buffer is the smaller, independent item.
 
-### 2026-10-28: scratch versioning tried, parked on branch `scratch-versioning`
+### 2026-10-27: scratch versioning tried, parked on branch `scratch-versioning`
 
 Built: every batch for another surface, and everything that depends on
 held work, is held; a list scheduler orders the held items at flush by
@@ -488,3 +488,36 @@ Next: the CPU side (GS front end 22 ms, device submit 29 ms on the main
 thread) and DATE on the stencil buffer; on the GPU side, measure the
 per-draw fixed cost directly (one batch, many setups) before building
 anything else on a model.
+
+### 2026-10-27: batches promised to the hardware path skip the compute bookkeeping
+
+The main thread is the limit (about 50 ms of work per frame against
+41 ms of GPU time), and perf put 6-8 ms of it in `flush_batch` and
+`emit_all`: per batch, span lists and per-tile primitive lists, decode
+plans and the snapshot, all of which only the compute rasterizer reads.
+The hardware path already skipped the decode and snapshot *dispatches*
+(replaying them if it declined the batch), but the CPU work to build them
+was still done for every batch.
+
+Now the batching layer asks the device first (`Device::batch_hardware`,
+answered by `HwRaster::batch_supported`, the same rules `draw()` applies
+through `supported()`). A promised batch gets only its primitives and
+setups appended to the arena and a raster command with no tiles, marked
+`Command::hardware`. The device has nothing to fall back on for such a
+batch, so a decline after the promise loses it: `note_lost` counts those
+and warns (`PS2_HW_LOST_TRACE=1` prints each), and the two things that
+could still decline were made rare: the vertex and uniform scratch
+doubled to 32 MB per frame slot, and the surface descriptor pool, which
+ran dry during the race-start frames (GT4 creates a few hundred one-page
+targets with FBW 0 over frames 6284-6286, each evicting a surface whose
+sets are freed only two submits later), is now sized for that churn.
+Resource declines report as "no surface" / "no framebuffer" instead of
+"scratch full" so this shows up in the fallback reasons.
+
+Measured on the Switch (race frames 6050-6650, headless timers): flush_batch
+plus emit_all 6-8 -> 2.6 ms per frame; 140924 batches promised, 140924
+drawn, 0 lost. Threaded race 39-42 -> 38-42 ms/frame: the main thread
+is now close to parity with the GPU (41 ms), so the next CPU savings
+will only show once GPU time drops too. Native compare: frames 5500-6000
+bit-identical to the reference; Switch frame 6100 identical to the
+previous verified build.
