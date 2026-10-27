@@ -356,9 +356,16 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
             continue;
         }
         if (hw_on_) {
-            // The resident target may hold memory this command reads or writes.
+            // The resident surfaces may hold memory this command reads or writes.
             hw_.before_command(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params));
             current = kPipelines;
+            if (c.pipeline == kDecode) {
+                // Decodes fill the cache image the fragment shader reads too.
+                hw_.dispatch_decode(cb, c, f.set);
+                vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
+                if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
+                continue;
+            }
         }
         if (c.pipeline != current) {
             vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[c.pipeline]);

@@ -1,2 +1,6 @@
 file(READ "${SRC}" content)
+if(APPEND)
+    file(READ "${APPEND}" extra)
+    string(APPEND content "\n" "${extra}")
+endif()
 file(WRITE "${OUT}" "extern const char ${NAME}[];\nconst char ${NAME}[] = R\"WGSL(${content})WGSL\";\n")

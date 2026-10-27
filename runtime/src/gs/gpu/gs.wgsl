@@ -10,6 +10,12 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> scratch: array<u32>;
 @group(0) @binding(6) var<storage, read> cache: array<u32>;
 @group(0) @binding(7) var<storage, read_write> decoded: array<u32>;
+// Decoded texels are read through decoded_load / decoded_store, defined by
+// the file appended at build time: gs_hooks.wgsl keeps them in `decoded`;
+// the hardware path (vk/hw.wgsl) mirrors them into an image the fragment
+// shader can fetch with texture-cache locality. Texture rows are aligned
+// to their width in `decoded` so that a 2048-wide image of it keeps rows
+// intact (gpu.cpp plan_decodes).
 
 override SCALE: u32 = 1u;
 
@@ -563,7 +569,7 @@ fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
     let x = texel_x(s, xi);
     let y = texel_y(s, yi);
     if (s.dec != 0xFFFFFFFFu) {
-        return decoded[s.dec + (y << s.tw) + x];
+        return decoded_load(s.dec + (y << s.tw) + x);
     }
     return convert(s, load_texel(addr(s.tf, x, y), k));
 }
@@ -1081,7 +1087,7 @@ fn decode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let s = load_setup(prm(0u));
     let x = i & ((1u << s.tw) - 1u);
     let y = i >> s.tw;
-    decoded[prm(1u) + i] = convert(s, load_at(addr(s.tf, x, y), 0u));
+    decoded_store(prm(1u) + i, convert(s, load_at(addr(s.tf, x, y), 0u)));
 }
 
 @compute @workgroup_size(64)

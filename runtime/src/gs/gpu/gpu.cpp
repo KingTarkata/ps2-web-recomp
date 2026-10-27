@@ -464,6 +464,8 @@ void plan_decodes(std::uint32_t prims) {
         const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
         if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
         const std::uint32_t words = 1u << (tw + th);
+        // Rows stay intact in a 2048-wide image of the cache (vk/hw.wgsl).
+        g_decoded_used = (g_decoded_used + (1u << tw) - 1) & ~((1u << tw) - 1);
         if (g_decoded_used + words > kDecodedWords) continue;
         if (g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1))) continue;
         w[24] = g_decoded_used;

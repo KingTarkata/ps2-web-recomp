@@ -34,6 +34,19 @@ struct HwParams {
 // import_depth and copied into the depth attachment, or copied out of it
 // and converted back by export_depth. Rows are `width` samples long.
 @group(1) @binding(3) var<storage, read_write> depth_stage: array<u32>;
+// The decoded texture cache as a 2048-wide R32_UINT image: the same words
+// as `decoded`, which is kept in step for the compute rasterizer.
+@group(1) @binding(4) var decoded_write: texture_storage_2d<r32uint, write>;
+@group(1) @binding(5) var decoded_read: texture_2d<u32>;
+
+fn decoded_load(i: u32) -> u32 {
+    return textureLoad(decoded_read, vec2<i32>(i32(i & 2047u), i32(i >> 11u)), 0).x;
+}
+
+fn decoded_store(i: u32, v: u32) {
+    decoded[i] = v;
+    textureStore(decoded_write, vec2<i32>(i32(i & 2047u), i32(i >> 11u)), vec4<u32>(v, 0u, 0u, 0u));
+}
 
 struct VsIn {
     @location(0) pos: vec2<f32>,    // GS pixel coordinates (already minus XYOFFSET, / 16)
@@ -118,7 +131,7 @@ fn hw_fs(i: VsOut) -> FsOut {
     var g = i32(i.color.y);
     var b = i32(i.color.z);
     var a = i32(i.color.w);
-    if (has(s, F_TME)) {
+    if (has(s, F_TME) && (hw.flags & 128u) == 0u) {  // bit 7: debug, skip sampling
         var u: f32;
         var v: f32;
         if (has(s, F_FST)) {

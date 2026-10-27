@@ -37,6 +37,9 @@ public:
     bool draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, VkBuffer data_buffer);
     // Whether a setup record alone (blend, tests, formats) is drawable here.
     bool setup_supported(const std::uint32_t *setup) const;
+    // Runs the texture decode of `cmd` with the hardware module's pipeline,
+    // which writes the decoded cache image as well as the buffer.
+    void dispatch_decode(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0);
     // Called before every command the device runs itself: writes back the
     // dirty tiles whose memory the command reads, and drops the tiles whose
     // memory it writes.
@@ -140,6 +143,10 @@ private:
     static std::uint32_t blend_key(const std::uint32_t *setup, bool dual_source);
     Buffer depth_stage_;  // D32 bits of the rectangle in flight, shared by all surfaces
     Image dummy_;         // stands in for the image bindings of depth surfaces
+    Image decoded_;       // the decoded texture cache as a 2048-wide R32_UINT image
+    VkDescriptorSet misc_set1_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};  // set 1 without a surface, for decodes
+    VkPipeline decode_ = VK_NULL_HANDLE;
+    bool write_set1(VkDescriptorSet set, int slot, VkImageView surface_view);
     std::vector<std::unique_ptr<Surface>> surfaces_;
     std::map<std::pair<VkImageView, VkImageView>, VkFramebuffer> framebuffers_;
     std::vector<Retired> retired_;

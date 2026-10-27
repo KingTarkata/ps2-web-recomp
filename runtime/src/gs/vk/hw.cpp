@@ -66,13 +66,15 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
         std::fprintf(stderr, "[vk] the driver rejected the hardware raster shaders\n");
         return false;
     }
-    VkDescriptorSetLayoutBinding b[4] = {};
+    VkDescriptorSetLayoutBinding b[6] = {};
     b[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[3] = {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    b[4] = {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    b[5] = {5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 4;
+    lci.bindingCount = 6;
     lci.pBindings = b;
     if (vkCreateDescriptorSetLayout(ctx.device, &lci, nullptr, &set1_layout_) != VK_SUCCESS) return false;
     VkDescriptorSetLayout sets[2] = {set0, set1_layout_};
@@ -81,8 +83,8 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     pli.pSetLayouts = sets;
     if (vkCreatePipelineLayout(ctx.device, &pli, nullptr, &layout_) != VK_SUCCESS) return false;
     // One set per surface and frame slot; surfaces come and go, so sets are freed.
-    const std::uint32_t max_sets = static_cast<std::uint32_t>(kMaxSurfaces) * 4;
-    VkDescriptorPoolSize sizes[4] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, max_sets}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, max_sets}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, max_sets}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, max_sets}};
+    const std::uint32_t max_sets = static_cast<std::uint32_t>(kMaxSurfaces) * 4 + 2;
+    VkDescriptorPoolSize sizes[4] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, max_sets}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, max_sets * 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, max_sets * 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, max_sets}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     dpi.maxSets = max_sets;
@@ -108,9 +110,62 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
         ctx.end_once(cb);
     }
+    if (!ctx.create_image(decoded_, 2048, 2048, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+    {
+        VkCommandBuffer cb = ctx.begin_once();
+        VkImageMemoryBarrier bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        bar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bar.image = decoded_.image;
+        bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+        ctx.end_once(cb);
+    }
     if (!build_pipelines(module)) return false;
+    VkDescriptorSetLayout layouts[2] = {set1_layout_, set1_layout_};
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = pool_;
+    dai.descriptorSetCount = 2;
+    dai.pSetLayouts = layouts;
+    if (vkAllocateDescriptorSets(ctx.device, &dai, misc_set1_) != VK_SUCCESS) return false;
+    for (int i = 0; i < 2; ++i) write_set1(misc_set1_[i], i, dummy_.view);
     frame_ = &frames_[0];
     return true;
+}
+
+bool HwRaster::write_set1(VkDescriptorSet set, int slot, VkImageView surface_view) {
+    VkDescriptorBufferInfo ub{frames_[slot].uniforms.buffer, 0, 48};
+    VkDescriptorImageInfo image{VK_NULL_HANDLE, surface_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorBufferInfo stage{depth_stage_.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorImageInfo dec{VK_NULL_HANDLE, decoded_.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[6] = {};
+    for (int k = 0; k < 6; ++k) {
+        w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[k].dstSet = set;
+        w[k].dstBinding = static_cast<std::uint32_t>(k);
+        w[k].descriptorCount = 1;
+    }
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    w[0].pBufferInfo = &ub;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[1].pImageInfo = &image;
+    w[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    w[2].pImageInfo = &image;
+    w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w[3].pBufferInfo = &stage;
+    w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[4].pImageInfo = &dec;
+    w[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    w[5].pImageInfo = &dec;
+    vkUpdateDescriptorSets(ctx_->device, 6, w, 0, nullptr);
+    return true;
+}
+
+void HwRaster::dispatch_decode(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0) {
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, decode_);
+    bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, set0, misc_set1_[slot_], cmd.param * gpu::kParamStride, 0);
+    vkCmdDispatch(cb, cmd.x, cmd.y, 1);
 }
 
 bool HwRaster::build_pipelines(VkShaderModule module) {
@@ -144,9 +199,9 @@ bool HwRaster::build_pipelines(VkShaderModule module) {
         if (vkCreateRenderPass(ctx_->device, &rpi, nullptr, with_depth ? &pass_depth_ : &pass_nodepth_) != VK_SUCCESS) return false;
     }
     // Compute pipelines for the import/export passes.
-    const char *compute_names[4] = {"import_frame", "export_frame", "export_depth", "import_depth"};
-    VkPipeline *compute_out[4] = {&import_frame_, &export_frame_, &export_depth_, &import_depth_};
-    for (int i = 0; i < 4; ++i) {
+    const char *compute_names[5] = {"import_frame", "export_frame", "export_depth", "import_depth", "decode"};
+    VkPipeline *compute_out[5] = {&import_frame_, &export_frame_, &export_depth_, &import_depth_, &decode_};
+    for (int i = 0; i < 5; ++i) {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -530,27 +585,7 @@ bool HwRaster::allocate(Surface &s, std::uint32_t width, std::uint32_t height) {
         ctx_->destroy_image(s.image);
         return false;
     }
-    for (int i = 0; i < 2; ++i) {
-        VkDescriptorBufferInfo ub{frames_[i].uniforms.buffer, 0, 48};
-        VkDescriptorImageInfo image{VK_NULL_HANDLE, s.depth ? dummy_.view : s.image.view, VK_IMAGE_LAYOUT_GENERAL};
-        VkDescriptorBufferInfo stage{depth_stage_.buffer, 0, VK_WHOLE_SIZE};
-        VkWriteDescriptorSet w[4] = {};
-        for (int k = 0; k < 4; ++k) {
-            w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[k].dstSet = s.set1[i];
-            w[k].dstBinding = static_cast<std::uint32_t>(k);
-            w[k].descriptorCount = 1;
-        }
-        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-        w[0].pBufferInfo = &ub;
-        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        w[1].pImageInfo = &image;
-        w[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        w[2].pImageInfo = &image;
-        w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        w[3].pBufferInfo = &stage;
-        vkUpdateDescriptorSets(ctx_->device, 4, w, 0, nullptr);
-    }
+    for (int i = 0; i < 2; ++i) write_set1(s.set1[i], i, s.depth ? dummy_.view : s.image.view);
     s.plane.valid.reset();
     s.plane.dirty.reset();
     return true;
@@ -728,6 +763,8 @@ void HwRaster::bind(VkCommandBuffer cb, VkPipelineBindPoint point, VkDescriptorS
 // buffer/image copy each way. The rectangles are processed one after the
 // other because they share depth_stage. Rectangles are clipped to the image.
 void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, bool import, const std::vector<Rect> &rects) {
+    static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
+    if (debug & 32768u) return;  // measurement only: no copies at all (wrong output)
     FrameScratch &f = *frame_;
     VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     for (const Rect &r0 : rects) {
@@ -1179,7 +1216,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         }
         std::uint32_t wmask = 0;
         write_mask(w[4], wmask);
-        const std::uint32_t base_flags = (with_depth ? 1u : 0u) | ((debug & 8u) ? 2u : 0u) | ((debug & 16u) ? 4u : 0u) | ((blend >> 15) & 1u) << 4 | ((blend >> 16) & 1u) << 5;
+        const std::uint32_t base_flags = (with_depth ? 1u : 0u) | ((debug & 8u) ? 2u : 0u) | ((debug & 16u) ? 4u : 0u) | ((blend >> 15) & 1u) << 4 | ((blend >> 16) & 1u) << 5 | ((debug & 16384u) ? 128u : 0u);
         const auto bind_draw = [&](std::uint32_t flags, bool write_z, std::uint32_t mask) -> bool {
             const std::uint32_t words[12] = {setup_offset + si * kSetupWords, 0, 0, flags, 0, 0, kTargetSize * scale_, kTargetSize * scale_, scale_, 0, 0, 0};
             const std::uint32_t uniform = push_uniform(f, words);
@@ -1277,8 +1314,9 @@ void HwRaster::destroy() {
     vkDeviceWaitIdle(ctx_->device);
     for (auto &[key, p] : draw_)
         if (p) vkDestroyPipeline(ctx_->device, p, nullptr);
-    for (VkPipeline p : {import_frame_, export_frame_, export_depth_, import_depth_})
+    for (VkPipeline p : {import_frame_, export_frame_, export_depth_, import_depth_, decode_})
         if (p) vkDestroyPipeline(ctx_->device, p, nullptr);
+    ctx_->destroy_image(decoded_);
     for (auto &[key, fb] : framebuffers_) vkDestroyFramebuffer(ctx_->device, fb, nullptr);
     for (Retired &r : retired_) {
         if (r.framebuffer) vkDestroyFramebuffer(ctx_->device, r.framebuffer, nullptr);

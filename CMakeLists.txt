@@ -73,8 +73,8 @@ if(PS2_GS_VK AND NOT EMSCRIPTEN AND EXISTS "${PS2_VULKAN_HEADERS}/vulkan/vulkan.
     foreach(scale 1 2 3)
         set(out "${PS2_SPV_DIR}/gs_scale${scale}.cpp")
         add_custom_command(OUTPUT "${out}"
-            COMMAND ${CMAKE_COMMAND} -DNAGA=${PS2_NAGA} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DOUT=${out} -DNAME=kGsSpvScale${scale} -DSCALE=${scale} -DWORK=${PS2_SPV_DIR} -P ${CMAKE_SOURCE_DIR}/cmake/wgsl_to_spv.cmake
-            DEPENDS runtime/src/gs/gpu/gs.wgsl cmake/wgsl_to_spv.cmake)
+            COMMAND ${CMAKE_COMMAND} -DNAGA=${PS2_NAGA} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DAPPEND=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs_hooks.wgsl -DPLAIN=1 -DOUT=${out} -DNAME=kGsSpvScale${scale} -DSCALE=${scale} -DWORK=${PS2_SPV_DIR} -P ${CMAKE_SOURCE_DIR}/cmake/wgsl_to_spv.cmake
+            DEPENDS runtime/src/gs/gpu/gs.wgsl runtime/src/gs/gpu/gs_hooks.wgsl cmake/wgsl_to_spv.cmake)
         list(APPEND PS2_SPV_SOURCES "${out}")
         set(out "${PS2_SPV_DIR}/hw_scale${scale}.cpp")
         add_custom_command(OUTPUT "${out}"
@@ -96,8 +96,8 @@ endif()
 if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
     set(PS2_GS_WGSL "${CMAKE_BINARY_DIR}/gs_wgsl.cpp")
     add_custom_command(OUTPUT "${PS2_GS_WGSL}"
-        COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DOUT=${PS2_GS_WGSL} -DNAME=kGsShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
-        DEPENDS runtime/src/gs/gpu/gs.wgsl cmake/embed.cmake)
+        COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DAPPEND=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs_hooks.wgsl -DOUT=${PS2_GS_WGSL} -DNAME=kGsShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+        DEPENDS runtime/src/gs/gpu/gs.wgsl runtime/src/gs/gpu/gs_hooks.wgsl cmake/embed.cmake)
     set(PS2_BLIT_WGSL "${CMAKE_BINARY_DIR}/blit_wgsl.cpp")
     add_custom_command(OUTPUT "${PS2_BLIT_WGSL}"
         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/blit.wgsl -DOUT=${PS2_BLIT_WGSL} -DNAME=kBlitShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
