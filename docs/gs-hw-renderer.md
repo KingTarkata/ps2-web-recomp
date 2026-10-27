@@ -228,7 +228,11 @@ now. The runtime's queue and threads do not change.
   difference and no behavioural divergence over the session. EE RAM
   differs in 305 small ranges (40 KB) that hold pixel data the game reads
   back from GS memory, by the same rounding.
+- 2026-10-27, Switch: 74.3 ms per race frame on the hardware path against
+  95.0 on the compute path the same day (`docs/switch-perf.md`). GPU time
+  is still 72 ms per frame, almost all of it the per-batch import and
+  export passes rather than drawing, which settles what comes next.
 - Next: page ownership so import/export only run when memory and target
-  disagree, which is where the time will be; then the remaining fallbacks
+  disagree, which is where the time is; then the remaining fallbacks
   (batches reading their own target, destination-alpha factors, DATE,
   alpha-test fail modes, 16-bit frames, upscaling, lines and points).

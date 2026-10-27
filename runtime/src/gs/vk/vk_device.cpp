@@ -343,9 +343,14 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
     Pipeline current = kPipelines;
     for (std::uint32_t i = 0; i < commands.size(); ++i) {
         const Command &c = commands[i];
+        // Every command writes both of its timestamps, drawn here or not: a
+        // profiled submit waits on all of them.
+        const bool timed = queries && per_command && i < n;
+        if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, i * 2);
         if (c.pipeline == kRaster && hw_on_ && hw_.draw(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), f.data.buffer)) {
             current = kPipelines;  // the draw rebinds compute pipelines
             vk::vkCmdPipelineBarrier(cb, shader_stages, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
+            if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
             continue;
         }
         if (c.pipeline != current) {
@@ -354,10 +359,9 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
         }
         const std::uint32_t offset = c.param * kParamStride;
         vk::vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &f.set, 1, &offset);
-        if (queries && per_command && i < n) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, i * 2);
         vk::vkCmdDispatch(cb, c.x, c.y, 1);
         vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
-        if (queries && per_command && i < n) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
+        if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
     }
     if (queries && !per_command) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, base + 1);
     // Make the results visible to transfers (read-backs) and the host.

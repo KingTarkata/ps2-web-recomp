@@ -50,3 +50,15 @@ measured in a VM belongs here.
 - Target is 16.7 ms, so the race is 5.8x short at native resolution.
 | 2026-10-26 | Race from saved state, headless, renderer refactored behind `Device`, wgpu | 6050-6650 | 95.12 | unchanged by the refactor |
 | 2026-10-26 | same, Vulkan device (`PS2_GS=hw`), identical compute shaders via naga | 6050-6650 | 80.88 | 15% from dropping wgpu-native alone, before any graphics-pipeline work |
+| 2026-10-26 | same, hardware rasterizer (`PS2_GS=hw`, graphics pipelines for 91% of batches), frames verified against the compute path | 6050-6650 | 74.34 | 142323 batches on the hardware path, 13913 through compute (snapshot 7074, alpha-test fail modes 3481, blend 2242, 16-bit frames 1116); same run day, compute path re-measured at 94.98 |
+| 2026-10-27 | same, `PS2_GPU_PROFILE` on the hardware path (profiling serialises CPU and GPU, so the frame time is not comparable) | 6050-6650 | 138.89 | GPU busy 71.95 ms/frame: raster 61.3 (hardware draws including their import/export passes), decode 5.3, load_clut 3.3, upload 1.9 |
+
+The hardware path's GPU time is no lower than the compute rasterizer's
+(72 vs 67 ms); the 20 ms saved per frame so far come from dropping
+wgpu-native and from the GPU no longer being the only limit. The reason is
+that every batch still imports its rectangle (frame and depth) from GS
+memory and exports it again: the heaviest rows above are 2 ms per batch for
+a few hundred triangles, which is the cost of four full-screen passes over
+swizzled memory, not of drawing. Page ownership tracking, so a target stays
+resident across batches and is only written back when something reads the
+memory, is the next step (docs/gs-hw-renderer.md).
