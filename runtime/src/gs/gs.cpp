@@ -505,6 +505,11 @@ void reset() {
     else render_reset();
 }
 
+// Read once at start-up: a function-local static would be guarded by an
+// acquire load on every register write (a quarter of write()'s time on the
+// Switch's A57).
+const char *const g_trace_seq = std::getenv("PS2_TRACE_GSSEQ");
+
 void kick(bool draw) {
     State &s = g_state;
     const std::uint32_t prim = static_cast<std::uint32_t>(s.prim) & 7u;
@@ -563,9 +568,8 @@ void write(std::uint32_t reg, std::uint64_t value) {
     ++g_writes[reg & 127u];
     constexpr std::uint64_t kVertexRegs = (1ull << 0x01) | (1ull << 0x02) | (1ull << 0x03) | (1ull << 0x04) | (1ull << 0x05) | (1ull << 0x0A) | (1ull << 0x0C) | (1ull << 0x0D);
     if (reg >= 64 || !((kVertexRegs >> reg) & 1u)) ++g_setup_generation;
-    static const char *seq = std::getenv("PS2_TRACE_GSSEQ");
-    if (seq) {
-        static std::uint64_t n = 0, start = std::strtoull(seq, nullptr, 10);
+    if (g_trace_seq) [[unlikely]] {
+        static std::uint64_t n = 0, start = std::strtoull(g_trace_seq, nullptr, 10);
         if (++n >= start && n < start + 100000) std::fprintf(stderr, "[gs] w %02X %016llX\n", reg, static_cast<unsigned long long>(value));
     }
     switch (reg) {
@@ -674,9 +678,8 @@ void signal(std::uint32_t reg, std::uint64_t value) {
 
 void write_packed(std::uint32_t reg, const Reg128 &q) {
     State &s = g_state;
-    static const char *const seq = std::getenv("PS2_TRACE_GSSEQ");
-    if (seq) [[unlikely]] {
-        static std::uint64_t n = 0, start = std::strtoull(seq, nullptr, 10);
+    if (g_trace_seq) [[unlikely]] {
+        static std::uint64_t n = 0, start = std::strtoull(g_trace_seq, nullptr, 10);
         if (++n >= start && n < start + 100000) std::fprintf(stderr, "[gs] w %02X %016llX\n", reg, static_cast<unsigned long long>(q.d[0]));
     }
     switch (reg) {
