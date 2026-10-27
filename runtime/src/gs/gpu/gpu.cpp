@@ -48,7 +48,7 @@ std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1
 
 std::uint32_t g_decoded_used = 0;
 bool g_rendered[512] = {};
-std::uint64_t g_uploads = 0, g_hardware_batches = 0;  // batches emitted without compute tile lists
+std::uint64_t g_uploads = 0, g_upload_bytes = 0, g_hardware_batches = 0;  // batches emitted without compute tile lists
 bool g_decode = true;
 struct CommandInfo {
     std::size_t index;
@@ -767,7 +767,10 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
         if (cache_find(key, bytes, n, offset) || (++g_cache_seen[key] >= 2 && cache_insert(key, bytes, n, offset))) source = 0x80000000u;
         if (g_cache_seen.size() > 65536) g_cache_seen.clear();
     }
-    if (!source) offset = arena_append(bytes, n);
+    if (!source) {
+        offset = arena_append(bytes, n);
+        g_upload_bytes += n;
+    }
     const std::uint32_t rec[11] = {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, lead_bits, im.bpp | source};
     std::memcpy(op.rec, rec, sizeof rec);
     const std::uint32_t first = im.done / im.rrw, last = (im.done + pixels - 1) / im.rrw;
@@ -1468,7 +1471,7 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
 
 void stats() {
     if (g_mode == Mode::off) return;
-    std::fprintf(stderr, "[gpu] clut loads: %llu emitted, %llu reused; %llu batches promised to the hardware path\n", static_cast<unsigned long long>(g_clut_emitted), static_cast<unsigned long long>(g_clut_reused), static_cast<unsigned long long>(g_hardware_batches));
+    std::fprintf(stderr, "[gpu] clut loads: %llu emitted, %llu reused; %llu batches promised to the hardware path; %llu uploads copied %.1f MB into the arena\n", static_cast<unsigned long long>(g_clut_emitted), static_cast<unsigned long long>(g_clut_reused), static_cast<unsigned long long>(g_hardware_batches), static_cast<unsigned long long>(g_uploads), static_cast<double>(g_upload_bytes) / 1048576.0);
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");

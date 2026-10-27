@@ -521,3 +521,20 @@ is now close to parity with the GPU (41 ms), so the next CPU savings
 will only show once GPU time drops too. Native compare: frames 5500-6000
 bit-identical to the reference; Switch frame 6100 identical to the
 previous verified build.
+
+### 2026-10-27: vertex and uniform scratch in host-cached memory
+
+perf on the Switch main thread had `append_prims` at 8% (3 ms/frame):
+the per-frame vertex and uniform scratch buffers were host-coherent,
+which on Tegra is uncached write-combined memory, and vertices are built
+a field at a time. They are now host-cached like the arena and flushed
+in `end_frame` (after the pass close, which can still draw held batches).
+append_prims 8.0 -> 1.8%, device record (`draw`) 15.4 -> 13.0 ms,
+threaded race 38-42 -> 36.4-39.5 ms/frame. Native frames 5500-6000
+identical, Switch frame 6100 identical.
+
+Main-thread profile after this (threaded race): memcpy 17% (image
+uploads into the arena 8.3%, SDL present copy 4%, read-back copy 2%),
+gpu::draw 5.7%, load_clut 5% (1059 calls/frame), write_packed 4.9%,
+gif::render 4.9%, memory_written 4.1%, gs::write 3.6%, copy_frame 3%,
+kick 2.3%. GPU time is about 41 ms, so the thread is at parity now.

@@ -140,8 +140,11 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     dpi2.pPoolSizes = sizes2;
     if (vkCreateDescriptorPool(ctx.device, &dpi2, nullptr, &pool2_) != VK_SUCCESS) return false;
     for (FrameScratch &f : frames_) {
-        if (!ctx.create_buffer(f.vertices, kVertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true)) return false;
-        if (!ctx.create_buffer(f.uniforms, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true)) return false;
+        // Host-cached: the CPU fills these with many small writes (a vertex
+        // field at a time); uncached write-combined memory made append_prims
+        // 8% of the main thread on the Switch. Flushed in end_frame.
+        if (!ctx.create_buffer(f.vertices, kVertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true, true)) return false;
+        if (!ctx.create_buffer(f.uniforms, kUniformBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true, true)) return false;
     }
     if (!ctx.create_buffer(depth_stage_, static_cast<VkDeviceSize>(kTargetSize) * kTargetSize * scale * scale * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false)) return false;
     // Depth surfaces never use the image bindings of set 1, but every
@@ -594,7 +597,9 @@ void HwRaster::close_pass(VkCommandBuffer cb, CloseWhy why) {
 }
 
 void HwRaster::end_frame(VkCommandBuffer cb) {
-    close_pass(cb, kCloseEndFrame);
+    close_pass(cb, kCloseEndFrame);  // may draw held batches: more vertices
+    ctx_->flush(frame_->vertices, 0, frame_->vertex_used);
+    ctx_->flush(frame_->uniforms, 0, frame_->uniform_used);
     if (!query_open_) return;
     vkCmdEndQuery(cb, occlusion_, static_cast<std::uint32_t>(slot_));
     query_used_[slot_] = true;
