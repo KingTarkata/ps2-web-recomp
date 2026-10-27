@@ -10,6 +10,7 @@
 #include "ps2/system.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -63,6 +64,12 @@ public:
             std::fprintf(stderr, "[vk] hardware raster: %llu batches drawn, %llu through the compute rasterizer\n", static_cast<unsigned long long>(hw_.drawn_batches()),
                          static_cast<unsigned long long>(hw_.fallback_batches()));
         if (hw_on_) hw_.print_reasons();
+        if (hw_on_) {
+            std::fprintf(stderr, "[vk] passes closed by commands:");
+            for (int i = 0; i < kPipelines; ++i)
+                if (closes_by_pipeline_[i]) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(closes_by_pipeline_[i]));
+            std::fprintf(stderr, "\n");
+        }
         cpu_timers::report(ps2::frame_count());
     }
     bool init(const Limits &limits, const std::vector<std::uint32_t> &tables) override;
@@ -124,6 +131,7 @@ private:
     Context ctx_;
     vk::HwRaster hw_;
     bool hw_on_ = false;
+    std::uint64_t closes_by_pipeline_[kPipelines] = {};  // passes closed by a command the device could not hold back
     Buffer vram_, tables_, clut_, scratch_, cache_, decoded_, readback_, staging_;
     VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
@@ -364,20 +372,50 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
     between.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     between.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT;
     const VkPipelineStageFlags shader_stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    Pipeline current = kPipelines;
     std::size_t skipped_from = ~static_cast<std::size_t>(0);  // first decode/snapshot skipped for the coming batch
+    // Compute commands met while the hardware path has a render pass open
+    // are recorded when that pass closes (HwRaster::close_pass runs the
+    // hook): they touch buffers, not the pass's images, and the pass's draws
+    // read none of their results, since a read that would see them (a
+    // texture decode, a tile import, memory sampling) closes the pass first.
+    // Their order among themselves is kept.
+    std::vector<std::function<void()>> deferred;
+    if (hw_on_)
+        hw_.on_pass_closed([&] {
+            // Recorded after the pass: each command's surface write-backs
+            // and invalidations (before_command) right before it.
+            for (std::size_t d = 0; d < deferred.size(); ++d) deferred[d]();
+            deferred.clear();
+            hw_.clear_deferred();
+        });
+    const auto dispatch = [&](const Command &k, std::uint32_t index, bool timed, bool top_written) {
+        if (timed && !top_written) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, index * 2);
+        if (k.pipeline == kDecode && hw_on_) {
+            hw_.dispatch_decode(cb, k, f.set);  // fills the cache image the fragment shader reads too
+        } else {
+            vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[k.pipeline]);
+            const std::uint32_t off = k.param * kParamStride;
+            vk::vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &f.set, 1, &off);
+            vk::vkCmdDispatch(cb, k.x, k.y, 1);
+        }
+        vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
+        if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, index * 2 + 1);
+    };
     for (std::uint32_t i = 0; i < commands.size(); ++i) {
         const Command &c = commands[i];
         // Every command writes both of its timestamps, drawn here or not: a
         // profiled submit waits on all of them.
         const bool timed = queries && per_command && i < n;
-        if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, i * 2);
-        if (c.pipeline == kRaster && hw_on_ && hw_.draw(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), f.data.buffer)) {
-            skipped_from = ~static_cast<std::size_t>(0);
-            current = kPipelines;  // the draw rebinds compute pipelines
-            vk::vkCmdPipelineBarrier(cb, shader_stages, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
-            if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
-            continue;
+        bool top_written = false;
+        if (c.pipeline == kRaster && hw_on_) {
+            if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, i * 2);
+            top_written = timed;
+            if (hw_.draw(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), f.data.buffer)) {
+                skipped_from = ~static_cast<std::size_t>(0);
+                if (!hw_.pass_open()) vk::vkCmdPipelineBarrier(cb, shader_stages, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);  // an open pass is closed, with its barrier, by whatever comes next
+                if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
+                continue;
+            }
         }
         if (hw_on_) {
             // The per-submit decodes and the snapshot the batching layer put
@@ -389,49 +427,43 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
                 while (next < commands.size() && (commands[next].pipeline == kDecode || commands[next].pipeline == kSnapshot)) ++next;
                 if (next < commands.size() && commands[next].pipeline == kRaster && hw_.decodes_unneeded(commands[next], arena, static_cast<const std::uint32_t *>(params))) {
                     if (skipped_from > i) skipped_from = i;
-                    if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
+                    if (timed) {
+                        vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, i * 2);
+                        vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
+                    }
                     continue;
                 }
             }
-            const auto run_compute = [&](const Command &k) {
-                hw_.before_command(cb, k, f.set, arena, static_cast<const std::uint32_t *>(params), false);
-                if (k.pipeline == kDecode) {
-                    hw_.dispatch_decode(cb, k, f.set);
-                } else {
-                    vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[k.pipeline]);
-                    const std::uint32_t off = k.param * kParamStride;
-                    vk::vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &f.set, 1, &off);
-                    vk::vkCmdDispatch(cb, k.x, k.y, 1);
-                }
-                vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
-            };
             if (c.pipeline == kRaster && skipped_from < i) {
-                // Declined after all: replay what was skipped.
-                for (std::size_t k = skipped_from; k < i; ++k) run_compute(commands[k]);
+                // Declined after all: replay what was skipped, in order.
+                for (std::size_t k = skipped_from; k < i; ++k) {
+                    hw_.before_command(cb, commands[k], f.set, arena, static_cast<const std::uint32_t *>(params), false);
+                    hw_.close_pass(cb);
+                    dispatch(commands[k], static_cast<std::uint32_t>(k), false, false);
+                }
             }
             skipped_from = ~static_cast<std::size_t>(0);
-            // The resident surfaces may hold memory this command reads or writes.
-            hw_.before_command(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
-            current = kPipelines;
-            if (c.pipeline == kDecode) {
-                // Decodes fill the cache image the fragment shader reads too.
-                hw_.dispatch_decode(cb, c, f.set);
-                vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
-                if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
+            if (hw_.pass_open() && c.pipeline != kRaster && c.ranged) {
+                hw_.note_deferred(c);
+                deferred.push_back([&, c, i, timed] {
+                    hw_.before_command(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
+                    dispatch(c, i, timed, false);
+                });
                 continue;
             }
+            if (hw_.pass_open()) {
+                ++closes_by_pipeline_[c.pipeline];
+                hw_.close_pass(cb);  // a compute-drawn batch or an unranged command: everything held back lands first
+            }
+            // The resident surfaces may hold memory this command reads or writes.
+            hw_.before_command(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
         }
-        if (c.pipeline != current) {
-            vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[c.pipeline]);
-            current = c.pipeline;
-        }
-        const std::uint32_t offset = c.param * kParamStride;
-        vk::vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &f.set, 1, &offset);
-        vk::vkCmdDispatch(cb, c.x, c.y, 1);
-        vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
-        if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
+        dispatch(c, i, timed, top_written);
     }
-    if (hw_on_) hw_.end_frame(cb);
+    if (hw_on_) {
+        hw_.end_frame(cb);  // closes the pass, which records what was held back
+        hw_.on_pass_closed(nullptr);
+    }
     if (queries && !per_command) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, base + 1);
     // Make the results visible to transfers (read-backs) and the host.
     VkMemoryBarrier done{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

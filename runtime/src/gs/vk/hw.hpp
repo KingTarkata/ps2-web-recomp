@@ -15,6 +15,7 @@
 
 #include <array>
 #include <bitset>
+#include <functional>
 #include <list>
 #include <cstdint>
 #include <map>
@@ -65,7 +66,35 @@ public:
     // (vertex and uniform rings) belongs to the frame slot in flight, and
     // objects retired two submits ago can go.
     void begin_frame(int slot);
-    void end_frame(VkCommandBuffer cb);  // closes the per-frame fragment count (PS2_HW_DEBUG 1048576)
+    void end_frame(VkCommandBuffer cb);  // closes the open render pass and the per-frame fragment count
+    bool pass_open() const { return pass_cb_ != VK_NULL_HANDLE; }
+    // Consecutive hardware-drawn batches on the same colour (and depth)
+    // surface share one render pass; anything recorded outside a pass
+    // (imports, write-backs, decodes, copies, image barriers) closes it
+    // first. 230 passes per frame, each between full barriers, had the GPU
+    // draining more than drawing.
+    enum CloseWhy { kCloseImport, kCloseWriteBack, kCloseDecode, kCloseCopy, kCloseTexture, kCloseMemoryRead, kCloseSurfaces, kCloseFailed, kCloseEndFrame, kCloseDevice, kCloseDecoded, kCloseWbDraw, kCloseWbDecode, kCloseWbBefore, kCloseWbEvict, kCloseWbOverlap, kCloseImportOwn, kCloseImportSource, kCloseWbUncached, kCloseDepthToggle, kCloseColorChange, kCloseDepthChange, kCloseCount };
+    CloseWhy wb_why_ = kCloseWriteBack, import_why_ = kCloseImport;  // who asked for the write-back / import that closed the pass (statistics)
+    struct WhyScope {
+        CloseWhy &slot, saved;
+        WhyScope(CloseWhy &s, CloseWhy v) : slot(s), saved(s) { slot = v; }
+        ~WhyScope() { slot = saved; }
+    };
+    void close_pass(VkCommandBuffer cb, CloseWhy why = kCloseDevice);
+    // Called right after a pass is closed (the device records the compute
+    // commands it held back while the pass was open).
+    void on_pass_closed(std::function<void()> hook) { pass_closed_hook_ = std::move(hook); }
+    // A compute command the device holds back while the pass is open; its
+    // before_command runs when it is recorded (at pass close), which is only
+    // right if no batch drawn in between touches its memory: such a batch
+    // closes the pass first (deferred_conflict).
+    void note_deferred(const gpu::Command &cmd);
+    void clear_deferred() {
+        deferred_reads_.clear();
+        deferred_writes_.clear();
+        deferred_count_ = 0;
+    }
+    bool deferred_conflict(const gpu::Command &cmd) const;
     std::uint64_t drawn_batches() const { return drawn_; }
     std::uint64_t fallback_batches() const { return fallback_; }
     void print_reasons() const;
@@ -187,6 +216,9 @@ private:
     // Resolves what set 2 binds for a textured setup: a surface sampled in
     // place when one mirrors the texture's buffer in the same layout, else
     // a cached texture. Null when neither can serve (memory sampling then).
+    // The texture as a resident surface in the same layout (sampled in place,
+    // or copied when the batch draws into it), or null.
+    VkDescriptorSet surface_texture(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *setup, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, const Surface *color, const Surface *depth);
     VkDescriptorSet texture_set(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *setup, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, const Surface *color,
                                 const Surface *depth);
     bool texture_current(const Texture &t, const Rect *texels) const;  // texels null: CLUT only
@@ -216,7 +248,7 @@ private:
     VkDescriptorSetLayout set1_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
-    VkRenderPass pass_depth_ = VK_NULL_HANDLE, pass_nodepth_ = VK_NULL_HANDLE;
+    VkRenderPass pass_depth_rp_ = VK_NULL_HANDLE, pass_nodepth_ = VK_NULL_HANDLE;
     VkPipeline import_frame_ = VK_NULL_HANDLE, export_frame_ = VK_NULL_HANDLE, export_depth_ = VK_NULL_HANDLE, import_depth_ = VK_NULL_HANDLE;
     VkShaderModule module_ = VK_NULL_HANDLE;
     VkShaderModule variant_modules_[8] = {};  // specialised fragment shaders, or null
@@ -270,6 +302,14 @@ private:
     FrameScratch frames_[2];
     FrameScratch *frame_ = nullptr;
     int slot_ = 0;
+    VkCommandBuffer pass_cb_ = VK_NULL_HANDLE;  // the open render pass, if any
+    std::function<void()> pass_closed_hook_;
+    std::vector<gpu::Span> deferred_reads_, deferred_writes_;
+    std::size_t deferred_count_ = 0;
+    Surface *pass_color_ = nullptr, *pass_depth_ = nullptr;
+    bool pass_with_depth_ = false;
+    VkRect2D pass_area_{};
+    std::uint64_t passes_ = 0, closes_[kCloseCount] = {};
     // PS2_HW_DEBUG 1048576: an occlusion query over each frame's draws counts
     // the fragments that reach the colour stage (after depth), for fill-rate maths.
     VkQueryPool occlusion_ = VK_NULL_HANDLE;

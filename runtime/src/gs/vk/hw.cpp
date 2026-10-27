@@ -240,7 +240,7 @@ bool HwRaster::build_pipelines(VkShaderModule module) {
         rpi.pAttachments = at;
         rpi.subpassCount = 1;
         rpi.pSubpasses = &sub;
-        if (vkCreateRenderPass(ctx_->device, &rpi, nullptr, with_depth ? &pass_depth_ : &pass_nodepth_) != VK_SUCCESS) return false;
+        if (vkCreateRenderPass(ctx_->device, &rpi, nullptr, with_depth ? &pass_depth_rp_ : &pass_nodepth_) != VK_SUCCESS) return false;
     }
     // Compute pipelines for the import/export passes.
     const char *compute_names[6] = {"import_frame", "export_frame", "export_depth", "import_depth", "decode", "decode_tex"};
@@ -417,7 +417,7 @@ VkPipeline HwRaster::pipeline_for(const PipelineKey &key) {
     gpi.pColorBlendState = &cb;
     gpi.pDynamicState = &ds;
     gpi.layout = layout_;
-    gpi.renderPass = key.with_depth ? pass_depth_ : pass_nodepth_;
+    gpi.renderPass = key.with_depth ? pass_depth_rp_ : pass_nodepth_;
     VkPipeline pipeline = VK_NULL_HANDLE;
     if (vkCreateGraphicsPipelines(ctx_->device, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipeline) != VK_SUCCESS) {
         std::fprintf(stderr, "[vk] cannot build a draw pipeline (blend key %x)\n", key.blend);
@@ -476,7 +476,47 @@ std::uint32_t HwRaster::push_uniform(FrameScratch &f, const std::uint32_t words[
 // writing, lines, points, upscaling, and batches that read their own target.
 const char *const kReasons[12] = {"scale", "empty", "snapshot", "blend", "date", "fbmsk", "fpsm", "ztst never", "zpsm", "atest fail mode", "prim kind", "scratch full"};
 
+void HwRaster::note_deferred(const gpu::Command &cmd) {
+    ++deferred_count_;
+    for (const gpu::Span &s : cmd.reads)
+        if (s.hi > s.lo) deferred_reads_.push_back(s);
+    for (const gpu::Span &s : cmd.writes)
+        if (s.hi > s.lo) deferred_writes_.push_back(s);
+}
+
+bool HwRaster::deferred_conflict(const gpu::Command &cmd) const {
+    if (deferred_reads_.empty() && deferred_writes_.empty()) return false;
+    const auto overlaps = [](const gpu::Span &a, const gpu::Span &b) { return a.hi > a.lo && b.hi > b.lo && a.lo < b.hi && b.lo < a.hi; };
+    if (!cmd.ranged) return true;
+    for (const gpu::Span &w : cmd.writes) {
+        for (const gpu::Span &d : deferred_reads_)
+            if (overlaps(w, d)) return true;
+        for (const gpu::Span &d : deferred_writes_)
+            if (overlaps(w, d)) return true;
+    }
+    for (const gpu::Span &r : cmd.reads)
+        for (const gpu::Span &d : deferred_writes_)
+            if (overlaps(r, d)) return true;
+    return false;
+}
+
+void HwRaster::close_pass(VkCommandBuffer cb, CloseWhy why) {
+    if (pass_cb_ != cb) return;  // none open, or open in another command buffer
+    ++closes_[why];
+    static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;  // one frame's pass closes, with reasons
+    if (frame_count() == trace_frame) {
+        static const char *const names[kCloseCount] = {"import", "write-back", "decode", "copy", "texture", "memory-read", "surfaces", "failed", "end", "device", "decoded", "wb-draw", "wb-decode", "wb-before", "wb-evict", "wb-overlap", "import-own", "import-source", "wb-uncached", "depth-toggle", "color-change", "depth-change"};
+        std::fprintf(stderr, "[pass] f%llu close after batch %llu: %s (surface %u/%u/%02x%s, %zu held back)\n", static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(drawn_), names[why], pass_color_->bp, pass_color_->bw, pass_color_->psm, pass_depth_ ? " +z" : "", deferred_count_);
+    }
+    vkCmdEndRenderPass(cb);
+    barrier_after_draw(cb, *pass_color_, pass_depth_);
+    pass_cb_ = VK_NULL_HANDLE;
+    pass_color_ = pass_depth_ = nullptr;
+    if (pass_closed_hook_) pass_closed_hook_();
+}
+
 void HwRaster::end_frame(VkCommandBuffer cb) {
+    close_pass(cb, kCloseEndFrame);
     if (!query_open_) return;
     vkCmdEndQuery(cb, occlusion_, static_cast<std::uint32_t>(slot_));
     query_used_[slot_] = true;
@@ -484,6 +524,11 @@ void HwRaster::end_frame(VkCommandBuffer cb) {
 }
 
 void HwRaster::print_reasons() const {
+    static const char *const kCloseNames[kCloseCount] = {"import", "write-back", "decode", "copy", "texture", "memory-read", "surfaces", "failed", "end", "device", "decoded", "wb-draw", "wb-decode", "wb-before", "wb-evict", "wb-overlap", "import-own", "import-source", "wb-uncached", "depth-toggle", "color-change", "depth-change"};
+    std::fprintf(stderr, "[vk] render passes: %llu (%.2f per hardware-drawn batch); closed by:", static_cast<unsigned long long>(passes_), drawn_ ? static_cast<double>(passes_) / static_cast<double>(drawn_) : 0.0);
+    for (int i = 0; i < kCloseCount; ++i)
+        if (closes_[i]) std::fprintf(stderr, " %s %llu", kCloseNames[i], static_cast<unsigned long long>(closes_[i]));
+    std::fprintf(stderr, "\n");
     if (fragment_frames_) std::fprintf(stderr, "[vk] fragments: %.2f M per frame reached the colour stage over %llu frames (hardware-drawn batches)\n", static_cast<double>(fragments_) / static_cast<double>(fragment_frames_) / 1e6, static_cast<unsigned long long>(fragment_frames_));
     std::fprintf(stderr, "[vk] surfaces: %zu resident, %.1f Mpx imported, %.1f Mpx written back, %llu evictions, %llu aliased batches, %llu uniform overflows\n", surfaces_.size(), static_cast<double>(imported_px_) / 1e6,
                  static_cast<double>(exported_px_) / 1e6, static_cast<unsigned long long>(evictions_), static_cast<unsigned long long>(alias_batches_), static_cast<unsigned long long>(uniform_overflows_));
@@ -750,6 +795,7 @@ HwRaster::Surface *HwRaster::surface_for(VkCommandBuffer cb, VkDescriptorSet set
             for (std::size_t i = 1; i < surfaces_.size(); ++i)
                 if (surfaces_[i]->last_use < surfaces_[victim]->last_use) victim = i;
             Surface &v = *surfaces_[victim];
+            WhyScope why(wb_why_, kCloseWbEvict);
             write_back(cb, set0, v, Rect{0, 0, kTargetSize - 1, kTargetSize - 1});
             retire(v);
             surfaces_.erase(surfaces_.begin() + static_cast<std::ptrdiff_t>(victim));
@@ -789,7 +835,7 @@ VkFramebuffer HwRaster::framebuffer_for(const Surface &color, const Surface *dep
     if (it != framebuffers_.end()) return it->second;
     VkImageView views[2] = {color.image.view, depth ? depth->image.view : VK_NULL_HANDLE};
     VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-    fci.renderPass = depth ? pass_depth_ : pass_nodepth_;
+    fci.renderPass = depth ? pass_depth_rp_ : pass_nodepth_;
     fci.attachmentCount = depth ? 2 : 1;
     fci.pAttachments = views;
     fci.width = std::min(color.width, depth ? depth->width : color.width) * scale_;
@@ -950,6 +996,7 @@ void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
 void HwRaster::import_tiles(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect) {
     const auto rects = tile_rects(s.plane, rect, [](const Plane &q, std::uint32_t t) { return !q.valid[t]; });
     if (rects.empty()) return;
+    close_pass(cb, import_why_);
     copy_rects(cb, set0, s, true, rects);
     const std::uint32_t tx0 = rect.x0 / kTile, tx1 = rect.x1 / kTile, ty0 = rect.y0 / kTile, ty1 = rect.y1 / kTile;
     for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
@@ -962,6 +1009,7 @@ void HwRaster::write_back(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
     if (!s.plane.dirty_count || !s.image.image) return;
     const auto rects = tile_rects(s.plane, rect, [](const Plane &q, std::uint32_t t) { return q.dirty[t]; });
     if (rects.empty()) return;
+    close_pass(cb, wb_why_);
     copy_rects(cb, set0, s, false, rects);
     // Other surfaces aliasing the memory just written: their tiles in the
     // (conservative) range no longer match memory. What they still hold
@@ -1119,6 +1167,7 @@ void HwRaster::before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDes
                 }
             }
         }
+        WhyScope why(wb_why_, kCloseWbBefore);
         for (const gpu::Span &sp : cmd.reads) memory_read(cb, set0, sp);
         keep_textures_ = cmd.pipeline == gpu::kUpload;  // block ids decide for uploads
         for (const gpu::Span &sp : cmd.writes) memory_written(cb, set0, sp, own_color, own_depth);
@@ -1285,6 +1334,7 @@ bool HwRaster::texture_current(const Texture &t, const Rect *texels) const {
 void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture &t, std::uint32_t setup_offset) {
     // The decode reads memory: surfaces holding newer pixels there store them first.
     const std::uint64_t before = exported_px_;
+    WhyScope why(wb_why_, kCloseWbDecode);
     memory_read(cb, set0, gpu::Span{t.lo, t.hi});
     if (t.chi > t.clo) memory_read(cb, set0, gpu::Span{t.clo, t.chi});
     if (exported_px_ != before) barrier_copies_visible(cb);
@@ -1293,6 +1343,7 @@ void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture 
     const std::uint32_t width = 1u << t.tw, height = 1u << t.th;
     std::uint32_t words[kUniformWords] = {setup_offset, 0, 0, 0, 0, 0, width, height, scale_, 0, 0, 0};
     const std::uint32_t uniform = push_uniform(*frame_, words);
+    close_pass(cb, kCloseDecode);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, decode_tex_);
     bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, set0, misc_set1_[slot_], 0, uniform);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 2, 1, &t.set2, 0, nullptr);
@@ -1300,14 +1351,14 @@ void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture 
     ++decoded_textures_;
 }
 
-VkDescriptorSet HwRaster::texture_set(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *w, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, const Surface *color,
-                                      const Surface *depth) {
+VkDescriptorSet HwRaster::surface_texture(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *w, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, const Surface *color, const Surface *depth) {
     // A surface in the texture's own layout holds the newest pixels: sample
     // it in place (after importing what memory still owns there), unless the
     // batch draws into it, which Vulkan forbids and the snapshot path serves.
     if (Surface *src = find_surface(w[12], w[13], w[14], false); src && src->image.image && src->set2) {
         Rect texels;
         if (texture_texels(w, prims, count, setup_index, texels) && texels.x1 < src->width && texels.y1 < src->height) {
+            WhyScope why(import_why_, kCloseImportSource);
             import_tiles(cb, set0, *src, texels);
             src->last_use = ++use_counter_;
             if (src != color && src != depth) {
@@ -1323,10 +1374,16 @@ VkDescriptorSet HwRaster::texture_set(VkCommandBuffer cb, VkDescriptorSet set0, 
                 return t->set2;
             }
         }
-        static int shown = 0;
-        if (std::getenv("PS2_TEX_TRACE") && shown++ < 20)
-            std::fprintf(stderr, "[tex] surface %u/%u/%02x %ux%u rejected: texels %u,%u-%u,%u (prims %u, setup %u)\n", w[12], w[13], w[14], src->width, src->height, texels.x0, texels.y0, texels.x1, texels.y1, count, setup_index);
+        static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
+        if (frame_count() == trace_frame)
+            std::fprintf(stderr, "[tex] surface %u/%u/%02x %ux%u rejected: texels %u,%u-%u,%u tw %u th %u modes %u/%u region %08x/%08x (prims %u, setup %u)\n", w[12], w[13], w[14], src->width, src->height, texels.x0, texels.y0, texels.x1, texels.y1, w[15] & 0xFFu, w[15] >> 8, (w[7] >> 24) & 3u, (w[7] >> 26) & 3u, w[18], w[19], count, setup_index);
     }
+    return VK_NULL_HANDLE;
+}
+
+VkDescriptorSet HwRaster::texture_set(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *w, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, const Surface *color,
+                                      const Surface *depth) {
+    if (VkDescriptorSet s = surface_texture(cb, set0, w, prims, count, setup_index, color, depth)) return s;
     const Texture *t = texture_for(cb, set0, w, setup_offset, prims, count, setup_index);
     return t ? t->set2 : VK_NULL_HANDLE;
 }
@@ -1375,6 +1432,7 @@ HwRaster::Texture *HwRaster::texture_slot(VkCommandBuffer cb, const std::uint32_
         war.srcQueueFamilyIndex = war.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         war.image = t->image.image;
         war.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        close_pass(cb, kCloseTexture);
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &war);
         const Image image = t->image;
         const VkDescriptorSet set2 = t->set2;
@@ -1392,6 +1450,7 @@ HwRaster::Texture *HwRaster::texture_slot(VkCommandBuffer cb, const std::uint32_
         bar.image = t->image.image;
         bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         bar.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        close_pass(cb, kCloseTexture);
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
         t->image.layout = VK_IMAGE_LAYOUT_GENERAL;
         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -1453,6 +1512,7 @@ HwRaster::Texture *HwRaster::texture_slot(VkCommandBuffer cb, const std::uint32_
 // Copies the texels a batch reads from the surface it also draws into.
 void HwRaster::copy_surface_texels(VkCommandBuffer cb, VkDescriptorSet set0, Surface &src, Texture &t, const Rect &texels) {
     (void)set0;
+    close_pass(cb, kCloseCopy);
     // Earlier sampling of the copy (fragment reads) must finish before it is
     // overwritten; the surface's attachment writes are already visible to
     // transfers (barrier_after_draw), its imports too (copies barrier).
@@ -1497,6 +1557,12 @@ HwRaster::Texture *HwRaster::texture_for(VkCommandBuffer cb, VkDescriptorSet set
     {
         cpu_timers::Scope tc(cpu_timers::kCurrent);
         current = !fresh && ((debug & 131072u) || texture_current(t, sampled ? &texels : nullptr));  // 131072: timing only, never re-decode
+    }
+    {
+        static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
+        if (frame_count() == trace_frame || frame_count() + 1 == trace_frame)
+            std::fprintf(stderr, "[tex] f%llu %s tbp %u tbw %u psm %02x %ux%u csa %u cpsm %02x clut slot %u source %u texels %u,%u-%u,%u\n", static_cast<unsigned long long>(frame_count()), current ? "hit" : fresh ? "new" : "stale", w[12], w[13], w[14], 1u << t.tw, 1u << t.th, w[17], w[16], w[22] & 0xFFFu, w[22] >> 12,
+                         texels.x0, texels.y0, texels.x1, texels.y1);
     }
     if (current) {
         ++texture_hits_;
@@ -1589,6 +1655,9 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         ++fallback_;
         return false;
     }
+    // Commands held back while the pass is open must land before a batch
+    // that touches their memory (see note_deferred).
+    if (pass_cb_ == cb && deferred_conflict(cmd)) close_pass(cb, kCloseMemoryRead);
     const std::uint32_t *p = params + cmd.param * (gpu::kParamStride / 4);
     const std::uint32_t *prims = arena + p[1];
     const std::uint32_t setup_offset = p[2];
@@ -1663,11 +1732,36 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     // surface) need the memory current; cached ones write back in their
     // decode, surfaces need nothing. Depth tests read the depth surface.
     const std::uint64_t exported_before = exported_px_;
+    std::vector<VkDescriptorSet> textures(cmd.setups, VK_NULL_HANDLE);
+    bool decoded_any = false, memory_sampled = false;
+    // Textures the cache does not take (tiny, or region modes outside the
+    // texture): a surface in the same layout is sampled in place; otherwise
+    // the fragment shader reads memory, which must be current.
     for (std::uint32_t i = 0; i < cmd.setups; ++i) {
         const std::uint32_t *w = setups + i * kSetupWords;
-        if ((w[0] & F_TME) && ((debug & 65536u) || !texture_cacheable(w))) memory_read(cb, set0, texture_span(w));
+        if (!(w[0] & F_TME) || (!(debug & 65536u) && texture_cacheable(w))) continue;
+        if (!(debug & 65536u)) {
+            const std::uint64_t before_imports = imported_px_, before_copies = surface_copies_;
+            textures[i] = surface_texture(cb, set0, w, prims, cmd.prims, i, color, depth);
+            decoded_any = decoded_any || imported_px_ != before_imports || surface_copies_ != before_copies;
+        }
+        if (!textures[i]) {
+            memory_sampled = true;
+            static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
+            if (frame_count() == trace_frame)
+                std::fprintf(stderr, "[tex] memory-sampled: tbp %u tbw %u tpsm %02x tw %u th %u modes %u/%u region %08x/%08x surface %s\n", w[12], w[13], w[14], w[15] & 0xFFu, w[15] >> 8, (w[7] >> 24) & 3u, (w[7] >> 26) & 3u, w[18], w[19],
+                             find_surface(w[12], w[13], w[14], false) ? "same layout" : find_surface(w[12], w[13], w[14] ^ 1u, false) ? "24/32 sibling" : "none");
+            WhyScope why(wb_why_, kCloseWbUncached);
+            memory_read(cb, set0, texture_span(w));
+        }
     }
-    for (const gpu::Span &sp : cmd.writes) memory_written(cb, set0, sp, color, depth);
+    // Memory sampling also reads the CLUT buffer, which held-back CLUT loads
+    // have not written yet: they land first.
+    if (memory_sampled && deferred_count_) close_pass(cb, kCloseMemoryRead);
+    {
+        WhyScope why(wb_why_, kCloseWbDraw);
+        for (const gpu::Span &sp : cmd.writes) memory_written(cb, set0, sp, color, depth);
+    }
     // The imports below read memory the write-backs above may have stored.
     if (exported_px_ != exported_before) {
         if (trace && frame_count() >= trace_from && frame_count() < trace_to)
@@ -1675,47 +1769,66 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
                          cmd.writes[0].hi, cmd.writes[1].lo, cmd.writes[1].hi);
         barrier_copies_visible(cb);
     }
-    if (color_any) import_tiles(cb, set0, *color, rect);
-    if (depth) import_tiles(cb, set0, *depth, rect);
+    // Every tile memory still owns is imported, not only the batch rectangle:
+    // the scene fills the screen batch by batch, and an import per batch
+    // closed the render pass every time (19 in a row in a race frame).
+    WhyScope why_import(import_why_, kCloseImportOwn);
+    if (color_any) import_tiles(cb, set0, *color, Rect{0, 0, color->width - 1, color->height - 1});
+    if (depth) import_tiles(cb, set0, *depth, Rect{0, 0, depth->width - 1, depth->height - 1});
     // Textures: resolve (and decode, which reads memory the write-backs
     // above just stored) every textured setup's image before the pass.
-    std::vector<VkDescriptorSet> textures(cmd.setups, VK_NULL_HANDLE);
-    bool decoded_any = false;
     if (!(debug & 65536u))
         for (std::uint32_t i = 0; i < cmd.setups; ++i) {
             const std::uint32_t *w = setups + i * kSetupWords;
             if (!(w[0] & F_TME) || !texture_cacheable(w)) continue;
-            const std::uint64_t before_decodes = decoded_textures_, before_imports = imported_px_;
+            const std::uint64_t before_decodes = decoded_textures_, before_imports = imported_px_, before_copies = surface_copies_;
             textures[i] = texture_set(cb, set0, w, setup_offset + i * kSetupWords, prims, cmd.prims, i, color, depth);
-            decoded_any = decoded_any || decoded_textures_ != before_decodes || imported_px_ != before_imports;
+            decoded_any = decoded_any || decoded_textures_ != before_decodes || imported_px_ != before_imports || surface_copies_ != before_copies;
         }
     if (decoded_any) {
         // Decodes and imports (compute stores, transfer writes) feed sampling.
+        close_pass(cb, kCloseDecoded);
         VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mem.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         mem.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
     }
-    barrier_after_copies(cb, *color, depth);
-    VkFramebuffer framebuffer = framebuffer_for(*color, depth);
-    if (!framebuffer) {
-        ++reasons_[11];
-        ++fallback_;
-        return false;
+    const bool same_pass = pass_cb_ == cb && pass_color_ == color && pass_depth_ == depth && pass_with_depth_ == with_depth;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    if (!same_pass) {
+        close_pass(cb, pass_color_ != color ? kCloseColorChange : pass_depth_ != depth && depth && pass_depth_ ? kCloseDepthChange : pass_with_depth_ != with_depth ? kCloseDepthToggle : kCloseSurfaces);
+        barrier_after_copies(cb, *color, depth);
+        framebuffer = framebuffer_for(*color, depth);
+        if (!framebuffer) {
+            ++reasons_[11];
+            ++fallback_;
+            return false;
+        }
     }
 
     // 2. Render pass: one draw per run of primitives sharing a setup.
-    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rbi.renderPass = with_depth ? pass_depth_ : pass_nodepth_;
-    rbi.framebuffer = framebuffer;
-    rbi.renderArea = {{static_cast<std::int32_t>(minx * scale_), static_cast<std::int32_t>(miny * scale_)}, {(maxx - minx + 1) * scale_, (maxy - miny + 1) * scale_}};
-    if (debug & 2097152u) rbi.renderArea = {{0, 0}, {color->width * scale_, color->height * scale_}};  // debug: whole-surface render area (does pass cost follow the area?)
-    if (occlusion_ && !query_open_) {
-        vkCmdResetQueryPool(cb, occlusion_, static_cast<std::uint32_t>(slot_), 1);
-        vkCmdBeginQuery(cb, occlusion_, static_cast<std::uint32_t>(slot_), 0);
-        query_open_ = true;
+    if (!same_pass) {
+        // The render area is the whole surface (it costs nothing on this
+        // hardware, measured) so later batches of the pass fit anywhere in it.
+        VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rbi.renderPass = with_depth ? pass_depth_rp_ : pass_nodepth_;
+        rbi.framebuffer = framebuffer;
+        rbi.renderArea = {{0, 0}, {color->width * scale_, color->height * scale_}};
+        if (occlusion_ && !query_open_) {
+            vkCmdResetQueryPool(cb, occlusion_, static_cast<std::uint32_t>(slot_), 1);
+            vkCmdBeginQuery(cb, occlusion_, static_cast<std::uint32_t>(slot_), 0);
+            query_open_ = true;
+        }
+        vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        pass_cb_ = cb;
+        pass_color_ = color;
+        pass_depth_ = depth;
+        pass_with_depth_ = with_depth;
+        pass_area_ = rbi.renderArea;
+        ++passes_;
     }
-    vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};  // only its renderArea is read below
+    rbi.renderArea = pass_area_;
     // The viewport is the whole GS drawing space, not the surface: clipping
     // primitives at the surface edge would re-interpolate their attributes
     // and shift texel picks against the compute path. The render area and
@@ -1819,8 +1932,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         if (!built) {
             // Pipeline creation failed: the target is now unreliable in the
             // rectangle; drop it and leave the batch to the compute path.
-            vkCmdEndRenderPass(cb);
-            barrier_after_draw(cb, *color, depth);
+            close_pass(cb, kCloseFailed);
             invalidate(*color, rect);
             if (depth) invalidate(*depth, rect);
             ++fallback_;
@@ -1829,8 +1941,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         i = j;
         ++run;
     }
-    vkCmdEndRenderPass(cb);
-    barrier_after_draw(cb, *color, depth);
+    // The pass stays open for the next batch on these surfaces.
 
     // 3. Bookkeeping: the rectangle is now newer than memory, and any
     // texture decoded from it no longer matches.
@@ -1846,6 +1957,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         // other, since neither surface alone holds the memory's contents.
         const gpu::Span cs = rect_span(*color, rect), zs = rect_span(*depth, rect);
         if (cs.lo < zs.hi && zs.lo < cs.hi) {
+            WhyScope why(wb_why_, kCloseWbOverlap);
             write_back(cb, set0, *color, rect, false);
             write_back(cb, set0, *depth, rect, false);
             Rect o;
@@ -1898,7 +2010,7 @@ void HwRaster::destroy() {
         ctx_->destroy_buffer(f.vertices);
         ctx_->destroy_buffer(f.uniforms);
     }
-    if (pass_depth_) vkDestroyRenderPass(ctx_->device, pass_depth_, nullptr);
+    if (pass_depth_rp_) vkDestroyRenderPass(ctx_->device, pass_depth_rp_, nullptr);
     if (pass_nodepth_) vkDestroyRenderPass(ctx_->device, pass_nodepth_, nullptr);
     if (pool_) vkDestroyDescriptorPool(ctx_->device, pool_, nullptr);
     if (layout_) vkDestroyPipelineLayout(ctx_->device, layout_, nullptr);

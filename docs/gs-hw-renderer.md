@@ -373,3 +373,57 @@ each between full pipeline barriers. Next: keep one render pass open across
 consecutive batches on the same surfaces when nothing needs the pass closed
 (no imports, write-backs, texture decodes or copies), with the whole
 surface as render area (the area costs nothing).
+
+### 2026-10-27, late: one render pass across batches, and why GT4 still closes it
+
+Mechanism (hw.cpp): consecutive hardware-drawn batches on the same colour
+and depth surfaces share one render pass (whole surface as render area);
+anything recorded outside a pass closes it first (`close_pass`, called by
+imports, write-backs, decodes, copies, image barriers). Compute commands
+the device meets while a pass is open (uploads, CLUT loads, copies,
+snapshots, decodes) are held back and recorded when the pass closes, with
+their `before_command` write-backs run then; a batch whose memory spans
+overlap a held-back command's spans closes the pass first
+(`deferred_conflict`), and so does a batch that samples memory in the
+fragment shader while CLUT loads are pending (they write the CLUT buffer,
+which the span check cannot see; found as a 62-pixel difference in the
+race compare). Own-surface imports take every tile memory still owns, not
+the batch rectangle, so the scene filling the screen costs one import, not
+nineteen. Textures the cache does not take are sampled from a surface in
+the same layout when there is one. CLUT loads are deduplicated by result
+identity: a slot's 512 entries as 32 chunks of 16, each named by the load
+that last wrote it (its parameters and the source pages' write
+generation), untouched chunks inherited from the CLUT the load merges
+into; a result already in a live slot is reused without a dispatch, the
+slot pinned until the submit so no emitted load overwrites it. 29% of the
+race's loads are reused, load_clut 4.0 -> 3.1 ms. Three bugs on the way,
+each a few hundred pixels: the generation was read before a buffered batch
+drawing the palette was flushed; emitted loads took the ring position after
+the current slot, overwriting live slots once a reuse pointed it back; and
+the early return skipped the CLUT source id the texture caches key on.
+Native frames stay bit-identical; `PS2_HW_PASS_TRACE=<frame>` prints every
+pass close of a frame with its reason.
+
+Result: still 0.99 passes per batch on the race, threaded 38-42 ms, GPU
+raster unchanged. The trace of frame 6100 (232 batches, 231 closes) says
+why: GT4's post-process. 70 times a frame it draws a textured 64x16 block
+into a 32-bit buffer (15328), then eight 8x32 sprites into the 24-bit frame
+(4480), each sampling 256 bytes of that block as an 8-bit texture through a
+CLUT loaded just before (a channel shuffle, as PCSX2 calls it). The
+alternation of targets alone is 140 passes; the 8-bit reads of a 32-bit
+surface need a write-back each time (`wb-uncached`, 70), and the pending
+CLUT load forces the pass closed (`memory-read`, 69). The rest: 23
+compute-path DATE batches (each also invalidates the surface), 18 copies for
+batches sampling their own frame, 15 copies in a 64-wide ping-pong, a few
+Z-alias overlaps.
+
+Plan, in order of value: (1) reorder around open passes: hold back a
+batch for another surface (and the compute commands between) while the
+open pass continues, flush in order when a later batch's spans conflict,
+hoisting held-back compute commands before held-back batches when their
+spans allow; on this frame the 70 block draws would form one pass and the
+70 strip draws another. (2) Read surfaces through memory addressing in the
+memory-sampling shader (inverse page tables for PSMCT32), so 8-bit reads
+of a 32-bit surface sample its image instead of forcing a write-back.
+(3) DATE through the stencil buffer. (4) 16-entry CLUT loads keyed by the
+chunks they touch rather than the whole chain, for more reuse.

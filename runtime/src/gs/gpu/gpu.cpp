@@ -103,6 +103,20 @@ struct Arena {
     std::uint32_t &operator[](std::size_t i) { return base[i]; }
 } g_arena;
 std::uint32_t g_clut_slot = 0, g_clut_loads = 0, g_texflushes = 0;
+// CLUT loads are deduplicated: a load's result depends only on its parameters,
+// the source memory (whose 8 KB pages carry a write generation) and, for a
+// partial load, the CLUT it merges into. A result already in a live slot is
+// reused without a dispatch; GT4 reloads the same palettes ~1000 times a frame.
+std::uint64_t g_page_gen[512] = {};
+std::uint64_t g_slot_key[kClutSlots] = {};
+std::array<std::uint64_t, 32> g_slot_chunks[kClutSlots] = {};  // a slot's 512 entries as 32 chunks of 16, each identified by the load that last wrote it
+std::unordered_map<std::uint64_t, std::uint32_t> g_clut_memo;
+std::uint64_t g_clut_reused = 0, g_clut_emitted = 0;
+std::uint32_t g_clut_next = 1;  // the ring position the next emitted load writes (independent of the current slot, which a reuse may point back)
+// Slots handed out by a reuse this submit: setups already built reference
+// them, so no load emitted before the submit may overwrite them.
+std::vector<std::uint8_t> g_slot_pinned(kClutSlots, 0);
+std::vector<std::uint32_t> g_pinned_slots;
 std::map<std::array<std::uint32_t, 6>, std::uint32_t> g_clut_sources;  // (cbp, cbw, cpsm, csm, cou, cov) -> id, for texture caches
 std::uint32_t g_clut_source_id = 0;  // of the latest load
 
@@ -448,6 +462,19 @@ Range pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y
     return r;
 }
 
+void bump_pages(const Range &r) {
+    if (r.hi <= r.lo) return;
+    for (std::uint64_t p = r.lo >> 13; p <= (r.hi - 1) >> 13 && p < 512 + (r.lo >> 13); ++p) ++g_page_gen[p & 511u];
+}
+
+std::uint64_t pages_generation(const Range &r) {
+    // A sum: generations only grow, so any write to any page changes it.
+    std::uint64_t sum = 0;
+    if (r.hi > r.lo)
+        for (std::uint64_t p = r.lo >> 13; p <= (r.hi - 1) >> 13 && p < 512 + (r.lo >> 13); ++p) sum += g_page_gen[p & 511u];
+    return sum;
+}
+
 void mark_rendered(const Range &r) {
     for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_rendered[(at >> 13) & 511u] = true;
 }
@@ -617,6 +644,8 @@ void flush_batch() {
     note_ranges(&g_commands.back(), reads, b.zwrite ? std::vector<Range>{b.fb_range, b.z_range} : std::vector<Range>{b.fb_range});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
+    bump_pages(b.fb_range);
+    if (b.zwrite) bump_pages(b.z_range);
     b.prims.clear();
     b.setups.clear();
     b.boxes.clear();
@@ -741,6 +770,7 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
         g_dev->blocks_written(blocks.data(), blocks.size(), id);
     }
     ++g_uploads;
+    bump_pages(op.range);
     op.x0 = im.dsax;
     op.x1 = im.dsax + im.rrw - 1;
     op.y0 = im.dsay + first;
@@ -786,6 +816,8 @@ void finish_submit() {
     g_command_info.clear();
     ++g_serial;
     g_param_records.clear();
+    for (std::uint32_t slot : g_pinned_slots) g_slot_pinned[slot] = 0;
+    g_pinned_slots.clear();
     g_arena.clear();
     {
         std::uint32_t *words = nullptr;
@@ -1003,10 +1035,13 @@ void draw(const State &st, const Vertex *v, int count) {
     const std::uint32_t prim = static_cast<std::uint32_t>(st.prim) & 7u;
     const Context &c = st.ctx[(attr >> 9) & 1u];
     SetupCache &cache = g_setup_cache;
-    if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot) {
+    // The CLUT source id is part of the record too (setup word 22): with
+    // deduplicated loads the slot can stay while the source changes.
+    const std::uint32_t clut_state = g_clut_slot | (g_clut_source_id << 12);
+    if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != clut_state) {
         cache.generation = g_setup_generation;
         cache.attr = attr;
-        cache.clut = g_clut_slot;
+        cache.clut = clut_state;
         const std::uint32_t *w = cache.setup;
         cache.flags = make_setup(st, attr, cache.setup);
         cache.key = static_cast<std::uint64_t>(w[1]) | (static_cast<std::uint64_t>(w[2]) << 14) | (static_cast<std::uint64_t>(w[3]) << 20) |
@@ -1234,6 +1269,7 @@ void local_copy(const State &s) {
                              (static_cast<int>(pos >> 48) & 0x7FF) + static_cast<int>(h) - 1);
     note_ranges(dispatch_linear(kCopyRead, w * h * g_scale * g_scale, read), {src}, {});
     note_ranges(dispatch_linear(kCopyWrite, w * h * g_scale * g_scale, write), {}, {dst});
+    bump_pages(dst);
 }
 
 void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
@@ -1245,26 +1281,83 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     }
     const std::uint32_t psm = static_cast<std::uint32_t>(tex0 >> 20) & 0x3Fu;
     const std::uint32_t cpsm = (static_cast<std::uint32_t>(tex0 >> 51) & 0xFu) == 0 ? PSMCT32 : static_cast<std::uint32_t>(tex0 >> 51) & 0xFu;
-    const std::uint32_t next = (g_clut_slot + 1) % kClutSlots;
+    std::uint32_t next = g_clut_next;
     const std::uint32_t tc = static_cast<std::uint32_t>(texclut);
     const std::uint32_t cbp = static_cast<std::uint32_t>(tex0 >> 37) & 0x3FFFu, csm = static_cast<std::uint32_t>(tex0 >> 55) & 1u;
     const std::uint32_t cbw = tc & 0x3Fu, cou = (tc >> 6) & 0x3Fu, cov = (tc >> 12) & 0x3FFu;
     PreOp op;
     op.clut = true;
-    const std::uint32_t rec[10] = {g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, (psm == PSMT8 || psm == PSMT8H) ? 1u : 0u, cbw, cou, cov};
+    const std::uint32_t csa = static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, eight = (psm == PSMT8 || psm == PSMT8H) ? 1u : 0u;
+    const std::uint32_t rec[10] = {g_clut_slot, next, cbp, cpsm, csm, csa, eight, cbw, cou, cov};
     std::memcpy(op.rec, rec, sizeof rec);
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
+    // A batch still being built may be drawing the palette: it goes out
+    // first, so the source pages' generations include it.
+    if (batch_conflict(op.range, true)) emit_all();
+    // The source id names the palette's memory for the texture caches; it
+    // is set whether the load is emitted or a slot is reused.
+    {
+        const std::array<std::uint32_t, 6> source{cbp, cbw, cpsm, csm, cou, cov};
+        auto it = g_clut_sources.find(source);
+        if (it == g_clut_sources.end()) {
+            it = g_clut_sources.emplace(source, static_cast<std::uint32_t>(g_clut_sources.size() + 1)).first;
+            g_dev->clut_source(it->second, span_of(op.range));
+        }
+        g_clut_source_id = it->second;
+    }
+    // The result's identity: the slot's 32 chunks of 16 entries, each named
+    // by the load that last wrote it (its parameters and the source pages'
+    // write generation), the untouched ones inherited from the current CLUT
+    // (load_clut in gs.wgsl: which chunks a load writes).
+    std::uint64_t own = 0x9E3779B97F4A7C15ull;
+    const auto mix = [](std::uint64_t &h, std::uint64_t v) {
+        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        h *= 0xBF58476D1CE4E5B9ull;
+    };
+    for (std::uint32_t v : {cbp, cpsm, csm, csa, eight, cbw, cou, cov}) mix(own, v);
+    mix(own, pages_generation(op.range));
+    std::array<std::uint64_t, 32> chunks = g_slot_chunks[g_clut_slot];
+    if (csm) {
+        for (std::uint32_t c = 0; c < (eight ? 16u : 1u); ++c) chunks[(csa + c) & 31u] = own + c;
+    } else if (eight) {
+        for (std::uint32_t c = 0; c < 16; ++c) chunks[c] = own + c;
+    } else {
+        chunks[csa & 15u] = own;
+    }
+    std::uint64_t key = 0x9E3779B97F4A7C15ull;
+    for (std::uint64_t c : chunks) mix(key, c);
+    if (!key) key = 1;
+    static const bool dedupe = !std::getenv("PS2_CLUT_NO_DEDUPE");  // A/B knob
+    static const int dedupe_mode = std::getenv("PS2_CLUT_DEDUPE_MODE") ? std::atoi(std::getenv("PS2_CLUT_DEDUPE_MODE")) : 0;  // 1: full 8-bit loads only, 2: csm 0 only, 3: 16-entry only
+    const bool allowed = dedupe_mode == 0 || (dedupe_mode == 1 && eight) || (dedupe_mode == 2 && !csm) || (dedupe_mode == 3 && !eight);
+    if (const auto it = g_clut_memo.find(key); dedupe && allowed && it != g_clut_memo.end() && g_slot_key[it->second] == key) {
+        g_clut_slot = it->second;
+        if (!g_slot_pinned[g_clut_slot]) {
+            g_slot_pinned[g_clut_slot] = 1;
+            g_pinned_slots.push_back(g_clut_slot);
+        }
+        ++g_clut_reused;
+        return;
+    }
+    if (g_pinned_slots.size() > kClutSlots / 2) {  // room for emissions: a submit releases the pins
+        emit_all();
+        submit();
+    }
+    while (g_slot_pinned[next]) next = (next + 1) % kClutSlots;
+    std::memcpy(op.rec + 1, &next, sizeof next);  // the slot may have moved past pinned ones
     queue_pre(op);
+    if (g_slot_key[next]) {
+        const auto old = g_clut_memo.find(g_slot_key[next]);
+        if (old != g_clut_memo.end() && old->second == next) g_clut_memo.erase(old);
+    }
+    g_slot_key[next] = key;
+    g_slot_chunks[next] = chunks;
+    g_clut_memo[key] = next;
+    g_clut_next = (next + 1) % kClutSlots;
+    ++g_clut_emitted;
     g_clut_slot = next;
     ++g_clut_loads;
-    const std::array<std::uint32_t, 6> source{cbp, cbw, cpsm, csm, cou, cov};
-    auto it = g_clut_sources.find(source);
-    if (it == g_clut_sources.end()) {
-        it = g_clut_sources.emplace(source, static_cast<std::uint32_t>(g_clut_sources.size() + 1)).first;
-        g_dev->clut_source(it->second, span_of(op.range));
-    }
-    g_clut_source_id = it->second;
 }
 
 void texflush() { ++g_texflushes; }
@@ -1336,6 +1429,10 @@ void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vec
 
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut) {
     wait_idle();
+    for (std::uint64_t &g : g_page_gen) ++g;
+    g_clut_memo.clear();
+    std::fill(std::begin(g_slot_key), std::end(g_slot_key), 0ull);
+    for (auto &c : g_slot_chunks) c.fill(0);
     const std::size_t words = kMemorySize / 4;
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
     std::fill(std::begin(g_rendered), std::end(g_rendered), from == to && to > 1);
@@ -1353,6 +1450,7 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
 
 void stats() {
     if (g_mode == Mode::off) return;
+    std::fprintf(stderr, "[gpu] clut loads: %llu emitted, %llu reused\n", static_cast<unsigned long long>(g_clut_emitted), static_cast<unsigned long long>(g_clut_reused));
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
