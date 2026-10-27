@@ -5,6 +5,8 @@
 file(READ "${SRC}" wgsl)
 if(APPEND)
     file(READ "${APPEND}" extra)
+    # hw.wgsl writes a second blend source; the directive has to lead the module.
+    string(PREPEND wgsl "enable dual_source_blending;\n")
     string(APPEND wgsl "\n" "${extra}")
 endif()
 if(SCALE)

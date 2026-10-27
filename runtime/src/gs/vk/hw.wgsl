@@ -2,8 +2,10 @@
 // helper of the compute renderer (memory layout, texture sampling, the
 // Setup record) is shared. These entry points draw a batch with the GPU's
 // own rasterizer into a target image that mirrors a frame buffer's words:
-// R32_UINT, one texel per GS pixel sample, holding the raw frame word.
-// Depth lives in a D32 attachment as z / 2^32 (exact for 16- and 24-bit Z).
+// RGBA8_UNORM, one texel per GS pixel sample, the frame word's four bytes
+// as unorm channels so the blend unit can work on them (import and export
+// convert exactly). Depth lives in a D32 attachment as z / 2^32 (exact for
+// 16- and 24-bit Z).
 //
 // Memory model (docs/gs-hw-renderer.md): GS memory in `vram` stays the
 // truth; `import_frame`/`import_depth` fill a target from it before a batch
@@ -22,8 +24,8 @@ struct HwParams {
 };
 
 @group(1) @binding(0) var<uniform> hw: HwParams;
-@group(1) @binding(1) var target_store: texture_storage_2d<r32uint, write>;
-@group(1) @binding(2) var target_load: texture_2d<u32>;
+@group(1) @binding(1) var target_store: texture_storage_2d<rgba8unorm, write>;
+@group(1) @binding(2) var target_load: texture_2d<f32>;
 // Depth travels through this buffer as D32 float bits: filled by
 // import_depth and copied into the depth attachment, or copied out of it
 // and converted back by export_depth. Rows are `width` samples long.
@@ -59,8 +61,26 @@ fn hw_vs(v: VsIn) -> VsOut {
 }
 
 struct FsOut {
-    @location(0) word: u32,
+    @location(0) @blend_src(0) color: vec4<f32>,
+    // The GS blend coefficient C = As / 128, for SRC1 blend factors.
+    @location(0) @blend_src(1) factor: vec4<f32>,
 };
+
+fn unpack_word(w: u32) -> vec4<f32> {
+    return vec4<f32>(f32(w & 0xFFu), f32((w >> 8u) & 0xFFu), f32((w >> 16u) & 0xFFu), f32(w >> 24u)) / 255.0;
+}
+
+fn pack_word(c: vec4<f32>) -> u32 {
+    let v = vec4<u32>(round(clamp(c, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0));
+    return v.x | (v.y << 8u) | (v.z << 16u) | (v.w << 24u);
+}
+
+fn debug_out(word: u32) -> FsOut {
+    var o: FsOut;
+    o.color = unpack_word(word);
+    o.factor = vec4<f32>(1.0);
+    return o;
+}
 
 // The per-pixel pipeline of `plot` for the cases the hardware path takes:
 // no blending, no destination alpha test, whole-word frame mask, alpha test
@@ -69,20 +89,7 @@ struct FsOut {
 @fragment
 fn hw_fs(i: VsOut) -> FsOut {
     if ((hw.flags & 2u) != 0u) {
-        var dbg: FsOut;
-        dbg.word = 0x80FF00FFu;  // debug: paint every fragment, before any test
-        return dbg;
-    }
-    if ((hw.flags & 32u) != 0u) {
-        let d = load_setup(hw.setup);  // debug: setup flags low byte, scissor x1 low byte, tpsm
-        var dbg: FsOut;
-        dbg.word = (d.flags & 0xFFu) | ((u32(d.scax1) & 0xFFu) << 8u) | ((d.tpsm & 0xFFu) << 16u) | 0xFF000000u;
-        return dbg;
-    }
-    if ((hw.flags & 16u) != 0u) {
-        var dbg: FsOut;  // debug: colour alpha in red, tex.x/16 in green, tex.z*64 in blue
-        dbg.word = (u32(clamp(i.color.w, 0.0, 255.0)) & 0xFFu) | ((u32(clamp(i.tex.x / 16.0, 0.0, 255.0)) & 0xFFu) << 8u) | ((u32(clamp(i.tex.z * 64.0, 0.0, 255.0)) & 0xFFu) << 16u) | 0xFF000000u;
-        return dbg;
+        return debug_out(0x80FF00FFu);  // debug: paint every fragment, before any test
     }
     let s = load_setup(hw.setup);
     let sx = u32(i.clip.x);
@@ -117,14 +124,7 @@ fn hw_fs(i: VsOut) -> FsOut {
         }
         let t = sample(s, u, v, k);
         if ((hw.flags & 4u) != 0u) {
-            var dbg: FsOut;
-            dbg.word = t | 0xFF000000u;  // debug: the raw texel
-            return dbg;
-        }
-        if ((hw.flags & 8u) != 0u) {
-            var dbg: FsOut;
-            dbg.word = (u32(clamp(u, 0.0, 255.0)) & 0xFFu) | ((u32(clamp(v, 0.0, 255.0)) & 0xFFu) << 8u) | (u32(clamp(i.tex.z * 64.0, 0.0, 255.0)) << 16u) | 0xFF000000u;  // debug: u, v, q
-            return dbg;
+            return debug_out(t | 0xFF000000u);  // debug: the raw texel
         }
         let tr = i32(t & 0xFFu);
         let tg = i32((t >> 8u) & 0xFFu);
@@ -202,7 +202,8 @@ fn hw_fs(i: VsOut) -> FsOut {
         out_a = out_a | 0x80u;
     }
     var o: FsOut;
-    o.word = u32(r) | (u32(g) << 8u) | (u32(b) << 16u) | (out_a << 24u);
+    o.color = vec4<f32>(f32(r), f32(g), f32(b), f32(out_a)) / 255.0;
+    o.factor = vec4<f32>(min(f32(a) / 128.0, 1.0));
     return o;
 }
 
@@ -219,7 +220,7 @@ fn import_frame(@builtin(global_invocation_id) gid: vec3<u32>) {
     let y = ty / hw.scale;
     let k = (ty % hw.scale) * hw.scale + tx % hw.scale;
     let l = addr(s.ff, x, y);
-    textureStore(target_store, vec2<i32>(i32(tx), i32(ty)), vec4<u32>(load_at(l, k), 0u, 0u, 0u));
+    textureStore(target_store, vec2<i32>(i32(tx), i32(ty)), unpack_word(load_at(l, k)));
 }
 
 // Writes a target back into GS memory through the frame format's own store
@@ -240,7 +241,7 @@ fn export_frame(@builtin(global_invocation_id) gid: vec3<u32>) {
     let y = ty / hw.scale;
     let k = (ty % hw.scale) * hw.scale + tx % hw.scale;
     let l = addr(s.ff, x, y);
-    let word = textureLoad(target_load, vec2<i32>(i32(tx), i32(ty)), 0).x;
+    let word = pack_word(textureLoad(target_load, vec2<i32>(i32(tx), i32(ty)), 0));
     write_frame_word(s, l, k, word);
 }
 

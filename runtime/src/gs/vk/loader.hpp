@@ -92,6 +92,7 @@ namespace ps2::gs::vk {
     X(vkCmdSetViewport) \
     X(vkCmdSetScissor) \
     X(vkCmdDraw) \
+    X(vkCmdSetBlendConstants) \
     X(vkCmdFillBuffer) \
     X(vkGetFenceStatus) \
     X(vkCreateQueryPool) \

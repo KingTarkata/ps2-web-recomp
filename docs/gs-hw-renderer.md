@@ -185,3 +185,27 @@ now. The runtime's queue and threads do not change.
   the cheap destination-read paths; batches that need them will be slower.
 - **Scope:** this is the largest single piece of work in the project. The
   stages are ordered so that each one is measurable and useful on its own.
+
+## 6. Progress log
+
+- 2026-10-26: stages 1 and 2 done. `gpu.cpp` drives a `Device`; the wgpu
+  device is verified frame- and RAM-identical; the Vulkan device runs the
+  compute shaders (naga, one SPIR-V per upscale factor) frame-identical over
+  the title and a 6000-frame race, and saves 15% on the Switch by itself.
+- 2026-10-26: stages 3 and 4 partly done in `runtime/src/gs/vk/hw.{wgsl,cpp}`.
+  Batches draw through graphics pipelines into an RGBA8 target plus a D32
+  attachment, imported from and exported to GS memory per batch rectangle;
+  the fragment shader shares gs.wgsl's texture sampling and per-pixel rules.
+  Blending maps the GS equation onto the blend unit with a dual-source
+  factor for As/128 and blend constants for FIX; depth tests map to the
+  depth unit (32-bit Z through float, 24 bits exact). Title sequence: 1152
+  of 1346 batches on the hardware path, seven frames identical, two
+  blended frames within a channel delta of 4. Still falling back: batches
+  whose setups carry different frame masks, destination-alpha factors and
+  tests, PABE, colour wrap, 16-bit frames, upscaling, lines and points, and
+  batches reading their own target.
+- Lessons: naga flips Y for Vulkan unless `--keep-coordinate-space`;
+  descriptor bindings must name the graphics stages; llvmpipe crashed on a
+  fragment-depth import draw, so depth moves through buffer/image copies.
+- Next: measure on the Switch; then page ownership so import/export only
+  run when memory and target disagree, which is where the time will be.

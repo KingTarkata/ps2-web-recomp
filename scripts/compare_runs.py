@@ -18,6 +18,29 @@ def digest(path):
         return hashlib.md5(f.read()).hexdigest()
 
 
+def pixel_stats(pa, pb):
+    """Counts differing pixels in two PPM frames and the largest channel delta,
+    so rounding-level differences (blending, interpolation) can be told apart
+    from wrong pixels."""
+    def load(p):
+        d = open(p, 'rb').read()
+        parts = d.split(maxsplit=4)
+        w, h = int(parts[1]), int(parts[2])
+        return w, h, parts[4][:w * h * 3]
+    w, h, a = load(pa)
+    _, _, b = load(pb)
+    if len(a) != len(b):
+        return 'sizes differ'
+    diff = big = maxd = 0
+    for i in range(0, len(a), 3):
+        if a[i:i + 3] != b[i:i + 3]:
+            diff += 1
+            d = max(abs(a[i + k] - b[i + k]) for k in range(3))
+            maxd = max(maxd, d)
+            big += d > 8
+    return '%d of %d pixels differ, %d by more than 8, max delta %d' % (diff, w * h, big, maxd)
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__)
@@ -33,7 +56,7 @@ def main():
             same += 1
         else:
             different += 1
-            print('frame differs:', name)
+            print('frame differs: %s  %s' % (name, pixel_stats(os.path.join(a, name), other)))
     print('frames: %d identical, %d different, %d missing in B' % (same, different, missing))
     ra, rb = os.path.join(a, 'ram.bin'), os.path.join(b, 'ram.bin')
     if not (os.path.exists(ra) and os.path.exists(rb)):

@@ -15,7 +15,7 @@ constexpr std::uint32_t kTargetSize = 2048;
 constexpr std::uint64_t kVertexBytes = 16u << 20, kUniformBytes = 1u << 20;
 constexpr std::uint32_t kUniformStride = 256;
 
-constexpr std::uint32_t F_TME = 2, F_ABE = 8, F_ZMSK = 32, F_ATE = 64, F_DATE = 128, F_ZTE = 512;
+constexpr std::uint32_t F_TME = 2, F_ABE = 8, F_ZMSK = 32, F_ATE = 64, F_DATE = 128, F_ZTE = 512, F_PABE = 1024, F_COLCLAMP = 2048;
 
 float fat(std::uint32_t u) {
     float f;
@@ -70,11 +70,11 @@ bool HwRaster::init(Context &ctx, VkShaderModule module, VkDescriptorSetLayout s
 }
 
 bool HwRaster::build_pipelines(VkShaderModule module) {
-    // Render passes: colour R32_UINT, optionally depth D32, both kept in
+    // Render passes: colour RGBA8, optionally depth D32, both kept in
     // GENERAL layout so the import/export passes can address them directly.
     for (int with_depth = 0; with_depth < 2; ++with_depth) {
         VkAttachmentDescription at[2] = {};
-        at[0].format = VK_FORMAT_R32_UINT;
+        at[0].format = VK_FORMAT_R8G8B8A8_UNORM;
         at[0].samples = VK_SAMPLE_COUNT_1_BIT;
         at[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         at[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -114,7 +114,80 @@ bool HwRaster::build_pipelines(VkShaderModule module) {
             return false;
         }
     }
-    // Graphics pipelines: the draw variants and the depth import.
+    module_ = module;
+    return true;
+}
+
+// Blend key layout: bit 0 enabled, bits 1-5 src factor, bits 6-10 dst
+// factor, bits 11-13 op, bit 14 uses blend constants (FIX).
+namespace {
+constexpr std::uint32_t kFactorBits = 5;
+std::uint32_t make_blend_key(VkBlendFactor src, VkBlendFactor dst, VkBlendOp op, bool constant) {
+    return 1u | (static_cast<std::uint32_t>(src) << 1) | (static_cast<std::uint32_t>(dst) << 6) | (static_cast<std::uint32_t>(op) << 11) | (constant ? 1u << 14 : 0u);
+}
+}
+
+std::uint32_t HwRaster::blend_key(const std::uint32_t *w, bool dual_source) {
+    const std::uint32_t a = (w[7] >> 12) & 3u, b = (w[7] >> 14) & 3u, c = (w[7] >> 16) & 3u, d = (w[7] >> 18) & 3u;
+    // Factor C: source alpha (dual-source output, As/128 clamped to 1),
+    // destination alpha (no exact mapping: unorm alpha is /255), or FIX/128.
+    VkBlendFactor fc, fnc;
+    bool constant = false;
+    if (c == 0) {
+        if (!dual_source) return 0;
+        fc = VK_BLEND_FACTOR_SRC1_COLOR;
+        fnc = VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+    } else if (c == 2) {
+        if (w[9] > 128) return 0;
+        fc = VK_BLEND_FACTOR_CONSTANT_COLOR;
+        fnc = VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+        constant = true;
+    } else {
+        return 0;
+    }
+    const auto key = [&](VkBlendFactor src, VkBlendFactor dst, VkBlendOp op) { return make_blend_key(src, dst, op, constant); };
+    // (A - B) * C + D over selectors Cs (0), Cd (1), zero (2).
+    if (a == b) {
+        if (d == 0) return key(VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD);
+        if (d == 1) return key(VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD);
+        return key(VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD);
+    }
+    if (a == 0 && b == 1) {  // (Cs - Cd) * C + D
+        if (d == 1) return key(fc, fnc, VK_BLEND_OP_ADD);
+        if (d == 2) return key(fc, fc, VK_BLEND_OP_SUBTRACT);
+        return 0;
+    }
+    if (a == 1 && b == 0) {  // (Cd - Cs) * C + D
+        if (d == 0) return key(fnc, fc, VK_BLEND_OP_ADD);
+        if (d == 2) return key(fc, fc, VK_BLEND_OP_REVERSE_SUBTRACT);
+        return 0;
+    }
+    if (a == 0 && b == 2) {  // Cs * C + D
+        if (d == 1) return key(fc, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD);
+        if (d == 2) return key(fc, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD);
+        return 0;
+    }
+    if (a == 1 && b == 2) {  // Cd * C + D
+        if (d == 0) return key(VK_BLEND_FACTOR_ONE, fc, VK_BLEND_OP_ADD);
+        if (d == 2) return key(VK_BLEND_FACTOR_ZERO, fc, VK_BLEND_OP_ADD);
+        return 0;
+    }
+    if (a == 2 && b == 0) {  // -Cs * C + D
+        if (d == 1) return key(fc, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_REVERSE_SUBTRACT);
+        if (d == 0) return key(fnc, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD);
+        return key(VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD);
+    }
+    if (a == 2 && b == 1) {  // -Cd * C + D
+        if (d == 0) return key(VK_BLEND_FACTOR_ONE, fc, VK_BLEND_OP_SUBTRACT);
+        if (d == 1) return key(VK_BLEND_FACTOR_ZERO, fnc, VK_BLEND_OP_ADD);
+        return key(VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD);
+    }
+    return 0;
+}
+
+VkPipeline HwRaster::pipeline_for(const PipelineKey &key) {
+    const auto it = draw_.find(key);
+    if (it != draw_.end()) return it->second;
     VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attrs[4] = {
         {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, x)},
@@ -140,23 +213,37 @@ bool HwRaster::build_pipelines(VkShaderModule module) {
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineColorBlendAttachmentState cba{};
-    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    if (key.blend & 1u) {
+        cba.blendEnable = VK_TRUE;
+        cba.srcColorBlendFactor = static_cast<VkBlendFactor>((key.blend >> 1) & 31u);
+        cba.dstColorBlendFactor = static_cast<VkBlendFactor>((key.blend >> 6) & 31u);
+        cba.colorBlendOp = static_cast<VkBlendOp>((key.blend >> 11) & 7u);
+        // The GS never blends alpha: the source alpha is written as is.
+        cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1;
     cb.pAttachments = &cba;
-    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    const VkDynamicState dyn[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
     VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    ds.dynamicStateCount = 2;
+    ds.dynamicStateCount = 3;
     ds.pDynamicStates = dyn;
     VkPipelineShaderStageCreateInfo stages[2] = {};
     stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = module;
+    stages[0].module = module_;
     stages[0].pName = "hw_vs";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = module;
+    stages[1].module = module_;
     stages[1].pName = "hw_fs";
+    const VkCompareOp ops[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
     VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    dss.depthTestEnable = key.with_depth && key.ztst != 1 ? VK_TRUE : VK_FALSE;
+    dss.depthWriteEnable = key.with_depth && key.zwrite ? VK_TRUE : VK_FALSE;
+    dss.depthCompareOp = ops[key.ztst & 3u];
     VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gpi.stageCount = 2;
     gpi.pStages = stages;
@@ -169,21 +256,14 @@ bool HwRaster::build_pipelines(VkShaderModule module) {
     gpi.pColorBlendState = &cb;
     gpi.pDynamicState = &ds;
     gpi.layout = layout_;
-    const VkCompareOp ops[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
-    for (int mode = 0; mode < 4; ++mode)
-        for (int write = 0; write < 2; ++write)
-            for (int with_depth = 0; with_depth < 2; ++with_depth) {
-                dss = VkPipelineDepthStencilStateCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-                dss.depthTestEnable = with_depth && mode != 1 ? VK_TRUE : VK_FALSE;
-                dss.depthWriteEnable = with_depth && write ? VK_TRUE : VK_FALSE;
-                dss.depthCompareOp = ops[mode];
-                gpi.renderPass = with_depth ? pass_depth_ : pass_nodepth_;
-                if (vkCreateGraphicsPipelines(ctx_->device, VK_NULL_HANDLE, 1, &gpi, nullptr, &draw_[mode][write][with_depth]) != VK_SUCCESS) {
-                    std::fprintf(stderr, "[vk] cannot build the draw pipeline\n");
-                    return false;
-                }
-            }
-    return true;
+    gpi.renderPass = key.with_depth ? pass_depth_ : pass_nodepth_;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(ctx_->device, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipeline) != VK_SUCCESS) {
+        std::fprintf(stderr, "[vk] cannot build a draw pipeline (blend key %x)\n", key.blend);
+        pipeline = VK_NULL_HANDLE;
+    }
+    draw_[key] = pipeline;
+    return pipeline;
 }
 
 bool HwRaster::ensure_target(std::uint32_t width, std::uint32_t height) {
@@ -191,7 +271,7 @@ bool HwRaster::ensure_target(std::uint32_t width, std::uint32_t height) {
     if (t.width >= width && t.height >= height) return true;
     const VkImageUsageFlags color_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     const VkImageUsageFlags depth_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (!ctx_->create_image(t.color, width, height, VK_FORMAT_R32_UINT, color_usage, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+    if (!ctx_->create_image(t.color, width, height, VK_FORMAT_R8G8B8A8_UNORM, color_usage, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
     if (!ctx_->create_image(t.depth, width, height, VK_FORMAT_D32_SFLOAT, depth_usage, VK_IMAGE_ASPECT_DEPTH_BIT)) return false;
     if (!ctx_->create_buffer(t.depth_stage, static_cast<VkDeviceSize>(width) * height * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false)) return false;
     t.width = width;
@@ -287,7 +367,11 @@ bool HwRaster::supported(const gpu::Command &cmd, const std::uint32_t *arena, co
     for (std::uint32_t i = 0; i < cmd.setups; ++i) {
         const std::uint32_t *w = setups + i * kSetupWords;
         const std::uint32_t flags = w[0];
-        if (flags & F_ABE) return no(3);
+        if (flags & F_ABE) {
+            // Blend when the factors map onto the blend unit, colours clamp, and
+            // per-pixel alpha blending (PABE) is off.
+            if ((flags & F_PABE) || !(flags & F_COLCLAMP) || !blend_key(w, ctx_->features.dualSrcBlend == VK_TRUE)) return no(3);
+        }
         if (flags & F_DATE) return no(4);
         if (w[4] != setups[4]) return no(5);  // one frame mask per batch, applied at export
         if (w[3] != 0x00u && w[3] != 0x01u) return no(6);
@@ -481,9 +565,22 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         const bool zte = w[0] & F_ZTE;
         const std::uint32_t ztst = zte ? (w[7] >> 8) & 3u : 1u;
         const bool zwrite = zte && !(w[0] & F_ZMSK);
-        const std::uint32_t words[8] = {setup_offset + si * kSetupWords, 0, scale_, (with_depth ? 1u : 0u) | ((debug & 8u) ? 2u : 0u) | ((debug & 16u) ? 4u : 0u) | ((debug & 32u) ? 8u : 0u) | ((debug & 64u) ? 16u : 0u) | ((debug & 128u) ? 32u : 0u), 0, 0, target_.width, target_.height};
+        const std::uint32_t words[8] = {setup_offset + si * kSetupWords, 0, scale_, (with_depth ? 1u : 0u) | ((debug & 8u) ? 2u : 0u) | ((debug & 16u) ? 4u : 0u), 0, 0, target_.width, target_.height};
         const std::uint32_t uniform = push_uniform(f, words);
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, draw_[ztst][zwrite ? 1 : 0][with_depth ? 1 : 0]);
+        const std::uint32_t blend = (w[0] & F_ABE) ? blend_key(w, ctx_->features.dualSrcBlend == VK_TRUE) : 0u;
+        if (blend & (1u << 14)) {
+            const float fix = static_cast<float>(w[9]) / 128.0f;
+            const float constants[4] = {fix, fix, fix, fix};
+            vkCmdSetBlendConstants(cb, constants);
+        }
+        VkPipeline pipeline = pipeline_for({ztst, zwrite ? 1u : 0u, with_depth ? 1u : 0u, blend});
+        if (!pipeline) {
+            // Pipeline creation failed: leave the batch to the compute path next time.
+            vkCmdEndRenderPass(cb);
+            ++fallback_;
+            return false;
+        }
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         bind(VK_PIPELINE_BIND_POINT_GRAPHICS, uniform);
         vkCmdDraw(cb, counts[run], 1, first[run], 0);
         std::uint32_t j = i + 1;
@@ -524,10 +621,8 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
 void HwRaster::destroy() {
     if (!ctx_ || !ctx_->device) return;
     vkDeviceWaitIdle(ctx_->device);
-    for (auto &row : draw_)
-        for (auto &col : row)
-            for (VkPipeline &p : col)
-                if (p) vkDestroyPipeline(ctx_->device, p, nullptr);
+    for (auto &[key, p] : draw_)
+        if (p) vkDestroyPipeline(ctx_->device, p, nullptr);
     for (VkPipeline p : {import_frame_, export_frame_, export_depth_, import_depth_})
         if (p) vkDestroyPipeline(ctx_->device, p, nullptr);
     if (target_.framebuffer) vkDestroyFramebuffer(ctx_->device, target_.framebuffer, nullptr);

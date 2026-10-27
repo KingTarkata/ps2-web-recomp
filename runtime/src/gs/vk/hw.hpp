@@ -7,6 +7,8 @@
 #include "context.hpp"
 
 #include <cstdint>
+#include <map>
+#include <tuple>
 #include <vector>
 
 namespace ps2::gs::vk {
@@ -49,6 +51,7 @@ private:
     };
 
     bool build_pipelines(VkShaderModule module);
+    VkShaderModule module_ = VK_NULL_HANDLE;
     bool ensure_target(std::uint32_t width, std::uint32_t height);
     bool supported(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params, const std::uint32_t *&setups, std::uint32_t &zmode) const;
     std::uint32_t push_uniform(FrameScratch &f, const std::uint32_t words[8]);
@@ -61,8 +64,17 @@ private:
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkRenderPass pass_depth_ = VK_NULL_HANDLE, pass_nodepth_ = VK_NULL_HANDLE;
     VkPipeline import_frame_ = VK_NULL_HANDLE, export_frame_ = VK_NULL_HANDLE, export_depth_ = VK_NULL_HANDLE, import_depth_ = VK_NULL_HANDLE;
-    // Draw pipelines: [depth test mode 0..3][depth write][has depth attachment]
-    VkPipeline draw_[4][2][2] = {};
+    // Draw pipelines by state: depth mode and write, depth attachment, and the
+    // blend equation (0 when off), built on first use.
+    struct PipelineKey {
+        std::uint32_t ztst, zwrite, with_depth, blend;
+        bool operator<(const PipelineKey &o) const { return std::tie(ztst, zwrite, with_depth, blend) < std::tie(o.ztst, o.zwrite, o.with_depth, o.blend); }
+    };
+    std::map<PipelineKey, VkPipeline> draw_;
+    VkPipeline pipeline_for(const PipelineKey &key);
+    // Packs a GS blend (A, B, C, D selectors with FIX) into Vulkan factors;
+    // 0 when the hardware cannot express it.
+    static std::uint32_t blend_key(const std::uint32_t *setup, bool dual_source);
     Target target_;
     FrameScratch frames_[2];
     FrameScratch *frame_ = nullptr;
