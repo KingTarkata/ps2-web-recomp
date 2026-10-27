@@ -563,3 +563,27 @@ map now has a 256-entry direct-mapped cache in front and a packed
 only re-emits a load; reuse 187058 -> 186899 over the run). load_clut
 3.2 -> 2.4 ms per frame; frames identical. A "same result already in
 the current slot" shortcut was tried first and bought nothing.
+
+### 2026-10-27: DATE on the hardware path tried, parked
+
+Compute-drawn batches cost 4.5 ms of GPU per race frame (17 per frame,
+all DATE). Tried: the colour surface's batch rectangle copied to a
+snapshot image outside the pass (`vkCmdCopyImage`), bound at set 1
+binding 6, and the fragment shader discarding on bit 7 of the snapshot's
+alpha against DATM; DATE setups kept in batches of their own
+(`Device::setup_alone`) because once they count as supported the
+batching layer merges the 17 draws into one or two huge batches, which
+then test one stale snapshot and drag unsupported blends to the compute
+path (first attempt: 200k wrong pixels per frame, GPU 50 ms).
+
+Isolated, the frames are visually identical (cars' paint layers; ±1-3
+blend rounding over the car bodies plus scattered edge pixels, the same
+category as hardware-vs-compute elsewhere), but the GPU profile got
+worse: compute raster 4.5 -> 1.6 ms, hardware raster 34 -> 39 ms, total
+44.6 -> 46.5 ms; threaded 36.5-38 ms (unchanged). The DATE batches
+sample the frame and other surfaces, so each one now costs a pass close,
+a snapshot copy and surface imports ("import-source" closes 761 ->
+5335 over the run). Patch kept at
+`private/notes/date-hw-experiment-2026-10-27.patch`; the stencil form
+would have the same per-batch structure. Not worth it until the
+per-batch fixed cost of the hardware path itself comes down.
