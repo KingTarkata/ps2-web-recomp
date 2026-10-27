@@ -264,3 +264,22 @@ now. The runtime's queue and threads do not change.
 - Next: textures as images sampled with texelFetch instead of swizzled
   buffer loads per fragment (the fragment shader also reloads the setup
   record per fragment); then DATE through stencil; then the depth copies.
+
+### 2026-10-27, afternoon: Switch measurements invalid from 09:19
+
+Every run on the Switch from the hw9 profile (09:19) onward is 7-15x slower
+than the morning runs, on the hardware path and on the compute path alike
+(compute: 978 ms of GPU time per frame against a 57-67 ms baseline), with
+the hardware build fully reverted to the hw8 state as well. `tegrastats`
+under load shows GR3D at 99% with EMC_FREQ at 0%, and the GPU devfreq at
+768 MHz: the memory controller clock is stuck low. No package changed and
+nothing is in the kernel log; the device needs a reboot (or a root-level
+`jetson_clocks --show`) before any number is trusted again. Consequences:
+
+- The effect of carrying the setup record in the per-run uniform block
+  (commit a00568b) is unmeasured. The hw9 figures (raster 372 ms) are not a
+  property of the code.
+- A loop over `hw.setup` with computed indices was tried as the cause and
+  ruled out; so was reading the record from the data arena.
+- Background `ssh` runs that finish while the link is idle can hang on
+  return: use `-o ServerAliveInterval=15` and read the logs on the device.
