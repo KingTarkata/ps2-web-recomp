@@ -26,6 +26,8 @@ extern const std::uint32_t kHwSpvScale2[];
 extern const std::size_t kHwSpvScale2_words;
 extern const std::uint32_t kHwSpvScale3[];
 extern const std::size_t kHwSpvScale3_words;
+#define PS2_HW_VARIANT_DECL(n) extern const std::uint32_t kHwSpvScale1V##n[]; extern const std::size_t kHwSpvScale1V##n##_words;
+PS2_HW_VARIANT_DECL(0) PS2_HW_VARIANT_DECL(1) PS2_HW_VARIANT_DECL(2) PS2_HW_VARIANT_DECL(3) PS2_HW_VARIANT_DECL(4) PS2_HW_VARIANT_DECL(5) PS2_HW_VARIANT_DECL(6) PS2_HW_VARIANT_DECL(7)
 
 namespace ps2::gs::gpu {
 
@@ -307,7 +309,9 @@ bool VkDevice_::init(const Limits &limits, const std::vector<std::uint32_t> &tab
     if (!build_pipelines(limits.scale)) return false;
     const std::uint32_t *hw_code = limits.scale == 2 ? kHwSpvScale2 : limits.scale == 3 ? kHwSpvScale3 : kHwSpvScale1;
     const std::size_t hw_words = limits.scale == 2 ? kHwSpvScale2_words : limits.scale == 3 ? kHwSpvScale3_words : kHwSpvScale1_words;
-    hw_on_ = !std::getenv("PS2_HW_OFF") && hw_.init(ctx_, hw_code, hw_words, layout_, limits.scale);
+    const std::uint32_t *const variants[8] = {kHwSpvScale1V0, kHwSpvScale1V1, kHwSpvScale1V2, kHwSpvScale1V3, kHwSpvScale1V4, kHwSpvScale1V5, kHwSpvScale1V6, kHwSpvScale1V7};
+    const std::size_t variant_words[8] = {kHwSpvScale1V0_words, kHwSpvScale1V1_words, kHwSpvScale1V2_words, kHwSpvScale1V3_words, kHwSpvScale1V4_words, kHwSpvScale1V5_words, kHwSpvScale1V6_words, kHwSpvScale1V7_words};
+    hw_on_ = !std::getenv("PS2_HW_OFF") && hw_.init(ctx_, hw_code, hw_words, limits.scale == 1 ? variants : nullptr, variant_words, layout_, limits.scale);
     std::fprintf(stderr, "[gpu] %s via Vulkan (%s)\n", ctx_.name.c_str(), hw_on_ ? "hardware rasterizer with compute fallback" : "compute rasterizer only");
     return true;
 }
@@ -427,6 +431,7 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
         vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
         if (timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, i * 2 + 1);
     }
+    if (hw_on_) hw_.end_frame(cb);
     if (queries && !per_command) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, base + 1);
     // Make the results visible to transfers (read-backs) and the host.
     VkMemoryBarrier done{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

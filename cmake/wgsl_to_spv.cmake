@@ -3,6 +3,13 @@
 # the caller passes SCALE and the source is rewritten to a constant first.
 #   cmake -DNAGA=... -DSRC=gs.wgsl -DOUT=gs_scale2.cpp -DNAME=kGsSpvScale2 -DSCALE=2 -DWORK=dir -P wgsl_to_spv.cmake
 file(READ "${SRC}" wgsl)
+# hw.wgsl specialises its fragment shader on HW_VARIANT (bit 0 textured, bit 1
+# may discard, bit 2 fogged); 0xFFFFFFFF decides at run time from the setup.
+if(DEFINED VARIANT)
+    string(PREPEND wgsl "const HW_VARIANT: u32 = ${VARIANT}u;\n")
+else()
+    string(PREPEND wgsl "const HW_VARIANT: u32 = 0xFFFFFFFFu;\n")
+endif()
 if(APPEND)
     file(READ "${APPEND}" extra)
     # hw.wgsl writes a second blend source; the directive has to lead the module.

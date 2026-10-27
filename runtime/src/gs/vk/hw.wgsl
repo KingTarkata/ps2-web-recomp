@@ -30,6 +30,20 @@ struct HwParams {
 
 // The setup record from the uniform copy, field by field (see load_setup in
 // gs.wgsl for why there is no intermediate array).
+// Fragment shader specialisation. The generic module (HW_VARIANT all ones)
+// reads the setup; a specialised module fixes texturing (bit 0), whether the
+// shader may discard (bit 1: alpha test or scan mask), and fog (bit 2), so
+// the compiler drops the rest and, without discards, tests depth early.
+fn v_on(s: Setup, flag: u32, bit: u32) -> bool {
+    if (HW_VARIANT == 0xFFFFFFFFu) {
+        return has(s, flag);
+    }
+    return (HW_VARIANT & bit) != 0u;
+}
+fn v_may_discard() -> bool {
+    return HW_VARIANT == 0xFFFFFFFFu || (HW_VARIANT & 2u) != 0u;
+}
+
 fn setup_u() -> Setup {
     var s: Setup;
     s.flags = hw.setup[0].x;
@@ -171,12 +185,12 @@ fn hw_fs(i: VsOut) -> FsOut {
     let sy = u32(i.clip.y);
     let x = i32(sx / hw.scale);
     let y = i32(sy / hw.scale);
-    if (x < s.scax0 || x > s.scax1 || y < s.scay0 || y > s.scay1) {
-        discard;
-    }
-    let scanmsk = mode(s, 28u, 2u);
-    if ((scanmsk == 2u && (y & 1) == 0) || (scanmsk == 3u && (y & 1) != 0)) {
-        discard;
+    // The GS scissor is the Vulkan scissor rectangle (set per setup by the host).
+    if (v_may_discard()) {
+        let scanmsk = mode(s, 28u, 2u);
+        if ((scanmsk == 2u && (y & 1) == 0) || (scanmsk == 3u && (y & 1) != 0)) {
+            discard;
+        }
     }
     let k = (sy % hw.scale) * hw.scale + sx % hw.scale;
     var r = i32(i.color.x);
@@ -326,19 +340,19 @@ fn hw_fs_cached(i: VsOut) -> FsOut {
     let sy = u32(i.clip.y);
     let x = i32(sx / hw.scale);
     let y = i32(sy / hw.scale);
-    if (x < s.scax0 || x > s.scax1 || y < s.scay0 || y > s.scay1) {
-        discard;
-    }
-    let scanmsk = mode(s, 28u, 2u);
-    if ((scanmsk == 2u && (y & 1) == 0) || (scanmsk == 3u && (y & 1) != 0)) {
-        discard;
+    // The GS scissor is the Vulkan scissor rectangle (set per setup by the host).
+    if (v_may_discard()) {
+        let scanmsk = mode(s, 28u, 2u);
+        if ((scanmsk == 2u && (y & 1) == 0) || (scanmsk == 3u && (y & 1) != 0)) {
+            discard;
+        }
     }
     let k = (sy % hw.scale) * hw.scale + sx % hw.scale;
     var r = i32(i.color.x);
     var g = i32(i.color.y);
     var b = i32(i.color.z);
     var a = i32(i.color.w);
-    if (has(s, F_TME) && (hw.flags & 128u) == 0u) {  // bit 7: debug, skip sampling
+    if (v_on(s, F_TME, 1u) && (hw.flags & 128u) == 0u) {  // bit 7: debug, skip sampling
         var u: f32;
         var v: f32;
         if (has(s, F_FST)) {
@@ -351,6 +365,10 @@ fn hw_fs_cached(i: VsOut) -> FsOut {
             }
             u = i.tex.x / q * f32(1u << s.tw);
             v = i.tex.y / q * f32(1u << s.th);
+        }
+        if ((hw.flags & 512u) != 0u) {  // debug: one texel for every fragment (texture bandwidth vs sampling maths)
+            u = 0.0;
+            v = 0.0;
         }
         let t = sample_cached(s, u, v);  // this variant only ever samples the bound texture image
         if ((hw.flags & 4u) != 0u) {
@@ -396,7 +414,7 @@ fn hw_fs_cached(i: VsOut) -> FsOut {
             }
         }
     }
-    if (has(s, F_FGE)) {
+    if (v_on(s, F_FGE, 4u)) {
         let f = i32(i.tex.w);
         let fr = i32(s.fogcol & 0xFFu);
         let fg = i32((s.fogcol >> 8u) & 0xFFu);
@@ -405,7 +423,7 @@ fn hw_fs_cached(i: VsOut) -> FsOut {
         g = (f * g + (255 - f) * fg) >> 8u;
         b = (f * b + (255 - f) * fb) >> 8u;
     }
-    if (has(s, F_ATE)) {
+    if (v_may_discard() && has(s, F_ATE)) {
         let av = u32(a);
         var ok = false;
         switch mode(s, 0u, 3u) {
@@ -457,6 +475,17 @@ fn hw_fs_cached(i: VsOut) -> FsOut {
             o.color = vec4<f32>(vec3<f32>(f32(r), f32(g), f32(b)) * (1.0 + c) / 255.0, f32(out_a) / 255.0);
         }
     }
+    return o;
+}
+
+// Measurement only (PS2_HW_DEBUG 4194304): one output, no blend, no tests.
+struct FsMin {
+    @location(0) color: vec4<f32>,
+};
+@fragment
+fn hw_fs_min(i: VsOut) -> FsMin {
+    var o: FsMin;
+    o.color = i.color / 255.0;
     return o;
 }
 

@@ -31,7 +31,8 @@ public:
     // created here, so a driver that rejects it only costs the hardware path.
     // `set0` is the compute renderer's buffer set layout, bound as set 0 of
     // every pipeline here too.
-    bool init(Context &ctx, const std::uint32_t *code, std::size_t words, VkDescriptorSetLayout set0, std::uint32_t scale);
+    // `variants`: eight specialised modules (hw.wgsl HW_VARIANT 0-7) or nulls.
+    bool init(Context &ctx, const std::uint32_t *code, std::size_t words, const std::uint32_t *const variants[8], const std::size_t variant_words[8], VkDescriptorSetLayout set0, std::uint32_t scale);
     void destroy();
 
     // Called while recording a command buffer, before the device would
@@ -64,6 +65,7 @@ public:
     // (vertex and uniform rings) belongs to the frame slot in flight, and
     // objects retired two submits ago can go.
     void begin_frame(int slot);
+    void end_frame(VkCommandBuffer cb);  // closes the per-frame fragment count (PS2_HW_DEBUG 1048576)
     std::uint64_t drawn_batches() const { return drawn_; }
     std::uint64_t fallback_batches() const { return fallback_; }
     void print_reasons() const;
@@ -217,12 +219,13 @@ private:
     VkRenderPass pass_depth_ = VK_NULL_HANDLE, pass_nodepth_ = VK_NULL_HANDLE;
     VkPipeline import_frame_ = VK_NULL_HANDLE, export_frame_ = VK_NULL_HANDLE, export_depth_ = VK_NULL_HANDLE, import_depth_ = VK_NULL_HANDLE;
     VkShaderModule module_ = VK_NULL_HANDLE;
+    VkShaderModule variant_modules_[8] = {};  // specialised fragment shaders, or null
     // Draw pipelines by state: depth mode and write, depth attachment, the
     // blend equation (0 when off) and the colour write mask, built on first use.
     struct PipelineKey {
-        std::uint32_t ztst, zwrite, with_depth, blend, wmask, shader;  // shader 0: hw_fs, 1: hw_fs_cached
-        bool operator<(const PipelineKey &o) const { return std::tie(ztst, zwrite, with_depth, blend, wmask, shader) < std::tie(o.ztst, o.zwrite, o.with_depth, o.blend, o.wmask, o.shader); }
-        bool operator==(const PipelineKey &o) const { return std::tie(ztst, zwrite, with_depth, blend, wmask, shader) == std::tie(o.ztst, o.zwrite, o.with_depth, o.blend, o.wmask, o.shader); }
+        std::uint32_t ztst, zwrite, with_depth, blend, wmask, shader, variant;  // shader 0: hw_fs, 1: hw_fs_cached; variant 0-7 specialised module, 0xFF generic
+        bool operator<(const PipelineKey &o) const { return std::tie(ztst, zwrite, with_depth, blend, wmask, shader, variant) < std::tie(o.ztst, o.zwrite, o.with_depth, o.blend, o.wmask, o.shader, o.variant); }
+        bool operator==(const PipelineKey &o) const { return std::tie(ztst, zwrite, with_depth, blend, wmask, shader, variant) == std::tie(o.ztst, o.zwrite, o.with_depth, o.blend, o.wmask, o.shader, o.variant); }
     };
     std::map<PipelineKey, VkPipeline> draw_;
     struct RecentPipeline {
@@ -267,6 +270,11 @@ private:
     FrameScratch frames_[2];
     FrameScratch *frame_ = nullptr;
     int slot_ = 0;
+    // PS2_HW_DEBUG 1048576: an occlusion query over each frame's draws counts
+    // the fragments that reach the colour stage (after depth), for fill-rate maths.
+    VkQueryPool occlusion_ = VK_NULL_HANDLE;
+    bool query_open_ = false, query_used_[2] = {};
+    std::uint64_t fragments_ = 0, fragment_frames_ = 0;
     std::uint64_t drawn_ = 0, fallback_ = 0;
     std::uint64_t imported_px_ = 0, exported_px_ = 0, evictions_ = 0, uniform_overflows_ = 0, alias_batches_ = 0;
     // Why batches fell back, by the first reason met (see hw.cpp kReasons).

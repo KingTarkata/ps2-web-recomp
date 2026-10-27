@@ -343,3 +343,33 @@ kick, draw: 22 ms per frame, shared code), the compute tile lists built
 for batches the hardware draws (about 3 ms), the SDL presentation path
 (two copies of the frame plus a GPU read-back: about 3 ms and a sync),
 and the 48-byte vertex format.
+
+### 2026-10-27, night: where the GPU time is, by elimination
+
+Fragment shader variants (hw.wgsl `HW_VARIANT`: textured, may discard,
+fogged; eight modules compiled for scale 1, chosen per setup) and the GS
+scissor moved from an in-shader discard to the Vulkan scissor rectangle, so
+most pipelines never discard and can test depth early. Native frames are
+bit-identical. Gain: raster 32.5 -> 31.5 ms (`PS2_HW_GENERIC=1` A/B),
+threaded 41-42.5 -> 38-40.5 ms. Small, which forced the measurements below
+(all race frames 6050-6650, raster ms per frame):
+
+| Experiment (`PS2_HW_DEBUG`) | raster |
+|---|---|
+| full shader | 31.5 |
+| sampling skipped (16384) | 22.8 |
+| sample one constant texel (524288): texture bandwidth removed, maths kept | 30.7 |
+| trivial shader, every fragment painted (8) | 17.8 |
+| single-output shader, no blend (4194304) | 17.6 |
+| same without a depth attachment (12582912) | 13.5 |
+| whole surface as render area (2097152) | 31.6 |
+
+Fragments reaching the colour stage (occlusion query, 1048576): about 5 M
+per frame. So: texture bandwidth is nothing; the sampling code is ~8 ms of
+instructions; depth traffic ~4 ms; and a 13.5 ms floor remains with a
+shader that does nothing, no blend and no depth, for a few million
+fragments, i.e. the GPU is mostly draining: 230 render passes per frame,
+each between full pipeline barriers. Next: keep one render pass open across
+consecutive batches on the same surfaces when nothing needs the pass closed
+(no imports, write-backs, texture decodes or copies), with the whole
+surface as render area (the area costs nothing).

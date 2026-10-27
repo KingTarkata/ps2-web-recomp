@@ -58,7 +58,7 @@ std::uint32_t z_at(std::uint32_t z0, float d) {
 
 }
 
-bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, VkDescriptorSetLayout set0, std::uint32_t scale) {
+bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, const std::uint32_t *const variants[8], const std::size_t variant_words[8], VkDescriptorSetLayout set0, std::uint32_t scale) {
     ctx_ = &ctx;
     scale_ = scale;
     VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -68,6 +68,20 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     if (vkCreateShaderModule(ctx.device, &mci, nullptr, &module) != VK_SUCCESS) {
         std::fprintf(stderr, "[vk] the driver rejected the hardware raster shaders\n");
         return false;
+    }
+    if (std::getenv("PS2_HW_DEBUG") && (static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) & 1048576u)) {
+        VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qci.queryType = VK_QUERY_TYPE_OCCLUSION;
+        qci.queryCount = 2;
+        if (vkCreateQueryPool(ctx.device, &qci, nullptr, &occlusion_) != VK_SUCCESS) occlusion_ = VK_NULL_HANDLE;
+    }
+    for (int v = 0; v < 8; ++v) {
+        variant_modules_[v] = VK_NULL_HANDLE;
+        if (!variants || !variants[v] || std::getenv("PS2_HW_GENERIC")) continue;  // PS2_HW_GENERIC: the unspecialised shader only, for A/B runs
+        VkShaderModuleCreateInfo vci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        vci.codeSize = variant_words[v] * 4;
+        vci.pCode = variants[v];
+        if (vkCreateShaderModule(ctx.device, &vci, nullptr, &variant_modules_[v]) != VK_SUCCESS) variant_modules_[v] = VK_NULL_HANDLE;
     }
     VkDescriptorSetLayoutBinding b[6] = {};
     b[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, nullptr};
@@ -382,8 +396,8 @@ VkPipeline HwRaster::pipeline_for(const PipelineKey &key) {
     stages[0].module = module_;
     stages[0].pName = "hw_vs";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = module_;
-    stages[1].pName = key.shader ? "hw_fs_cached" : "hw_fs";
+    stages[1].module = key.variant < 8 && variant_modules_[key.variant] ? variant_modules_[key.variant] : module_;
+    stages[1].pName = key.shader == 2 ? "hw_fs_min" : key.shader ? "hw_fs_cached" : "hw_fs";
     const VkCompareOp ops[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
     VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     // Vulkan drops depth writes whenever the depth test is off, so a GS
@@ -416,6 +430,16 @@ VkPipeline HwRaster::pipeline_for(const PipelineKey &key) {
 void HwRaster::begin_frame(int slot) {
     slot_ = slot & 1;
     frame_ = &frames_[slot_];
+    query_open_ = false;
+    if (occlusion_ && query_used_[slot_]) {
+        // This slot's last submission has been waited on: its count is ready.
+        std::uint64_t count = 0;
+        if (vkGetQueryPoolResults(ctx_->device, occlusion_, static_cast<std::uint32_t>(slot_), 1, sizeof count, &count, sizeof count, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+            fragments_ += count;
+            ++fragment_frames_;
+        }
+        query_used_[slot_] = false;
+    }
     frame_->vertex_used = frame_->uniform_used = 0;
     ++submits_;
     // Both frame slots have been waited on since these were retired.
@@ -452,7 +476,15 @@ std::uint32_t HwRaster::push_uniform(FrameScratch &f, const std::uint32_t words[
 // writing, lines, points, upscaling, and batches that read their own target.
 const char *const kReasons[12] = {"scale", "empty", "snapshot", "blend", "date", "fbmsk", "fpsm", "ztst never", "zpsm", "atest fail mode", "prim kind", "scratch full"};
 
+void HwRaster::end_frame(VkCommandBuffer cb) {
+    if (!query_open_) return;
+    vkCmdEndQuery(cb, occlusion_, static_cast<std::uint32_t>(slot_));
+    query_used_[slot_] = true;
+    query_open_ = false;
+}
+
 void HwRaster::print_reasons() const {
+    if (fragment_frames_) std::fprintf(stderr, "[vk] fragments: %.2f M per frame reached the colour stage over %llu frames (hardware-drawn batches)\n", static_cast<double>(fragments_) / static_cast<double>(fragment_frames_) / 1e6, static_cast<unsigned long long>(fragment_frames_));
     std::fprintf(stderr, "[vk] surfaces: %zu resident, %.1f Mpx imported, %.1f Mpx written back, %llu evictions, %llu aliased batches, %llu uniform overflows\n", surfaces_.size(), static_cast<double>(imported_px_) / 1e6,
                  static_cast<double>(exported_px_) / 1e6, static_cast<unsigned long long>(evictions_), static_cast<unsigned long long>(alias_batches_), static_cast<unsigned long long>(uniform_overflows_));
     std::fprintf(stderr, "[vk] textures: %zu resident, %llu decoded, %llu hits, %llu sampled from surfaces, %llu copied from own surface; block writes by commands %llu, write-backs %llu, own draws %llu; evictions %llu, stale at lookup %llu\n", textures_.size(),
@@ -1598,7 +1630,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
             std::fprintf(stderr, "[hw]   prim %u setup %u kind %u box %u,%u-%u,%u xy %.1f,%.1f %.1fx%.1f z %08x c %08x %08x\n", i, r[0], r[1], r[2] & 0xFFFFu, r[2] >> 16, r[3] & 0xFFFFu, r[3] >> 16, fat(r[4]), fat(r[5]), fat(r[6]), fat(r[7]), r[24], r[12], r[13]);
         }
     }
-    const bool with_depth = zmode != 0;
+    const bool with_depth = zmode != 0 && !(debug & 8388608u);  // debug: measure without a depth attachment
     bool zwrite_any = false, color_any = false;
     for (std::uint32_t i = 0; i < cmd.setups; ++i) {
         const std::uint32_t *w = setups + i * kSetupWords;
@@ -1677,6 +1709,12 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     rbi.renderPass = with_depth ? pass_depth_ : pass_nodepth_;
     rbi.framebuffer = framebuffer;
     rbi.renderArea = {{static_cast<std::int32_t>(minx * scale_), static_cast<std::int32_t>(miny * scale_)}, {(maxx - minx + 1) * scale_, (maxy - miny + 1) * scale_}};
+    if (debug & 2097152u) rbi.renderArea = {{0, 0}, {color->width * scale_, color->height * scale_}};  // debug: whole-surface render area (does pass cost follow the area?)
+    if (occlusion_ && !query_open_) {
+        vkCmdResetQueryPool(cb, occlusion_, static_cast<std::uint32_t>(slot_), 1);
+        vkCmdBeginQuery(cb, occlusion_, static_cast<std::uint32_t>(slot_), 0);
+        query_open_ = true;
+    }
     vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     // The viewport is the whole GS drawing space, not the surface: clipping
     // primitives at the surface edge would re-interpolate their attributes
@@ -1708,12 +1746,35 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         write_mask(w[4], wmask);
         const VkDescriptorSet texture = textures[si];
         if (texture) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 2, 1, &texture, 0, nullptr);
-        const std::uint32_t base_flags = (with_depth ? 1u : 0u) | ((debug & 8u) ? 2u : 0u) | ((debug & 16u) ? 4u : 0u) | ((blend >> 15) & 1u) << 4 | ((blend >> 16) & 1u) << 5 | ((debug & 16384u) ? 128u : 0u) | (texture ? 256u : 0u);
+        const std::uint32_t base_flags = (with_depth ? 1u : 0u) | ((debug & 8u) ? 2u : 0u) | ((debug & 16u) ? 4u : 0u) | ((blend >> 15) & 1u) << 4 | ((blend >> 16) & 1u) << 5 | ((debug & 16384u) ? 128u : 0u) | (texture ? 256u : 0u) | ((debug & 524288u) ? 512u : 0u);
+        // The GS scissor (inclusive, GS pixels) as the Vulkan scissor, within
+        // the render area; an empty one skips the draws.
+        bool skip_draw = false;
+        {
+            const std::int32_t sx0 = static_cast<std::int32_t>((w[10] & 0xFFFFu) * scale_), sx1 = static_cast<std::int32_t>(((w[10] >> 16) + 1) * scale_);
+            const std::int32_t sy0 = static_cast<std::int32_t>((w[11] & 0xFFFFu) * scale_), sy1 = static_cast<std::int32_t>(((w[11] >> 16) + 1) * scale_);
+            const std::int32_t ax0 = rbi.renderArea.offset.x, ay0 = rbi.renderArea.offset.y;
+            const std::int32_t ax1 = ax0 + static_cast<std::int32_t>(rbi.renderArea.extent.width), ay1 = ay0 + static_cast<std::int32_t>(rbi.renderArea.extent.height);
+            const std::int32_t x0 = std::max(sx0, ax0), y0 = std::max(sy0, ay0), x1 = std::min(sx1, ax1), y1 = std::min(sy1, ay1);
+            if (x0 >= x1 || y0 >= y1) {
+                skip_draw = true;
+            } else {
+                const VkRect2D sc{{x0, y0}, {static_cast<std::uint32_t>(x1 - x0), static_cast<std::uint32_t>(y1 - y0)}};
+                vkCmdSetScissor(cb, 0, 1, &sc);
+            }
+        }
+        // Specialised fragment shader: textured (cached image), may discard
+        // (alpha test that can fail, or a scan mask), fogged. Setups that
+        // sample memory keep the generic shader.
+        const bool cached_fs = (base_flags & 256u) && !(debug & 262144u);
+        const bool may_discard = ((w[0] & F_ATE) && ((w[7] & 7u) != 1u)) || (((w[7] >> 28) & 3u) != 0u);
+        const std::uint32_t variant = (!(w[0] & F_TME) || cached_fs) ? ((cached_fs ? 1u : 0u) | (may_discard ? 2u : 0u) | ((w[0] & 4u) ? 4u : 0u)) : 0xFFu;
         const auto bind_draw = [&](std::uint32_t flags, bool write_z, std::uint32_t mask) -> bool {
             std::uint32_t words[kUniformWords] = {setup_offset + si * kSetupWords, 0, 0, flags, 0, 0, kTargetSize * scale_, kTargetSize * scale_, scale_, p[5], p[6], 0};
             std::memcpy(words + 12, w, kSetupWords * 4);
             const std::uint32_t uniform = push_uniform(f, words);
-            VkPipeline pipeline = pipeline_for({ztst, write_z ? 1u : 0u, with_depth ? 1u : 0u, blend & 0x7FFFu, mask, (flags & 256u) && !(debug & 262144u) ? 1u : 0u});
+            VkPipeline pipeline = (debug & 4194304u) ? pipeline_for({ztst, write_z ? 1u : 0u, with_depth ? 1u : 0u, 0u, 0xFu, 2u, 0xFFu})  // debug: minimal fragment shader, single output, no blend
+                                                   : pipeline_for({ztst, write_z ? 1u : 0u, with_depth ? 1u : 0u, blend & 0x7FFFu, mask, variant < 8 ? 1u : cached_fs ? 1u : 0u, variant});
             if (!pipeline) return false;
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             bind(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, set0, color->set1[slot_], param_offset, uniform);
@@ -1731,14 +1792,14 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
             for (std::uint32_t k = i; k < j && built; ++k) {
                 const std::uint32_t verts = prims[k * kPrimWords + 1] == 0 ? 3u : 6u;
                 built = bind_draw(base_flags, false, wmask & ~static_cast<std::uint32_t>(VK_COLOR_COMPONENT_A_BIT));
-                if (built) vkCmdDraw(cb, verts, 1, first, 0);
+                if (built && !skip_draw) vkCmdDraw(cb, verts, 1, first, 0);
                 if (built) built = bind_draw(base_flags | 64u, zwrite, wmask);
-                if (built) vkCmdDraw(cb, verts, 1, first, 0);
+                if (built && !skip_draw) vkCmdDraw(cb, verts, 1, first, 0);
                 first += verts;
             }
         } else if (afail == 0) {
             built = bind_draw(base_flags, zwrite, wmask);
-            if (built) vkCmdDraw(cb, counts[run], 1, firsts[run], 0);
+            if (built && !skip_draw) vkCmdDraw(cb, counts[run], 1, firsts[run], 0);
         } else {
             // Per primitive: the passing fragments with full writes, then
             // the failing ones with what the mode keeps: 1 colour only,
@@ -1749,9 +1810,9 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
             for (std::uint32_t k = i; k < j && built; ++k) {
                 const std::uint32_t verts = prims[k * kPrimWords + 1] == 0 ? 3u : 6u;
                 built = bind_draw(base_flags, zwrite, wmask);
-                if (built) vkCmdDraw(cb, verts, 1, first, 0);
+                if (built && !skip_draw) vkCmdDraw(cb, verts, 1, first, 0);
                 if (built) built = bind_draw(base_flags | 8u, fail_z, fail_mask);
-                if (built) vkCmdDraw(cb, verts, 1, first, 0);
+                if (built && !skip_draw) vkCmdDraw(cb, verts, 1, first, 0);
                 first += verts;
             }
         }
@@ -1843,6 +1904,9 @@ void HwRaster::destroy() {
     if (layout_) vkDestroyPipelineLayout(ctx_->device, layout_, nullptr);
     if (set1_layout_) vkDestroyDescriptorSetLayout(ctx_->device, set1_layout_, nullptr);
     if (module_) vkDestroyShaderModule(ctx_->device, module_, nullptr);
+    if (occlusion_) vkDestroyQueryPool(ctx_->device, occlusion_, nullptr);
+    for (VkShaderModule &m : variant_modules_)
+        if (m) vkDestroyShaderModule(ctx_->device, m, nullptr);
 }
 
 }

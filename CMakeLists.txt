@@ -82,6 +82,15 @@ if(PS2_GS_VK AND NOT EMSCRIPTEN AND EXISTS "${PS2_VULKAN_HEADERS}/vulkan/vulkan.
             DEPENDS runtime/src/gs/gpu/gs.wgsl runtime/src/gs/vk/hw.wgsl cmake/wgsl_to_spv.cmake)
         list(APPEND PS2_SPV_SOURCES "${out}")
     endforeach()
+    # Specialised fragment shaders (hw.wgsl HW_VARIANT) for native resolution,
+    # the only scale the hardware path draws at.
+    foreach(variant 0 1 2 3 4 5 6 7)
+        set(out "${PS2_SPV_DIR}/hw_scale1_v${variant}.cpp")
+        add_custom_command(OUTPUT "${out}"
+            COMMAND ${CMAKE_COMMAND} -DNAGA=${PS2_NAGA} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DAPPEND=${CMAKE_SOURCE_DIR}/runtime/src/gs/vk/hw.wgsl -DOUT=${out} -DNAME=kHwSpvScale1V${variant} -DSCALE=1 -DVARIANT=${variant} -DWORK=${PS2_SPV_DIR} -P ${CMAKE_SOURCE_DIR}/cmake/wgsl_to_spv.cmake
+            DEPENDS runtime/src/gs/gpu/gs.wgsl runtime/src/gs/vk/hw.wgsl cmake/wgsl_to_spv.cmake)
+        list(APPEND PS2_SPV_SOURCES "${out}")
+    endforeach()
     set(out "${PS2_SPV_DIR}/blit.cpp")
     add_custom_command(OUTPUT "${out}"
         COMMAND ${CMAKE_COMMAND} -DNAGA=${PS2_NAGA} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/blit.wgsl -DOUT=${out} -DNAME=kBlitSpv -DWORK=${PS2_SPV_DIR} -P ${CMAKE_SOURCE_DIR}/cmake/wgsl_to_spv.cmake
