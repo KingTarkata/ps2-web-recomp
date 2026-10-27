@@ -119,7 +119,7 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     pli.pSetLayouts = sets;
     if (vkCreatePipelineLayout(ctx.device, &pli, nullptr, &layout_) != VK_SUCCESS) return false;
     // One set per surface and frame slot; surfaces come and go, so sets are freed.
-    const std::uint32_t max_sets = static_cast<std::uint32_t>(kMaxSurfaces) * 4 + 2;
+    const std::uint32_t max_sets = static_cast<std::uint32_t>(kMaxSurfaces + kMaxChains) * 4 + 2;
     VkDescriptorPoolSize sizes[4] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, max_sets}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, max_sets * 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, max_sets * 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, max_sets}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -127,7 +127,7 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     dpi.poolSizeCount = 4;
     dpi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx.device, &dpi, nullptr, &pool_) != VK_SUCCESS) return false;
-    const std::uint32_t max_tex = static_cast<std::uint32_t>(kMaxTextures + kMaxSurfaces) * 2 + 8;
+    const std::uint32_t max_tex = static_cast<std::uint32_t>(kMaxTextures + kMaxSurfaces + kMaxChains) * 2 + 8;
     VkDescriptorPoolSize sizes2[3] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, max_tex}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, max_tex}, {VK_DESCRIPTOR_TYPE_SAMPLER, max_tex * 4}};
     VkDescriptorPoolCreateInfo dpi2{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi2.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -514,40 +514,293 @@ bool HwRaster::held_conflict(const gpu::Command &cmd) const {
     return false;
 }
 
-HwRaster::Surface *HwRaster::viewable_surface(const gpu::Span &span, const Surface *color, const Surface *depth) {
+// A 32/24-bit colour surface (not this batch's own) holding part of `span`
+// dirty: it has pixels VRAM does not, so a decode would force a write-back.
+HwRaster::Surface *HwRaster::dirty_surface_for(const gpu::Span &span, const Surface *color, const Surface *depth) {
     if (span.hi <= span.lo) return nullptr;
     for (auto &sp : surfaces_) {
         Surface &s = *sp;
-        if (s.depth || !s.image.image || !s.set2 || (s.psm != 0x00u && s.psm != 0x01u) || &s == color || &s == depth) continue;
+        if (s.depth || !s.image.image || !s.set2 || (s.psm != 0x00u && s.psm != 0x01u) || &s == color || &s == depth || !s.plane.dirty_count) continue;
         const std::uint64_t base = static_cast<std::uint64_t>(s.bp) * 256, end = base + static_cast<std::uint64_t>(s.height / 32) * s.bw * 8192;
-        if (span.lo >= base && span.hi <= end) return &s;
+        if (span.lo < base || span.hi > end) continue;
+        Rect r;
+        if (span_rect(s, span, r) && !tile_rects(s.plane, r, [](const Plane &q, std::uint32_t t) { return q.dirty[t]; }).empty()) return &s;
     }
     return nullptr;
 }
 
-HwRaster::Plan HwRaster::plan(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) {
+HwRaster::Surface *HwRaster::viewable_surface(const gpu::Span &span, const Surface *color, const Surface *depth) {
+    if (span.hi <= span.lo) return nullptr;
+    // Aliasing surfaces (a 448-row frame and its lower half as a buffer of
+    // its own) can both hold the span: the one whose tiles there are valid
+    // needs no import, so it wins.
+    Surface *fallback = nullptr;
+    for (auto &sp : surfaces_) {
+        Surface &s = *sp;
+        if (s.depth || !s.image.image || !s.set2 || (s.psm != 0x00u && s.psm != 0x01u) || &s == color || &s == depth) continue;
+        const std::uint64_t base = static_cast<std::uint64_t>(s.bp) * 256, end = base + static_cast<std::uint64_t>(s.height / 32) * s.bw * 8192;
+        if (span.lo < base || span.hi > end) continue;
+        Rect r;
+        if (span_rect(s, span, r) && tile_rects(s.plane, r, [](const Plane &q, std::uint32_t t) { return !q.valid[t]; }).empty()) return &s;
+        if (!fallback) fallback = &s;
+    }
+    return fallback;
+}
+
+HwRaster::Plan HwRaster::plan(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params, bool depends_on_held) {
     const std::uint32_t *setups = nullptr;
     std::uint32_t zmode = 0;
     if (!supported(cmd, arena, params, setups, zmode)) {
         ++fallback_;
         return Plan::Declined;
     }
-    if (!pass_cb_) return Plan::Draw;
     static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
-    if (debug & 16777216u) return Plan::Draw;  // debug: never hold a batch back
+    if (debug & 16777216u) return Plan::Draw;  // debug: never hold a batch back (order is then the device's problem: measurement only)
+    if (!cmd.ranged) return Plan::Draw;
+    if (depends_on_held) return Plan::Hold;  // after what it depends on
+    if (!pass_cb_) return Plan::Draw;
+    if (targets_open_pass(cmd, arena, params, VersionRef{})) return Plan::Draw;
+    return Plan::Hold;  // other surfaces: the open pass goes on
+}
+
+bool HwRaster::targets_open_pass(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params, const VersionRef &write) {
+    if (!pass_cb_) return false;
+    if (write.chain) return pass_color_ == write.chain->atlas.get() && !pass_with_depth_;
+    const std::uint32_t *setups = nullptr;
+    std::uint32_t zmode = 0;
+    if (!supported(cmd, arena, params, setups, zmode)) return false;
+    static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
     const bool with_depth = zmode != 0 && !(debug & 8388608u);
     Surface *color = find_surface(setups[1], setups[2], setups[3], false);
     Surface *depth = with_depth ? find_surface(setups[5], setups[2], setups[6], true) : nullptr;
-    if (color == pass_color_ && depth == pass_depth_ && with_depth == pass_with_depth_) return Plan::Draw;
-    // Other surfaces: hold it unless something held back or drawn must come
-    // first (then draw() closes the pass and switches).
+    return color == pass_color_ && depth == pass_depth_ && with_depth == pass_with_depth_;
+}
+
+bool HwRaster::batch_textured(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) const {
+    if (cmd.pipeline != gpu::kRaster || !cmd.setups) return false;
+    const std::uint32_t *setups = arena + (params + cmd.param * (gpu::kParamStride / 4))[2];
+    for (std::uint32_t i = 0; i < cmd.setups; ++i)
+        if (setups[i * kSetupWords] & F_TME) return true;
+    return false;
+}
+
+gpu::Span HwRaster::chain_span(const Chain &c) const { return rect_span(*c.surface, c.rect); }
+
+HwRaster::VersionRef HwRaster::version_write(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) {
     static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
-    const bool conflict = !cmd.ranged || deferred_conflict(cmd) || held_conflict(cmd);
-    if (frame_count() == trace_frame)
-        std::fprintf(stderr, "[pass] f%llu plan: batch for %u/%u/%02x%s while pass on %u/%u/%02x%s: %s\n", static_cast<unsigned long long>(frame_count()), setups[1], setups[2], setups[3], with_depth ? " +z" : "", pass_color_->bp, pass_color_->bw, pass_color_->psm,
-                     pass_depth_ ? " +z" : "", conflict ? "draw (conflict)" : "hold");
-    if (conflict) return Plan::Draw;
-    return Plan::Hold;
+    const auto no = [&](int why) -> VersionRef {
+        if (frame_count() == trace_frame) std::fprintf(stderr, "[pass] f%llu no version: reason %d\n", static_cast<unsigned long long>(frame_count()), why);
+        return VersionRef{};
+    };
+    static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
+    if (debug & 67108864u) return no(2);  // debug: no scratch versioning
+    const std::uint32_t *setups = nullptr;
+    std::uint32_t zmode = 0;
+    if (!cmd.ranged || !supported(cmd, arena, params, setups, zmode) || zmode != 0 || setups[3] != 0x00u) return no(3);
+    const std::uint32_t *p = params + cmd.param * (gpu::kParamStride / 4);
+    const std::uint32_t *prims = arena + p[1];
+    std::uint32_t minx = ~0u, miny = ~0u, maxx = 0, maxy = 0;
+    for (std::uint32_t i = 0; i < cmd.prims; ++i) {
+        if (prims[i * kPrimWords + 1] != 1u) return no(4);  // sprites only: their coverage is their boxes
+        const std::uint32_t lo = prims[i * kPrimWords + 2], hi = prims[i * kPrimWords + 3];
+        minx = std::min(minx, lo & 0xFFFFu);
+        miny = std::min(miny, lo >> 16);
+        maxx = std::max(maxx, hi & 0xFFFFu);
+        maxy = std::max(maxy, hi >> 16);
+    }
+    if (minx > maxx || miny > maxy || maxx >= kTargetSize || maxy >= kTargetSize) return no(5);
+    const std::uint32_t w = maxx - minx + 1, h = maxy - miny + 1;
+    if (w > 128 || h > 64 || w * h > 4096) return no(6);
+    // Setups that overwrite colour outright (no blend, RGB unmasked): their
+    // primitives must cover the rectangle, so the result owes nothing to
+    // what was there; blended setups then read this batch's own pixels or
+    // are overwritten. Alpha may stay (bands start as the region's contents).
+    std::vector<std::uint8_t> opaque(cmd.setups, 0);
+    for (std::uint32_t i = 0; i < cmd.setups; ++i) {
+        const std::uint32_t *s = setups + i * kSetupWords;
+        std::uint32_t wmask = 0;
+        opaque[i] = !(s[0] & F_ABE) && write_mask(s[4], wmask) && (wmask & 7u) == 7u;
+    }
+    Surface *surface = find_surface(setups[1], setups[2], setups[3], false);
+    if (!surface || !surface->image.image || maxx >= surface->width || maxy >= surface->height) return no(8);
+    const Rect rect{minx, miny, maxx, maxy};
+    const gpu::Span region = rect_span(*surface, rect);
+    for (const gpu::Span &r : cmd.reads)
+        if (r.hi > r.lo && r.lo < region.hi && region.lo < r.hi) return no(9);  // reads its own region: no renaming
+    // Every pixel of the rectangle written?
+    std::vector<std::uint8_t> covered(static_cast<std::size_t>(w) * h, 0);
+    for (std::uint32_t i = 0; i < cmd.prims; ++i) {
+        if (!opaque[prims[i * kPrimWords]]) continue;
+        const std::uint32_t lo = prims[i * kPrimWords + 2], hi = prims[i * kPrimWords + 3];
+        for (std::uint32_t y = (lo >> 16); y <= (hi >> 16); ++y)
+            for (std::uint32_t x = lo & 0xFFFFu; x <= (hi & 0xFFFFu); ++x) covered[static_cast<std::size_t>(y - miny) * w + (x - minx)] = 1;
+    }
+    for (std::uint8_t c : covered)
+        if (!c) return no(10);
+    Chain *chain = nullptr;
+    for (auto &c : chains_)
+        if (c->surface == surface) chain = c.get();
+    if (chain && (chain->rect.x0 != rect.x0 || chain->rect.y0 != rect.y0 || chain->rect.x1 != rect.x1 || chain->rect.y1 != rect.y1)) {
+        if (chain->count) return no(11);  // another region of the same surface is in flight
+        retire(*chain->atlas);
+        chains_.erase(std::find_if(chains_.begin(), chains_.end(), [chain](const std::unique_ptr<Chain> &c) { return c.get() == chain; }));
+        chain = nullptr;
+    }
+    if (!chain) {
+        if (chains_.size() >= kMaxChains) return no(12);
+        auto c = std::make_unique<Chain>();
+        c->surface = surface;
+        c->rect = rect;
+        c->band_h = h;
+        c->atlas = std::make_unique<Surface>();
+        c->atlas->bp = surface->bp;
+        c->atlas->bw = surface->bw;
+        c->atlas->psm = surface->psm;
+        if (!allocate(*c->atlas, surface->width, h * kBands)) return no(13);
+        chains_.push_back(std::move(c));
+        chain = chains_.back().get();
+    }
+    if (chain->count >= kBands) return no(14);
+    ++chain->count;
+    ++versions_made_;
+    return {chain, chain->count};
+}
+
+void HwRaster::version_reads(const gpu::Command &cmd, std::vector<VersionRef> &out) const {
+    for (const auto &c : chains_) {
+        if (!c->count) continue;
+        const gpu::Span region = chain_span(*c);
+        for (const gpu::Span &r : cmd.reads)
+            if (span_inside(r, region)) {
+                out.push_back({c.get(), c->count});
+                break;
+            }
+    }
+}
+
+// Bands for the pending versions start as the region's current contents (a
+// writer leaves alpha alone, so it must be there).
+void HwRaster::prepare_bands(VkCommandBuffer cb, VkDescriptorSet set0, Chain &c) {
+    static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
+    if (debug & 536870912u) { c.prepared = c.count; return; }  // debug: no band preparation copies
+    if (c.prepared >= c.count) return;
+    close_pass(cb, kCloseCopy, false);
+    import_source(cb, set0, *c.surface, c.rect);
+    VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mem.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    mem.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
+    const std::uint32_t rw = (c.rect.x1 - c.rect.x0 + 1) * scale_, rh = c.band_h * scale_;
+    for (std::uint32_t v = c.prepared + 1; v <= c.count; ++v) {
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.srcOffset = {static_cast<std::int32_t>(c.rect.x0 * scale_), static_cast<std::int32_t>(c.rect.y0 * scale_), 0};
+        region.dstOffset = {static_cast<std::int32_t>(c.rect.x0 * scale_), static_cast<std::int32_t>((v - 1) * c.band_h * scale_), 0};
+        region.extent = {rw, rh, 1};
+        vkCmdCopyImage(cb, c.surface->image.image, VK_IMAGE_LAYOUT_GENERAL, c.atlas->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    }
+    c.prepared = c.count;
+    VkImageMemoryBarrier bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    bar.oldLayout = bar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.image = c.atlas->image.image;
+    bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+}
+
+// A memory reader of version v: that band goes to VRAM first. The surface's
+// own dirty tiles there are dropped: VRAM is now the chain's.
+void HwRaster::ensure_vram_version(VkCommandBuffer cb, VkDescriptorSet set0, Chain &c, std::uint32_t version) {
+    static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
+    if (debug & 134217728u) return;  // debug: no band exports
+    if (c.vram_version == version) return;
+    close_pass(cb, kCloseWriteBack, false);
+    const std::uint32_t tx0 = c.rect.x0 / kTile, tx1 = c.rect.x1 / kTile, ty0 = c.rect.y0 / kTile, ty1 = c.rect.y1 / kTile;
+    for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
+        for (std::uint32_t tx = tx0; tx <= tx1; ++tx) c.surface->plane.clear_dirty(ty * kTiles + tx);
+    copy_rects(cb, set0, *c.atlas, false, {c.rect}, static_cast<std::int32_t>((version - 1) * c.band_h) - static_cast<std::int32_t>(c.rect.y0));
+    barrier_copies_visible(cb);
+    c.vram_version = version;
+}
+
+// A versioned writer the compute path drew after all: its band takes the
+// region from VRAM, where that draw put it.
+void HwRaster::band_from_vram(VkCommandBuffer cb, VkDescriptorSet set0, Chain &c, std::uint32_t version) {
+    close_pass(cb, kCloseImport, false);
+    copy_rects(cb, set0, *c.atlas, true, {c.rect}, static_cast<std::int32_t>((version - 1) * c.band_h) - static_cast<std::int32_t>(c.rect.y0));
+    c.vram_version = version;
+    VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mem.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mem.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
+}
+
+// The latest version becomes the surface's contents again.
+void HwRaster::resolve_chain(VkCommandBuffer cb, Chain &c) {
+    if (!c.count) return;
+    static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
+    if (debug & 268435456u) {  // debug: no resolve copies
+        c.count = 0;
+        c.vram_version = 0;
+        c.prepared = 0;
+        return;
+    }
+    close_pass(cb, kCloseCopy, false);  // without the flush hook: it could resolve this very chain underneath us
+    if (!c.count) return;
+    VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mem.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    mem.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.srcOffset = {static_cast<std::int32_t>(c.rect.x0 * scale_), static_cast<std::int32_t>((c.count - 1) * c.band_h * scale_), 0};
+    region.dstOffset = {static_cast<std::int32_t>(c.rect.x0 * scale_), static_cast<std::int32_t>(c.rect.y0 * scale_), 0};
+    region.extent = {(c.rect.x1 - c.rect.x0 + 1) * scale_, c.band_h * scale_, 1};
+    vkCmdCopyImage(cb, c.atlas->image.image, VK_IMAGE_LAYOUT_GENERAL, c.surface->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    VkImageMemoryBarrier bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bar.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    bar.oldLayout = bar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.image = c.surface->image.image;
+    bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+    const std::uint32_t tx0 = c.rect.x0 / kTile, tx1 = c.rect.x1 / kTile, ty0 = c.rect.y0 / kTile, ty1 = c.rect.y1 / kTile;
+    for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
+        for (std::uint32_t tx = tx0; tx <= tx1; ++tx) {
+            c.surface->plane.valid[ty * kTiles + tx] = true;
+            if (c.vram_version == c.count) c.surface->plane.clear_dirty(ty * kTiles + tx);
+            else c.surface->plane.set_dirty(ty * kTiles + tx);
+        }
+    tex_drop_cause_ = 2;
+    textures_written(chain_span(c));
+    c.count = 0;
+    c.vram_version = 0;
+    c.prepared = 0;
+}
+
+void HwRaster::resolve_chains(VkCommandBuffer cb, VkDescriptorSet set0) {
+    (void)set0;
+    for (auto &cp : chains_) resolve_chain(cb, *cp);
+}
+
+void HwRaster::touch_versions(VkCommandBuffer cb, const gpu::Span &span) {
+    if (span.hi <= span.lo) return;
+    for (auto &cp : chains_) {
+        if (!cp->count) continue;
+        const gpu::Span region = chain_span(*cp);
+        if (span.lo < region.hi && region.lo < span.hi) resolve_chain(cb, *cp);
+    }
+}
+
+HwRaster::Chain *HwRaster::chain_of(const Surface *s) const {
+    for (const auto &c : chains_)
+        if (c->surface == s || c->atlas.get() == s) return c.get();
+    return nullptr;
 }
 
 bool HwRaster::deferred_conflict(const gpu::Command &cmd) const {
@@ -566,7 +819,7 @@ bool HwRaster::deferred_conflict(const gpu::Command &cmd) const {
     return false;
 }
 
-void HwRaster::close_pass(VkCommandBuffer cb, CloseWhy why) {
+void HwRaster::close_pass(VkCommandBuffer cb, CloseWhy why, bool run_hook) {
     if (pass_cb_ != cb) return;  // none open, or open in another command buffer
     ++closes_[why];
     static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;  // one frame's pass closes, with reasons
@@ -578,7 +831,7 @@ void HwRaster::close_pass(VkCommandBuffer cb, CloseWhy why) {
     barrier_after_draw(cb, *pass_color_, pass_depth_);
     pass_cb_ = VK_NULL_HANDLE;
     pass_color_ = pass_depth_ = nullptr;
-    if (pass_closed_hook_) pass_closed_hook_();
+    if (run_hook && pass_closed_hook_) pass_closed_hook_();
     // Drawing what was held back may have left a pass open; a caller about
     // to record outside a pass needs it closed.
     if (pass_cb_ == cb) {
@@ -599,7 +852,7 @@ void HwRaster::end_frame(VkCommandBuffer cb) {
 
 void HwRaster::print_reasons() const {
     static const char *const kCloseNames[kCloseCount] = {"import", "write-back", "decode", "copy", "texture", "memory-read", "surfaces", "failed", "end", "device", "decoded", "wb-draw", "wb-decode", "wb-before", "wb-evict", "wb-overlap", "import-own", "import-source", "wb-uncached", "depth-toggle", "color-change", "depth-change"};
-    std::fprintf(stderr, "[vk] render passes: %llu (%.2f per hardware-drawn batch), %llu batches held back for other surfaces; closed by:", static_cast<unsigned long long>(passes_), drawn_ ? static_cast<double>(passes_) / static_cast<double>(drawn_) : 0.0, static_cast<unsigned long long>(held_batches_));
+    std::fprintf(stderr, "[vk] render passes: %llu (%.2f per hardware-drawn batch), %llu batches held back, %llu scratch versions; closed by:", static_cast<unsigned long long>(passes_), drawn_ ? static_cast<double>(passes_) / static_cast<double>(drawn_) : 0.0, static_cast<unsigned long long>(held_batches_), static_cast<unsigned long long>(versions_made_));
     for (int i = 0; i < kCloseCount; ++i)
         if (closes_[i]) std::fprintf(stderr, " %s %llu", kCloseNames[i], static_cast<unsigned long long>(closes_[i]));
     std::fprintf(stderr, "\n");
@@ -775,7 +1028,7 @@ HwRaster::Surface *HwRaster::find_surface(std::uint32_t bp, std::uint32_t bw, st
 }
 
 bool HwRaster::allocate(Surface &s, std::uint32_t width, std::uint32_t height) {
-    const VkImageUsageFlags color_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    const VkImageUsageFlags color_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;  // image copies: own-surface texels, scratch bands
     const VkImageUsageFlags depth_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!ctx_->create_image(s.image, width * scale_, height * scale_, s.depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM, s.depth ? depth_usage : color_usage,
                             s.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT))
@@ -833,6 +1086,14 @@ bool HwRaster::allocate(Surface &s, std::uint32_t width, std::uint32_t height) {
 // Drops the surface's GPU objects once no recorded command buffer can
 // reference them any more (two submits from now).
 void HwRaster::retire(Surface &s) {
+    for (std::size_t i = 0; i < chains_.size();) {
+        if (chains_[i]->surface == &s) {
+            retire(*chains_[i]->atlas);
+            chains_.erase(chains_.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            ++i;
+        }
+    }
     Retired r;
     r.image = s.image;
     r.sets[0] = s.set1[0];
@@ -862,12 +1123,19 @@ void HwRaster::retire(Surface &s) {
 // Returns null when the image cannot be made (the batch then falls back).
 HwRaster::Surface *HwRaster::surface_for(VkCommandBuffer cb, VkDescriptorSet set0, std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, bool depth, const Rect &needed) {
     Surface *s = find_surface(bp, bw, psm, depth);
+    if (s && !depth)
+        if (Chain *c = chain_of(s); c && c->count && c->surface == s) resolve_chain(cb, *c);  // drawn outside its versions: they land first
     if (!s) {
         if (surfaces_.size() >= kMaxSurfaces) {
             // Evict the least recently used surface, written back first.
             std::size_t victim = 0;
+            const auto chained = [this](const Surface *s) {
+                for (const auto &c : chains_)
+                    if (c->surface == s && c->count) return true;
+                return false;
+            };
             for (std::size_t i = 1; i < surfaces_.size(); ++i)
-                if (surfaces_[i]->last_use < surfaces_[victim]->last_use) victim = i;
+                if (surfaces_[i]->last_use < surfaces_[victim]->last_use && !chained(surfaces_[i].get())) victim = i;
             Surface &v = *surfaces_[victim];
             WhyScope why(wb_why_, kCloseWbEvict);
             write_back(cb, set0, v, Rect{0, 0, kTargetSize - 1, kTargetSize - 1});
@@ -1003,7 +1271,7 @@ void HwRaster::bind(VkCommandBuffer cb, VkPipelineBindPoint point, VkDescriptorS
 // the import/export shaders directly; depth through depth_stage and a
 // buffer/image copy each way. The rectangles are processed one after the
 // other because they share depth_stage. Rectangles are clipped to the image.
-void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, bool import, const std::vector<Rect> &rects) {
+void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, bool import, const std::vector<Rect> &rects, std::int32_t image_dy) {
     static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
     if (debug & 32768u) return;  // measurement only: no copies at all (wrong output)
     FrameScratch &f = *frame_;
@@ -1012,7 +1280,7 @@ void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
         if (r0.x0 >= s.width || r0.y0 >= s.height) continue;
         const Rect r{r0.x0, r0.y0, std::min(r0.x1, s.width - 1), std::min(r0.y1, s.height - 1)};
         const std::uint32_t rw = (r.x1 - r.x0 + 1) * scale_, rh = (r.y1 - r.y0 + 1) * scale_;
-        std::uint32_t words[kUniformWords] = {s.bp, s.bw, s.psm, 0, r.x0, r.y0, rw, rh, scale_, 0, 0, 0};
+        std::uint32_t words[kUniformWords] = {s.bp, s.bw, s.psm, 0, r.x0, r.y0, rw, rh, scale_, 0, 0, 0, 0, 0, 0, static_cast<std::uint32_t>(image_dy)};
         const std::uint32_t uniform = push_uniform(f, words);
         const std::uint32_t gx = (rw + 15) / 16, gy = (rh + 15) / 16;
         const VkBufferImageCopy region{0, rw, rh, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {static_cast<std::int32_t>(r.x0 * scale_), static_cast<std::int32_t>(r.y0 * scale_), 0}, {rw, rh, 1}};
@@ -1067,9 +1335,24 @@ void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
     }
 }
 
+void HwRaster::import_source(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect) {
+    const auto invalid = tile_rects(s.plane, rect, [](const Plane &q, std::uint32_t t) { return !q.valid[t]; });
+    if (invalid.empty()) return;
+    const std::uint64_t before = exported_px_;
+    {
+        WhyScope why(wb_why_, kCloseWbUncached);
+        for (const Rect &r : invalid) memory_read(cb, set0, rect_span(s, r), &s);
+    }
+    if (exported_px_ != before) barrier_copies_visible(cb);
+    import_tiles(cb, set0, s, rect);
+}
+
 void HwRaster::import_tiles(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect) {
     const auto rects = tile_rects(s.plane, rect, [](const Plane &q, std::uint32_t t) { return !q.valid[t]; });
     if (rects.empty()) return;
+    static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
+    if (frame_count() == trace_frame)
+        std::fprintf(stderr, "[pass] f%llu import %u/%u/%02x rect %u,%u-%u,%u: %zu tile rects, first %u,%u-%u,%u (why %d)\n", static_cast<unsigned long long>(frame_count()), s.bp, s.bw, s.psm, rect.x0, rect.y0, rect.x1, rect.y1, rects.size(), rects[0].x0, rects[0].y0, rects[0].x1, rects[0].y1, static_cast<int>(import_why_));
     close_pass(cb, import_why_);
     copy_rects(cb, set0, s, true, rects);
     const std::uint32_t tx0 = rect.x0 / kTile, tx1 = rect.x1 / kTile, ty0 = rect.y0 / kTile, ty1 = rect.y1 / kTile;
@@ -1080,6 +1363,8 @@ void HwRaster::import_tiles(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s
 // Writes the dirty tiles of `rect` back to memory. Other surfaces that
 // alias that memory lose the tiles the write covers.
 void HwRaster::write_back(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect, bool drop_aliases) {
+    if (!s.depth)
+        if (Chain *c = chain_of(&s); c && c->count && c->surface == &s) resolve_chain(cb, *c);
     if (!s.plane.dirty_count || !s.image.image) return;
     const auto rects = tile_rects(s.plane, rect, [](const Plane &q, std::uint32_t t) { return q.dirty[t]; });
     if (rects.empty()) return;
@@ -1108,6 +1393,8 @@ void HwRaster::write_back(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
 }
 
 void HwRaster::invalidate(Surface &s, const Rect &rect) {
+    static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
+    if (frame_count() == trace_frame) std::fprintf(stderr, "[pass] f%llu invalidate %u/%u/%02x rect %u,%u-%u,%u\n", static_cast<unsigned long long>(frame_count()), s.bp, s.bw, s.psm, rect.x0, rect.y0, rect.x1, rect.y1);
     const std::uint32_t tx0 = rect.x0 / kTile, tx1 = rect.x1 / kTile, ty0 = rect.y0 / kTile, ty1 = rect.y1 / kTile;
     for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
         for (std::uint32_t tx = tx0; tx <= tx1; ++tx) {
@@ -1126,12 +1413,14 @@ void HwRaster::mark_dirty(Surface &s, const Rect &rect) {
 }
 
 void HwRaster::memory_read(VkCommandBuffer cb, VkDescriptorSet set0, const gpu::Span &span, const Surface *except) {
+    touch_versions(cb, span);
     Rect r;
     for (auto &s : surfaces_)
         if (s.get() != except && span_rect(*s, span, r)) write_back(cb, set0, *s, r);
 }
 
 void HwRaster::memory_written(VkCommandBuffer cb, VkDescriptorSet set0, const gpu::Span &span, const Surface *except_a, const Surface *except_b) {
+    if (!(except_a && !except_a->depth && chain_of(except_a) && chain_of(except_a)->atlas.get() == except_a)) touch_versions(cb, span);  // a versioned write itself leaves its region's versions alone
     tex_drop_cause_ = 0;
     if (!keep_textures_) textures_written(span);
     Rect r;
@@ -1432,8 +1721,9 @@ VkDescriptorSet HwRaster::surface_texture(VkCommandBuffer cb, VkDescriptorSet se
     if (Surface *src = find_surface(w[12], w[13], w[14], false); src && src->image.image && src->set2) {
         Rect texels;
         if (texture_texels(w, prims, count, setup_index, texels) && texels.x1 < src->width && texels.y1 < src->height) {
+            touch_versions(cb, rect_span(*src, texels));
             WhyScope why(import_why_, kCloseImportSource);
-            import_tiles(cb, set0, *src, texels);
+            import_source(cb, set0, *src, texels);
             src->last_use = ++use_counter_;
             if (src != color && src != depth) {
                 ++surface_samples_;
@@ -1662,7 +1952,7 @@ HwRaster::Texture *HwRaster::texture_for(VkCommandBuffer cb, VkDescriptorSet set
 
 // ---- Drawing ---------------------------------------------------------------
 
-bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, VkBuffer) {
+bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, VkBuffer, const DrawHints *hints) {
     cpu_timers::Scope timer(cpu_timers::kDraw);
     // PS2_HW_DEBUG bits, for isolating driver trouble: 1 skip batches that
     // need depth, 8 paint every fragment magenta, 16 paint the raw texel,
@@ -1731,7 +2021,6 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     }
     // Commands held back while the pass is open must land before a batch
     // that touches their memory (see note_deferred).
-    if (pass_cb_ == cb && (deferred_conflict(cmd) || held_conflict(cmd))) close_pass(cb, kCloseMemoryRead);
     const std::uint32_t *p = params + cmd.param * (gpu::kParamStride / 4);
     const std::uint32_t *prims = arena + p[1];
     const std::uint32_t setup_offset = p[2];
@@ -1749,6 +2038,19 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         return false;
     }
     const Rect rect{minx, miny, maxx, maxy};
+    {
+        static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
+        static const bool trace_all = std::getenv("PS2_HW_BATCH_ALL") != nullptr;  // every batch, since held ones land in a later flush (headless submits are rare)
+        if (trace_all || frame_count() == trace_frame) {
+            std::fprintf(stderr, "[pass] f%llu batch %llu fb %u/%u/%02x rect %u,%u-%u,%u prims %u%s | tex:", static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(drawn_), setups[1], setups[2], setups[3], rect.x0, rect.y0, rect.x1, rect.y1, cmd.prims,
+                         hints && hints->write.chain ? " (versioned)" : "");
+            for (std::uint32_t i = 0; i < cmd.setups; ++i) {
+                const std::uint32_t *w = setups + i * kSetupWords;
+                if (w[0] & F_TME) std::fprintf(stderr, " %u/%u/%02x %ux%u", w[12], w[13], w[14], 1u << (w[15] & 0xFFu), 1u << (w[15] >> 8));
+            }
+            std::fprintf(stderr, " | reads %x-%x %x-%x %x-%x %x-%x writes %x-%x %x-%x\n", cmd.reads[0].lo, cmd.reads[0].hi, cmd.reads[1].lo, cmd.reads[1].hi, cmd.reads[2].lo, cmd.reads[2].hi, cmd.reads[3].lo, cmd.reads[3].hi, cmd.writes[0].lo, cmd.writes[0].hi, cmd.writes[1].lo, cmd.writes[1].hi);
+        }
+    }
     // PS2_HW_TRACE=from,to prints the batches drawn in that frame window.
     static std::uint64_t trace_from = ~0ull, trace_to = 0;
     static const bool trace = [] {
@@ -1786,14 +2088,22 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     // its writes alias in other surfaces; import the tiles it touches that
     // memory still owns.
     const std::uint32_t *first = setups;
-    Surface *color = surface_for(cb, set0, first[1], first[2], first[3], false, rect);
-    if (!color) {
-        ++reasons_[11];
-        ++fallback_;
-        return false;
+    Chain *write_chain = hints && hints->write.chain ? hints->write.chain : nullptr;
+    Surface *color = nullptr;
+    if (write_chain) {
+        // A version of a scratch region: drawn into its band of the atlas.
+        prepare_bands(cb, set0, *write_chain);
+        color = write_chain->atlas.get();
+    } else {
+        color = surface_for(cb, set0, first[1], first[2], first[3], false, rect);
+        if (!color) {
+            ++reasons_[11];
+            ++fallback_;
+            return false;
+        }
     }
     Surface *depth = nullptr;
-    if (with_depth) {
+    if (with_depth && !write_chain) {
         depth = surface_for(cb, set0, first[5], first[2], first[6], true, rect);
         if (!depth) {
             ++reasons_[11];
@@ -1825,13 +2135,31 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
             // reads that surface's image through its layout (surface view),
             // so nothing is written back.
             const gpu::Span span = texture_span(w);
+            if (hints && hints->reads) {
+                // A version of a scratch region: its band of the atlas.
+                bool viewed = false;
+                for (const VersionRef &vr : *hints->reads) {
+                    if (!span_inside(span, chain_span(*vr.chain))) continue;
+                    const Surface &s = *vr.chain->surface;
+                    views[i] = View{s.bp * 64u, s.bw, static_cast<std::uint32_t>(s.height / 32) * s.bw * 2048u, (vr.version - 1) * vr.chain->band_h - vr.chain->rect.y0};
+                    textures[i] = vr.chain->atlas->set2;
+                    viewed = true;
+                    ++surface_views_;
+                    break;
+                }
+                if (viewed) {
+                    memory_sampled = true;
+                    continue;
+                }
+            }
             Surface *v = (debug & 33554432u) ? nullptr : viewable_surface(span, color, depth);  // debug: no surface views
             Rect vr;
             if (v && span_rect(*v, span, vr)) {
+                touch_versions(cb, span);  // a plain view of a versioned region sees the latest version
                 if (pass_cb_ == cb && (v == pass_color_ || v == pass_depth_)) close_pass(cb, kCloseSurfaces);  // its attachment writes land first
                 const std::uint64_t before_imports = imported_px_;
                 WhyScope why(import_why_, kCloseImportSource);
-                import_tiles(cb, set0, *v, vr);  // what memory still owns there
+                import_source(cb, set0, *v, vr);
                 decoded_any = decoded_any || imported_px_ != before_imports;
                 views[i] = View{v->bp * 64u, v->bw, static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u, 0u};
                 textures[i] = v->set2;
@@ -1848,12 +2176,9 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
             memory_read(cb, set0, texture_span(w));
         }
     }
-    // Memory sampling also reads the CLUT buffer, which held-back CLUT loads
-    // have not written yet: they land first.
-    if (memory_sampled && deferred_count_) close_pass(cb, kCloseMemoryRead);
     {
         WhyScope why(wb_why_, kCloseWbDraw);
-        for (const gpu::Span &sp : cmd.writes) memory_written(cb, set0, sp, color, depth);
+        for (const gpu::Span &sp : cmd.writes) memory_written(cb, set0, sp, color, write_chain ? write_chain->surface : depth);  // a versioned write leaves its surface alone
     }
     // The imports below read memory the write-backs above may have stored.
     if (exported_px_ != exported_before) {
@@ -1862,12 +2187,12 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
                          cmd.writes[0].hi, cmd.writes[1].lo, cmd.writes[1].hi);
         barrier_copies_visible(cb);
     }
-    // Every tile memory still owns is imported, not only the batch rectangle:
-    // the scene fills the screen batch by batch, and an import per batch
-    // closed the render pass every time (19 in a row in a race frame).
+    // Only the batch rectangle: memory_written above wrote back what other
+    // surfaces hold dirty there, so VRAM is current for it; a wider import
+    // would take rows that an aliasing surface still holds newer.
     WhyScope why_import(import_why_, kCloseImportOwn);
-    if (color_any) import_tiles(cb, set0, *color, Rect{0, 0, color->width - 1, color->height - 1});
-    if (depth) import_tiles(cb, set0, *depth, Rect{0, 0, depth->width - 1, depth->height - 1});
+    if (color_any && !write_chain) import_tiles(cb, set0, *color, rect);
+    if (depth) import_tiles(cb, set0, *depth, rect);
     // Textures: resolve (and decode, which reads memory the write-backs
     // above just stored) every textured setup's image before the pass.
     if (!(debug & 65536u))
@@ -1875,6 +2200,27 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
             const std::uint32_t *w = setups + i * kSetupWords;
             if (!(w[0] & F_TME) || !texture_cacheable(w)) continue;
             const std::uint64_t before_decodes = decoded_textures_, before_imports = imported_px_, before_copies = surface_copies_;
+            // A render target read as a texture (a surface holds it dirty,
+            // newer than VRAM): the memory-sampling shader views the surface
+            // image instead of a decode, which would write it back first.
+            if (!(debug & 33554432u) && !textures[i]) {
+                const gpu::Span span = texture_span(w);
+                Surface *v = dirty_surface_for(span, color, depth);
+                Rect vr;
+                if (v && span_rect(*v, span, vr)) {
+                    touch_versions(cb, span);
+                    if (pass_cb_ == cb && (v == pass_color_ || v == pass_depth_)) close_pass(cb, kCloseSurfaces);
+                    const std::uint64_t before_views = imported_px_;
+                    WhyScope why(import_why_, kCloseImportSource);
+                    import_source(cb, set0, *v, vr);
+                    decoded_any = decoded_any || imported_px_ != before_views;
+                    views[i] = View{v->bp * 64u, v->bw, static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u, 0u};
+                    textures[i] = v->set2;
+                    memory_sampled = true;
+                    ++surface_views_;
+                    continue;
+                }
+            }
             textures[i] = texture_set(cb, set0, w, setup_offset + i * kSetupWords, prims, cmd.prims, i, color, depth);
             decoded_any = decoded_any || decoded_textures_ != before_decodes || imported_px_ != before_imports || surface_copies_ != before_copies;
         }
@@ -1926,7 +2272,10 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     // primitives at the surface edge would re-interpolate their attributes
     // and shift texel picks against the compute path. The render area and
     // scissor keep fragments inside the surface.
-    const VkViewport viewport{0.0f, 0.0f, static_cast<float>(kTargetSize * scale_), static_cast<float>(kTargetSize * scale_), 0.0f, 1.0f};
+    // A versioned write lands in its band: the viewport moves down by the
+    // band's rows (minus the region's own row), the scissor stays in it.
+    const std::int32_t band_dy = write_chain ? static_cast<std::int32_t>((hints->write.version - 1) * write_chain->band_h) - static_cast<std::int32_t>(write_chain->rect.y0) : 0;
+    const VkViewport viewport{0.0f, static_cast<float>(band_dy) * static_cast<float>(scale_), static_cast<float>(kTargetSize * scale_), static_cast<float>(kTargetSize * scale_), 0.0f, 1.0f};
     vkCmdSetViewport(cb, 0, 1, &viewport);
     const VkRect2D scissor = rbi.renderArea;
     vkCmdSetScissor(cb, 0, 1, &scissor);
@@ -1958,9 +2307,15 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         bool skip_draw = false;
         {
             const std::int32_t sx0 = static_cast<std::int32_t>((w[10] & 0xFFFFu) * scale_), sx1 = static_cast<std::int32_t>(((w[10] >> 16) + 1) * scale_);
-            const std::int32_t sy0 = static_cast<std::int32_t>((w[11] & 0xFFFFu) * scale_), sy1 = static_cast<std::int32_t>(((w[11] >> 16) + 1) * scale_);
-            const std::int32_t ax0 = rbi.renderArea.offset.x, ay0 = rbi.renderArea.offset.y;
-            const std::int32_t ax1 = ax0 + static_cast<std::int32_t>(rbi.renderArea.extent.width), ay1 = ay0 + static_cast<std::int32_t>(rbi.renderArea.extent.height);
+            const std::int32_t sy0 = static_cast<std::int32_t>((w[11] & 0xFFFFu) * scale_) + band_dy * static_cast<std::int32_t>(scale_), sy1 = static_cast<std::int32_t>(((w[11] >> 16) + 1) * scale_) + band_dy * static_cast<std::int32_t>(scale_);
+            std::int32_t ax0 = rbi.renderArea.offset.x, ay0 = rbi.renderArea.offset.y;
+            std::int32_t ax1 = ax0 + static_cast<std::int32_t>(rbi.renderArea.extent.width), ay1 = ay0 + static_cast<std::int32_t>(rbi.renderArea.extent.height);
+            if (write_chain) {
+                ax0 = static_cast<std::int32_t>(write_chain->rect.x0 * scale_);
+                ax1 = static_cast<std::int32_t>((write_chain->rect.x1 + 1) * scale_);
+                ay0 = static_cast<std::int32_t>((hints->write.version - 1) * write_chain->band_h * scale_);
+                ay1 = ay0 + static_cast<std::int32_t>(write_chain->band_h * scale_);
+            }
             const std::int32_t x0 = std::max(sx0, ax0), y0 = std::max(sy0, ay0), x1 = std::min(sx1, ax1), y1 = std::min(sy1, ay1);
             if (x0 >= x1 || y0 >= y1) {
                 skip_draw = true;
@@ -2038,7 +2393,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
 
     // 3. Bookkeeping: the rectangle is now newer than memory, and any
     // texture decoded from it no longer matches.
-    if (color_any) mark_dirty(*color, rect);
+    if (color_any && !write_chain) mark_dirty(*color, rect);
     if (depth && zwrite_any) mark_dirty(*depth, rect);
     tex_drop_cause_ = 2;
     if (color_any) textures_written(rect_span(*color, rect));
@@ -2086,6 +2441,8 @@ void HwRaster::destroy() {
     for (auto &[size, list] : free_by_size_)
         for (auto &t : list) ctx_->destroy_image(t->image);
     free_by_size_.clear();
+    for (auto &c : chains_) ctx_->destroy_image(c->atlas->image);
+    chains_.clear();
     for (VkSampler sm : samplers_)
         if (sm) vkDestroySampler(ctx_->device, sm, nullptr);
     if (pool2_) vkDestroyDescriptorPool(ctx_->device, pool2_, nullptr);

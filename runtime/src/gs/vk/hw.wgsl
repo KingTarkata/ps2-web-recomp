@@ -574,7 +574,7 @@ fn import_frame(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let c = copy_sample(gid);
     let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / hw.scale, c.y / hw.scale);
-    textureStore(target_store, vec2<i32>(i32(c.x), i32(c.y)), unpack_word(load_at(l, c.z)));
+    textureStore(target_store, vec2<i32>(i32(c.x), i32(c.y + hw.view_shift * hw.scale)), unpack_word(load_at(l, c.z)));
 }
 
 // Writes a target back into GS memory through the frame format's own store:
@@ -603,7 +603,7 @@ fn export_frame(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let c = copy_sample(gid);
     let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / hw.scale, c.y / hw.scale);
-    let word = pack_word(textureLoad(target_load, vec2<i32>(i32(c.x), i32(c.y)), 0));
+    let word = pack_word(textureLoad(target_load, vec2<i32>(i32(c.x), i32(c.y + hw.view_shift * hw.scale)), 0));  // view_shift: atlas band rows
     store_frame(hw.psm, l, c.z, word);
 }
 

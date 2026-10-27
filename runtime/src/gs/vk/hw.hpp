@@ -39,7 +39,61 @@ public:
     // Called while recording a command buffer, before the device would
     // dispatch the compute raster for `cmd`. Returns true when the batch was
     // drawn here (imports, draw and bookkeeping all recorded into `cb`).
-    bool draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, VkBuffer data_buffer);
+    // Scratch versioning. A small region of a 32-bit surface that held-back
+    // batches overwrite whole, one after another (GT4's post-process writes a
+    // 64x32 block 70 times a frame), gets one image band per version in an
+    // atlas: the writers then share one render pass, and each reader sees
+    // its version, through a view into the band or, for memory readers, a
+    // band exported to VRAM first. The latest version is copied back into
+    // the surface when the held work is flushed (resolve_chains).
+    // GS pixels, inclusive.
+    struct Rect {
+        std::uint32_t x0, y0, x1, y1;
+    };
+private:
+    struct Surface;
+
+public:
+    struct Chain {
+        Surface *surface = nullptr;
+        Rect rect{};
+        std::uint32_t band_h = 0;
+        std::unique_ptr<Surface> atlas;  // bands stacked down the image; bp/bw/psm of the surface, for export addressing
+        std::uint32_t count = 0;         // versions pending; band v - 1 holds version v
+        std::uint32_t vram_version = 0;  // the version VRAM holds for the region (0: none exported since the last resolve)
+        std::uint32_t prepared = 0;      // bands given the region's base contents so far
+    };
+    static constexpr std::uint32_t kBands = 96, kMaxChains = 4;
+    struct VersionRef {
+        Chain *chain = nullptr;
+        std::uint32_t version = 0;
+    };
+    struct DrawHints {
+        VersionRef write;                         // draw into this version's band instead of the surface
+        const std::vector<VersionRef> *reads = nullptr;  // versions this batch's memory reads see
+    };
+    bool draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, VkBuffer data_buffer, const DrawHints *hints = nullptr);
+    VersionRef version_write(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params);
+    void version_reads(const gpu::Command &cmd, std::vector<VersionRef> &out) const;
+    gpu::Span chain_span(const Chain &c) const;
+    static bool span_inside(const gpu::Span &a, const gpu::Span &b) { return a.hi > a.lo && a.lo >= b.lo && a.hi <= b.hi; }
+    void prepare_bands(VkCommandBuffer cb, VkDescriptorSet set0, Chain &c);
+    void ensure_vram_version(VkCommandBuffer cb, VkDescriptorSet set0, Chain &c, std::uint32_t version);
+    void band_from_vram(VkCommandBuffer cb, VkDescriptorSet set0, Chain &c, std::uint32_t version);
+    void resolve_chains(VkCommandBuffer cb, VkDescriptorSet set0);
+    void resolve_chain(VkCommandBuffer cb, Chain &c);
+    // Memory of an active region touched by anything but a versioned write or
+    // a version-tagged read (an aliasing surface, a plain view, a write-back,
+    // a memory command): the latest version becomes the surface's contents
+    // first, so the usual machinery sees it.
+    void touch_versions(VkCommandBuffer cb, const gpu::Span &span);
+    Chain *chain_of(const Surface *s) const;
+    bool targets_open_pass(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params, const VersionRef &write);
+    bool batch_textured(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) const;
+    // Imports `rect` of a surface that is read (sampled in place, viewed, or
+    // copied into bands): when memory still owns tiles there, aliasing
+    // surfaces' newer pixels reach VRAM first, then the tiles are imported.
+    void import_source(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect);
     // What to do with a raster batch before anything is recorded: decline it
     // (compute path), draw it now, or hold it back because it targets other
     // surfaces than the open pass and nothing drawn since needs it first. A
@@ -47,7 +101,7 @@ public:
     // the compute commands held with it; batches on the open surfaces that
     // touch a held batch's memory close the pass first (held_conflict).
     enum class Plan { Declined, Draw, Hold };
-    Plan plan(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params);
+    Plan plan(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params, bool depends_on_held);
     void note_held(const gpu::Command &cmd);
     void clear_held() {
         held_reads_.clear();
@@ -95,7 +149,7 @@ public:
         WhyScope(CloseWhy &s, CloseWhy v) : slot(s), saved(s) { slot = v; }
         ~WhyScope() { slot = saved; }
     };
-    void close_pass(VkCommandBuffer cb, CloseWhy why = kCloseDevice);
+    void close_pass(VkCommandBuffer cb, CloseWhy why = kCloseDevice, bool run_hook = true);  // run_hook false: the held work stays held (chain bookkeeping must not be re-entered)
     // Called right after a pass is closed (the device records the compute
     // commands it held back while the pass was open).
     void on_pass_closed(std::function<void()> hook) { pass_closed_hook_ = std::move(hook); }
@@ -137,10 +191,6 @@ private:
                 --dirty_count;
             }
         }
-    };
-    // GS pixels, inclusive.
-    struct Rect {
-        std::uint32_t x0, y0, x1, y1;
     };
     struct Surface {
         std::uint32_t bp = 0, bw = 0, psm = 0;
@@ -207,7 +257,7 @@ private:
     bool span_rect(const Surface &s, const gpu::Span &span, Rect &out) const;
     gpu::Span rect_span(const Surface &s, const Rect &r) const;
     template <class Pred> std::vector<Rect> tile_rects(const Plane &p, const Rect &within, Pred pred) const;
-    void copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, bool import, const std::vector<Rect> &rects);
+    void copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, bool import, const std::vector<Rect> &rects, std::int32_t image_dy = 0);  // image_dy: rows between image and GS coordinates (atlas bands)
     void import_tiles(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect);
     void write_back(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect, bool drop_aliases = true);
     void invalidate(Surface &s, const Rect &rect);
@@ -324,12 +374,15 @@ private:
     std::uint64_t held_batches_ = 0;
     std::uint32_t inverse32_words_ = 0;
     std::uint64_t surface_views_ = 0;  // uncached texture reads answered by a surface image
+    std::vector<std::unique_ptr<Chain>> chains_;
+    std::uint64_t versions_made_ = 0;
     // A surface view for one setup's memory reads (see hw.wgsl HwParams).
     struct View {
         std::uint32_t base = 0, bw = 0, words = 0, shift = 0;
     };
     // The resident 32/24-bit colour surface holding `span` whole (not this batch's own), or null.
     Surface *viewable_surface(const gpu::Span &span, const Surface *color, const Surface *depth);
+    Surface *dirty_surface_for(const gpu::Span &span, const Surface *color, const Surface *depth);
     std::size_t deferred_count_ = 0;
     Surface *pass_color_ = nullptr, *pass_depth_ = nullptr;
     bool pass_with_depth_ = false;

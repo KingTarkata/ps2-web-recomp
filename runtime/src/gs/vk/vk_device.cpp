@@ -65,6 +65,7 @@ public:
                          static_cast<unsigned long long>(hw_.fallback_batches()));
         if (hw_on_) hw_.print_reasons();
         if (hw_on_) {
+            std::fprintf(stderr, "[vk] held items %llu, flushes %llu, flushed items %llu, flushed batches drawn %llu declined %llu\n", (unsigned long long)held_items_, (unsigned long long)flushes_, (unsigned long long)flushed_items_, (unsigned long long)flushed_batches_drawn_, (unsigned long long)flushed_batches_declined_);
             std::fprintf(stderr, "[vk] passes closed by commands:");
             for (int i = 0; i < kPipelines; ++i)
                 if (closes_by_pipeline_[i]) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(closes_by_pipeline_[i]));
@@ -132,6 +133,7 @@ private:
     vk::HwRaster hw_;
     bool hw_on_ = false;
     std::uint64_t closes_by_pipeline_[kPipelines] = {};  // passes closed by a command the device could not hold back
+    std::uint64_t held_items_ = 0, flushed_items_ = 0, flushed_batches_drawn_ = 0, flushed_batches_declined_ = 0, flushes_ = 0;
     Buffer vram_, tables_, clut_, scratch_, cache_, decoded_, readback_, staging_;
     VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
@@ -380,20 +382,87 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
     // read none of their results, since a read that would see them (a
     // texture decode, a tile import, memory sampling) closes the pass first.
     // Their order among themselves is kept.
-    // Held back while a pass is open: compute commands and raster batches
-    // for other surfaces. When the pass closes (HwRaster::close_pass runs the
-    // hook) the compute commands are recorded first, in order, each after
-    // its before_command write-backs, then the batches, in order; the span
-    // checks at hold time (deferred_conflict, held_conflict) keep that
-    // reordering invisible.
-    struct Deferred {
+    // Held back: compute commands and raster batches that cannot be
+    // recorded now without breaking the open render pass or the order of
+    // things already held. Each held item records what it depends on
+    // (page-indexed memory accesses with scratch versions, CLUT loads for
+    // textured batches, the previous compute command); when the held work is
+    // flushed (a pass closes, a command cannot be held, the frame ends) a
+    // list scheduler records it: batches that extend the open pass first,
+    // then the oldest compute command, then the oldest ready batch.
+    struct Access {
+        std::uint32_t item;
+        bool write;
+        vk::HwRaster::Chain *chain;  // null: plain memory
+        std::uint32_t version;
+    };
+    struct Item {
         bool batch;
         Command c;
         std::uint32_t index;
         bool timed;
         std::size_t skipped_from;
+        vk::HwRaster::VersionRef vwrite;
+        std::vector<vk::HwRaster::VersionRef> vreads;
+        std::vector<std::uint32_t> deps;
+        bool done = false;
     };
-    std::vector<Deferred> deferred;
+    std::vector<Item> items;
+    std::vector<std::vector<Access>> pages(512);
+    std::vector<std::uint32_t> held_cluts;
+    int last_compute = -1;
+    const auto page_lo = [](const Span &sp) { return std::min<std::uint32_t>(sp.lo >> 13, 511u); };
+    const auto page_hi = [](const Span &sp) { return std::min<std::uint32_t>((sp.hi - 1) >> 13, 511u); };
+    // Two accesses order each other when one writes, unless both are versions
+    // of one scratch region and differ (each version has its own band).
+    const auto ordered = [](const Access &a, bool write, vk::HwRaster::Chain *chain, std::uint32_t version) {
+        if (!a.write && !write) return false;
+        if (a.chain && chain && a.chain == chain) return a.version == version;
+        return true;
+    };
+    const auto tagged = [&](const Span &sp, const std::vector<vk::HwRaster::VersionRef> &vreads) -> vk::HwRaster::VersionRef {
+        for (const vk::HwRaster::VersionRef &vr : vreads)
+            if (vk::HwRaster::span_inside(sp, hw_.chain_span(*vr.chain))) return vr;
+        return {};
+    };
+    const auto find_deps = [&](const Command &c, const vk::HwRaster::VersionRef &vwrite, const std::vector<vk::HwRaster::VersionRef> &vreads, std::vector<std::uint32_t> &deps) {
+        deps.clear();
+        if (!c.ranged) {
+            for (std::uint32_t i = 0; i < items.size(); ++i) deps.push_back(i);
+            return;
+        }
+        for (const Span &sp : c.reads) {
+            if (sp.hi <= sp.lo) continue;
+            const vk::HwRaster::VersionRef t = tagged(sp, vreads);
+            for (std::uint32_t p = page_lo(sp); p <= page_hi(sp); ++p)
+                for (const Access &a : pages[p])
+                    if (ordered(a, false, t.chain, t.version)) deps.push_back(a.item);
+        }
+        for (const Span &sp : c.writes) {
+            if (sp.hi <= sp.lo) continue;
+            const bool versioned = vwrite.chain && vk::HwRaster::span_inside(sp, hw_.chain_span(*vwrite.chain));
+            for (std::uint32_t p = page_lo(sp); p <= page_hi(sp); ++p)
+                for (const Access &a : pages[p])
+                    if (ordered(a, true, versioned ? vwrite.chain : nullptr, versioned ? vwrite.version : 0)) deps.push_back(a.item);
+        }
+        if (c.pipeline == kRaster && hw_.batch_textured(c, arena, static_cast<const std::uint32_t *>(params))) deps.insert(deps.end(), held_cluts.begin(), held_cluts.end());  // CLUT buffer contents
+        if (c.pipeline != kRaster && last_compute >= 0) deps.push_back(static_cast<std::uint32_t>(last_compute));  // compute commands keep their order
+        std::sort(deps.begin(), deps.end());
+        deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
+    };
+    const auto register_item = [&](std::uint32_t idx, const Command &c, const vk::HwRaster::VersionRef &vwrite, const std::vector<vk::HwRaster::VersionRef> &vreads) {
+        if (!c.ranged) return;
+        for (const Span &sp : c.reads) {
+            if (sp.hi <= sp.lo) continue;
+            const vk::HwRaster::VersionRef t = tagged(sp, vreads);
+            for (std::uint32_t p = page_lo(sp); p <= page_hi(sp); ++p) pages[p].push_back({idx, false, t.chain, t.version});
+        }
+        for (const Span &sp : c.writes) {
+            if (sp.hi <= sp.lo) continue;
+            const bool versioned = vwrite.chain && vk::HwRaster::span_inside(sp, hw_.chain_span(*vwrite.chain));
+            for (std::uint32_t p = page_lo(sp); p <= page_hi(sp); ++p) pages[p].push_back({idx, true, versioned ? vwrite.chain : nullptr, versioned ? vwrite.version : 0});
+        }
+    };
     const auto dispatch = [&](const Command &k, std::uint32_t index, bool timed, bool top_written) {
         if (timed && !top_written) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, index * 2);
         if (k.pipeline == kDecode && hw_on_) {
@@ -416,34 +485,70 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
             dispatch(commands[k], static_cast<std::uint32_t>(k), false, false);
         }
     };
-    const auto draw_held = [&](const Deferred &d) {
+    const auto run_item = [&](Item &d) {
+        ++flushed_items_;
+        if (!d.batch) {
+            for (const vk::HwRaster::VersionRef &vr : d.vreads) hw_.ensure_vram_version(cb, f.set, *vr.chain, vr.version);
+            hw_.before_command(cb, d.c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
+            dispatch(d.c, d.index, d.timed, false);
+            return;
+        }
+        const vk::HwRaster::DrawHints hints{d.vwrite, &d.vreads};
         if (d.timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, d.index * 2);
-        if (hw_.draw(cb, d.c, f.set, arena, static_cast<const std::uint32_t *>(params), f.data.buffer)) {
+        if (hw_.draw(cb, d.c, f.set, arena, static_cast<const std::uint32_t *>(params), f.data.buffer, &hints)) {
+            ++flushed_batches_drawn_;
             if (!hw_.pass_open()) vk::vkCmdPipelineBarrier(cb, shader_stages, shader_stages, 0, 1, &between, 0, nullptr, 0, nullptr);
             if (d.timed) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, d.index * 2 + 1);
             return;
         }
-        static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
-        if (ps2::frame_count() == trace_frame) std::fprintf(stderr, "[pass] f%llu held batch %u declined at flush\n", static_cast<unsigned long long>(ps2::frame_count()), d.index);
+        ++flushed_batches_declined_;
+        // Declined now: through the compute path, after what was skipped for it.
+        for (const vk::HwRaster::VersionRef &vr : d.vreads) hw_.ensure_vram_version(cb, f.set, *vr.chain, vr.version);
         if (d.skipped_from < d.index) replay(d.skipped_from, d.index);
         hw_.close_pass(cb);
         hw_.before_command(cb, d.c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
         dispatch(d.c, d.index, d.timed, true);
+        if (d.vwrite.chain) hw_.band_from_vram(cb, f.set, *d.vwrite.chain, d.vwrite.version);  // its band takes what the compute draw wrote
     };
-    if (hw_on_)
-        hw_.on_pass_closed([&] {
-            std::vector<Deferred> items;
-            items.swap(deferred);
-            hw_.clear_deferred();
-            hw_.clear_held();
-            for (const Deferred &d : items)
-                if (!d.batch) {
-                    hw_.before_command(cb, d.c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
-                    dispatch(d.c, d.index, d.timed, false);
-                }
-            for (const Deferred &d : items)
-                if (d.batch) draw_held(d);
-        });
+    const auto flush = [&] {
+        ++flushes_;
+        std::vector<Item> its;
+        its.swap(items);
+        for (auto &p : pages) p.clear();
+        held_cluts.clear();
+        last_compute = -1;
+        const auto ready = [&](const Item &it) {
+            for (std::uint32_t d : it.deps)
+                if (!its[d].done) return false;
+            return true;
+        };
+        std::size_t remaining = its.size();
+        while (remaining) {
+            int pick = -1;
+            if (hw_.pass_open())
+                for (std::size_t i = 0; i < its.size() && pick < 0; ++i)
+                    if (!its[i].done && its[i].batch && ready(its[i]) && hw_.targets_open_pass(its[i].c, arena, static_cast<const std::uint32_t *>(params), its[i].vwrite)) pick = static_cast<int>(i);
+            if (pick < 0)
+                for (std::size_t i = 0; i < its.size(); ++i)
+                    if (!its[i].done && !its[i].batch) {
+                        if (ready(its[i])) pick = static_cast<int>(i);
+                        break;  // compute commands only in order
+                    }
+            if (pick < 0)
+                for (std::size_t i = 0; i < its.size() && pick < 0; ++i)
+                    if (!its[i].done && its[i].batch && ready(its[i])) pick = static_cast<int>(i);
+            if (pick < 0)
+                for (std::size_t i = 0; i < its.size() && pick < 0; ++i)
+                    if (!its[i].done) pick = static_cast<int>(i);  // cannot happen: the oldest pending item has no pending dependency
+            run_item(its[static_cast<std::size_t>(pick)]);
+            its[static_cast<std::size_t>(pick)].done = true;
+            --remaining;
+        }
+        hw_.resolve_chains(cb, f.set);
+    };
+    if (hw_on_) hw_.on_pass_closed(flush);
+    std::vector<vk::HwRaster::VersionRef> vreads;
+    std::vector<std::uint32_t> deps;
     for (std::uint32_t i = 0; i < commands.size(); ++i) {
         const Command &c = commands[i];
         // Every command writes both of its timestamps, drawn here or not: a
@@ -451,10 +556,25 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
         const bool timed = queries && per_command && i < n;
         bool top_written = false;
         if (c.pipeline == kRaster && hw_on_) {
-            const auto plan = hw_.plan(c, arena, static_cast<const std::uint32_t *>(params));
+            vreads.clear();
+            hw_.version_reads(c, vreads);
+            find_deps(c, vk::HwRaster::VersionRef{}, vreads, deps);
+            const auto plan = hw_.plan(c, arena, static_cast<const std::uint32_t *>(params), !deps.empty());
             if (plan == vk::HwRaster::Plan::Hold) {
+                const vk::HwRaster::VersionRef vwrite = hw_.version_write(c, arena, static_cast<const std::uint32_t *>(params));
+                if (vwrite.chain) find_deps(c, vwrite, vreads, deps);
+                const std::uint32_t idx = static_cast<std::uint32_t>(items.size());
+                register_item(idx, c, vwrite, vreads);
+                static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
+                if (ps2::frame_count() == trace_frame) {
+                    std::fprintf(stderr, "[pass] f%llu hold batch %u: writes %x-%x %x-%x reads %x-%x %x-%x %x-%x %x-%x", static_cast<unsigned long long>(ps2::frame_count()), i, c.writes[0].lo, c.writes[0].hi, c.writes[1].lo, c.writes[1].hi, c.reads[0].lo, c.reads[0].hi, c.reads[1].lo, c.reads[1].hi, c.reads[2].lo, c.reads[2].hi, c.reads[3].lo, c.reads[3].hi);
+                    if (vwrite.chain) std::fprintf(stderr, " | version %u of region %x-%x", vwrite.version, hw_.chain_span(*vwrite.chain).lo, hw_.chain_span(*vwrite.chain).hi);
+                    for (const auto &vr : vreads) std::fprintf(stderr, " | sees version %u of %x-%x", vr.version, hw_.chain_span(*vr.chain).lo, hw_.chain_span(*vr.chain).hi);
+                    std::fprintf(stderr, " | deps %zu\n", deps.size());
+                }
+                items.push_back({true, c, i, timed, skipped_from, vwrite, vreads, deps});
+                ++held_items_;
                 hw_.note_held(c);
-                deferred.push_back({true, c, i, timed, skipped_from});
                 skipped_from = ~static_cast<std::size_t>(0);
                 continue;
             }
@@ -488,18 +608,23 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
             }
             if (c.pipeline == kRaster && skipped_from < i) replay(skipped_from, i);  // declined after all
             skipped_from = ~static_cast<std::size_t>(0);
-            if (hw_.pass_open() && c.pipeline != kRaster && c.ranged && !hw_.held_conflict(c)) {
-                hw_.note_deferred(c);
-                deferred.push_back({false, c, i, timed, 0});
+            if ((hw_.pass_open() || !items.empty()) && c.pipeline != kRaster && c.ranged) {
+                vreads.clear();
+                hw_.version_reads(c, vreads);
+                find_deps(c, vk::HwRaster::VersionRef{}, vreads, deps);
+                const std::uint32_t idx = static_cast<std::uint32_t>(items.size());
+                register_item(idx, c, vk::HwRaster::VersionRef{}, vreads);
+                items.push_back({false, c, i, timed, 0, vk::HwRaster::VersionRef{}, vreads, deps});
+                if (c.pipeline == kLoadClut) held_cluts.push_back(idx);
+                last_compute = static_cast<int>(idx);
                 continue;
             }
-            if (hw_.pass_open()) {
+            if (hw_.pass_open() || !items.empty()) {
                 ++closes_by_pipeline_[c.pipeline];
                 static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
-                if (ps2::frame_count() == trace_frame)
-                    std::fprintf(stderr, "[pass] f%llu device closes for %s%s: reads %x-%x %x-%x writes %x-%x\n", static_cast<unsigned long long>(ps2::frame_count()), kEntryPoints[c.pipeline], !c.ranged ? " (unranged)" : hw_.held_conflict(c) ? " (held batch conflict)" : "",
-                                 c.reads[0].lo, c.reads[0].hi, c.reads[1].lo, c.reads[1].hi, c.writes[0].lo, c.writes[0].hi);
-                hw_.close_pass(cb);  // a compute-drawn batch, an unranged command, or one a held batch must precede: everything held back lands first
+                if (ps2::frame_count() == trace_frame) std::fprintf(stderr, "[pass] f%llu device flushes for %s%s\n", static_cast<unsigned long long>(ps2::frame_count()), kEntryPoints[c.pipeline], !c.ranged ? " (unranged)" : "");
+                hw_.close_pass(cb);  // a compute-drawn batch or an unranged command: everything held lands first, in order
+                flush();
             }
             // The resident surfaces may hold memory this command reads or writes.
             hw_.before_command(cb, c, f.set, arena, static_cast<const std::uint32_t *>(params), false);
@@ -508,6 +633,8 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
     }
     if (hw_on_) {
         hw_.end_frame(cb);  // closes the pass, which records what was held back
+        flush();            // and anything held while no pass was open
+        hw_.end_frame(cb);
         hw_.on_pass_closed(nullptr);
     }
     if (queries && !per_command) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, base + 1);

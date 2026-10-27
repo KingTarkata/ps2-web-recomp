@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(__SWITCH__)
+#include <execinfo.h>
+#endif
+#include <csignal>
 #include "ps2/system.hpp"
 
 #ifdef PS2_WINDOW
@@ -31,6 +35,22 @@ int usage() {
 }
 
 int main(int argc, char **argv) {
+#if defined(__linux__) && !defined(__SWITCH__)
+    // PS2_BACKTRACE=1: a symbolised backtrace on a crash (no debugger needed).
+    if (std::getenv("PS2_BACKTRACE")) {
+        static const auto on_crash = [](int sig) {
+            void *frames[64];
+            const int n = backtrace(frames, 64);
+            std::fprintf(stderr, "\n[crash] signal %d\n", sig);
+            backtrace_symbols_fd(frames, n, 2);
+            std::_Exit(128 + sig);
+        };
+        std::signal(SIGSEGV, on_crash);
+        std::signal(SIGABRT, on_crash);
+        std::signal(SIGBUS, on_crash);
+    }
+#endif
+
     if (argc < 2) return usage();
     std::vector<std::string> args{argv[1]};
     [[maybe_unused]] bool window = false, fullscreen = false;
