@@ -13,11 +13,14 @@
 #include "../gpu/device.hpp"
 #include "context.hpp"
 
+#include <array>
 #include <bitset>
+#include <list>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace ps2::gs::vk {
@@ -70,6 +73,24 @@ private:
     static constexpr std::size_t kMaxSurfaces = 32;
     struct Plane {
         std::bitset<kTiles * kTiles> valid, dirty;
+        std::uint32_t dirty_count = 0;  // tiles set in `dirty` (a bitset scan per query was 2% of the render thread)
+        void reset() {
+            valid.reset();
+            dirty.reset();
+            dirty_count = 0;
+        }
+        void set_dirty(std::size_t t) {
+            if (!dirty[t]) {
+                dirty[t] = true;
+                ++dirty_count;
+            }
+        }
+        void clear_dirty(std::size_t t) {
+            if (dirty[t]) {
+                dirty[t] = false;
+                --dirty_count;
+            }
+        }
     };
     // GS pixels, inclusive.
     struct Rect {
@@ -103,12 +124,17 @@ private:
         Image image;
         std::uint32_t lo = 0, hi = 0;    // GS memory span of the texels
         std::uint32_t clo = 0, chi = 0;  // and of the CLUT source, for indexed formats
-        std::vector<std::uint32_t> blocks, clut_blocks;  // the blocks the texels (and CLUT) were decoded from, sorted
-        std::vector<std::uint64_t> ids, clut_ids;        // their block ids at decode time
+        // The texels' 256-byte blocks as a grid of block cells (cw x ch
+        // texels each), with the block id each cell had at decode time: a
+        // sampled rectangle is checked by indexing, no block list or sort.
+        std::uint32_t cw = 1, ch = 1, cells_x = 0, cells_y = 0;
+        std::vector<std::uint32_t> cell_block, clut_blocks;
+        std::vector<std::uint64_t> cell_id, clut_ids;
         std::uint32_t tw = 0, th = 0;
         bool from_surface = false;  // filled by image copies from a surface, not decoded
         VkDescriptorSet set2 = VK_NULL_HANDLE;
         std::uint64_t last_use = 0;
+        std::list<std::unique_ptr<Texture>>::iterator self;  // position in textures_ (most recent first)
     };
     static constexpr std::size_t kMaxTextures = 1536;
     // Objects a recorded command buffer may still reference.
@@ -155,14 +181,13 @@ private:
     // The texel rectangle a batch's primitives of `setup_index` can sample
     // (false when none do), and the blocks of memory holding a texel rectangle.
     bool texture_texels(const std::uint32_t *setup, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, Rect &texels) const;
-    void texel_blocks(const std::uint32_t *setup, const Rect &texels, std::vector<std::uint32_t> &blocks) const;
     Texture *texture_slot(VkCommandBuffer cb, const std::uint32_t *setup, bool from_surface, bool &created);
     // Resolves what set 2 binds for a textured setup: a surface sampled in
     // place when one mirrors the texture's buffer in the same layout, else
     // a cached texture. Null when neither can serve (memory sampling then).
     VkDescriptorSet texture_set(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *setup, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, const Surface *color,
                                 const Surface *depth);
-    bool texture_current(const Texture &t, const std::vector<std::uint32_t> &footprint) const;
+    bool texture_current(const Texture &t, const Rect *texels) const;  // texels null: CLUT only
     void decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture &t, std::uint32_t setup_offset);
     void copy_surface_texels(VkCommandBuffer cb, VkDescriptorSet set0, Surface &src, Texture &t, const Rect &texels);
     void textures_written(const gpu::Span &span);
@@ -197,8 +222,15 @@ private:
     struct PipelineKey {
         std::uint32_t ztst, zwrite, with_depth, blend, wmask, shader;  // shader 0: hw_fs, 1: hw_fs_cached
         bool operator<(const PipelineKey &o) const { return std::tie(ztst, zwrite, with_depth, blend, wmask, shader) < std::tie(o.ztst, o.zwrite, o.with_depth, o.blend, o.wmask, o.shader); }
+        bool operator==(const PipelineKey &o) const { return std::tie(ztst, zwrite, with_depth, blend, wmask, shader) == std::tie(o.ztst, o.zwrite, o.with_depth, o.blend, o.wmask, o.shader); }
     };
     std::map<PipelineKey, VkPipeline> draw_;
+    struct RecentPipeline {
+        PipelineKey key{};
+        VkPipeline pipeline = VK_NULL_HANDLE;
+    };
+    RecentPipeline recent_[8];  // the last few keys, ahead of the map (a few per batch)
+    unsigned recent_next_ = 0;
     VkPipeline pipeline_for(const PipelineKey &key);
     // Packs a GS blend (A, B, C, D selectors with FIX) into Vulkan factors;
     // 0 when the hardware cannot express it.
@@ -212,8 +244,18 @@ private:
     VkDescriptorSetLayout set2_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool2_ = VK_NULL_HANDLE;
     VkSampler samplers_[4] = {};
-    std::vector<std::unique_ptr<Texture>> textures_;
-    std::vector<std::unique_ptr<Texture>> free_textures_;  // evicted entries, images kept for reuse by size
+    std::list<std::unique_ptr<Texture>> textures_;  // most recently used first; the back is the eviction victim
+    // Key -> entry, for the lookup every textured batch does per setup (a
+    // linear scan of 1536 keys cost 12 ms per race frame on the Switch).
+    struct KeyHash {
+        std::size_t operator()(const std::array<std::uint32_t, 11> &k) const {
+            std::uint64_t h = 0x9E3779B97F4A7C15ull;
+            for (std::uint32_t v : k) h = (h ^ v) * 0xBF58476D1CE4E5B9ull;
+            return static_cast<std::size_t>(h ^ (h >> 29));
+        }
+    };
+    std::unordered_map<std::array<std::uint32_t, 11>, Texture *, KeyHash> texture_index_;
+    std::map<std::uint32_t, std::vector<std::unique_ptr<Texture>>> free_by_size_;  // evicted entries by (tw << 8 | th), images kept for reuse
     std::uint64_t decoded_textures_ = 0, texture_hits_ = 0, surface_samples_ = 0, surface_copies_ = 0;
     std::uint64_t tex_drops_[5] = {};  // by memory_written, write_back, own draw, eviction, changed blocks
     int tex_drop_cause_ = 0;

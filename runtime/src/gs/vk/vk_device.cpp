@@ -6,6 +6,7 @@
 #include "../gpu/device.hpp"
 #include "context.hpp"
 #include "hw.hpp"
+#include "../gpu/cpu_timers.hpp"
 #include "ps2/system.hpp"
 
 #include <algorithm>
@@ -34,6 +35,7 @@ using vk::Buffer;
 using vk::Context;
 
 constexpr int kFrames = 2;              // command buffers in flight
+constexpr std::size_t kArenaMinWords = 8u << 20;  // 32 MB of arena per frame slot before a frame outgrows it
 constexpr std::uint32_t kProfileMax = 2048;
 
 struct Frame {
@@ -59,12 +61,24 @@ public:
             std::fprintf(stderr, "[vk] hardware raster: %llu batches drawn, %llu through the compute rasterizer\n", static_cast<unsigned long long>(hw_.drawn_batches()),
                          static_cast<unsigned long long>(hw_.fallback_batches()));
         if (hw_on_) hw_.print_reasons();
+        cpu_timers::report(ps2::frame_count());
     }
     bool init(const Limits &limits, const std::vector<std::uint32_t> &tables) override;
     bool timestamps() const override { return ctx_.has_timestamps; }
     bool setup_unsupported(const std::uint32_t *setup) const override { return hw_on_ && !hw_.setup_supported(setup); }
     void clut_source(std::uint32_t id, gpu::Span span) override { hw_.clut_source(id, span); }
     void blocks_written(const std::uint32_t *blocks, std::size_t n, std::uint64_t id) override { hw_.blocks_written(blocks, n, id); }
+    bool arena_storage(std::uint32_t *&words, std::size_t &capacity) override {
+        // The slot the next submit uses: its last submission must be done
+        // before the CPU writes into its data buffer (the wait submit() would
+        // otherwise do, moved to the start of the frame).
+        Frame &f = frames_[frame_];
+        wait_frame(f);
+        if (!ensure_frame_capacity(f, 0, kArenaMinWords)) return false;
+        words = static_cast<std::uint32_t *>(f.data.mapped);
+        capacity = static_cast<std::size_t>(f.data.size / 4);
+        return words != nullptr;
+    }
     void write(gpu::Buffer b, std::uint64_t offset, const void *data, std::uint64_t bytes) override;
     void submit(const std::vector<Command> &commands, const void *params, std::size_t param_bytes, const std::uint32_t *arena, std::size_t arena_words, bool present) override;
     void submit_profiled(const std::vector<Command> &commands, const void *params, std::size_t param_bytes, const std::uint32_t *arena, std::size_t arena_words,
@@ -232,7 +246,7 @@ bool VkDevice_::ensure_frame_capacity(Frame &f, std::size_t param_bytes, std::si
         wait_frame(f);
         ctx_.destroy_buffer(f.data);
         const std::uint64_t size = std::max<std::uint64_t>(f.data.size * 2, (data_bytes + (4u << 20) - 1) & ~((4ull << 20) - 1));
-        if (!ctx_.create_buffer(f.data, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true)) return false;
+        if (!ctx_.create_buffer(f.data, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, true)) return false;  // cached: the CPU reads the arena back (hardware path)
         changed = true;
     }
     const std::uint64_t wanted = std::max<std::uint64_t>(param_bytes, kParamStride);
@@ -264,6 +278,7 @@ void VkDevice_::write_descriptors(Frame &f) {
 }
 
 void VkDevice_::wait_frame(Frame &f) {
+    cpu_timers::Scope timer(cpu_timers::kWaitFrame);
     if (!f.submitted) return;
     vk::vkWaitForFences(ctx_.device, 1, &f.fence, VK_TRUE, ~0ull);
     vk::vkResetFences(ctx_.device, 1, &f.fence);
@@ -276,7 +291,7 @@ bool VkDevice_::init(const Limits &limits, const std::vector<std::uint32_t> &tab
     if (!ctx_.create_buffer(vram_, limits.vram_bytes, storage, false) || !ctx_.create_buffer(tables_, tables.size() * 4, storage, false) ||
         !ctx_.create_buffer(clut_, limits.clut_bytes, storage, false) || !ctx_.create_buffer(scratch_, limits.scratch_bytes, storage, false) ||
         !ctx_.create_buffer(cache_, limits.cache_bytes, storage, false) || !ctx_.create_buffer(decoded_, limits.decoded_bytes, storage, false) ||
-        !ctx_.create_buffer(readback_, limits.readback_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true) ||
+        !ctx_.create_buffer(readback_, limits.readback_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, true) ||
         !ctx_.create_buffer(staging_, 4u << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true)) {
         std::fprintf(stderr, "[vk] cannot allocate the GS buffers\n");
         return false;
@@ -298,6 +313,7 @@ bool VkDevice_::init(const Limits &limits, const std::vector<std::uint32_t> &tab
 }
 
 void VkDevice_::write(gpu::Buffer b, std::uint64_t offset, const void *data, std::uint64_t bytes) {
+    cpu_timers::Scope timer(cpu_timers::kWrite);
     if (b == gpu::Buffer::Vram && hw_on_) hw_.drop_all();
     Buffer &target = buffer(b, &frames_[frame_]);
     if (target.mapped) {
@@ -422,6 +438,7 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
 
 void VkDevice_::submit(const std::vector<Command> &commands, const void *params, std::size_t param_bytes, const std::uint32_t *arena, std::size_t arena_words, bool) {
     if (commands.empty()) return;
+    cpu_timers::Scope timer(cpu_timers::kSubmit);
     // Collect the GPU time of the frame measured two submits ago.
     if (query_pending_ && queries_) {
         Frame &q = frames_[query_frame_];
@@ -437,7 +454,8 @@ void VkDevice_::submit(const std::vector<Command> &commands, const void *params,
     Frame &f = frames_[frame_];
     wait_frame(f);
     if (!ensure_frame_capacity(f, param_bytes, arena_words)) return;
-    std::memcpy(f.data.mapped, arena, arena_words * 4);
+    if (arena != static_cast<const std::uint32_t *>(f.data.mapped)) std::memcpy(f.data.mapped, arena, arena_words * 4);  // built elsewhere (first frame, or outgrew the buffer)
+    ctx_.flush(f.data, 0, arena_words * 4);
     std::memcpy(f.params.mapped, params, param_bytes);
     const bool measure = queries_ && !query_pending_;
     hw_.begin_frame(frame_);
@@ -471,7 +489,8 @@ void VkDevice_::submit_profiled(const std::vector<Command> &commands, const void
     Frame &f = frames_[frame_];
     wait_frame(f);
     if (!ensure_frame_capacity(f, param_bytes, arena_words)) return;
-    std::memcpy(f.data.mapped, arena, arena_words * 4);
+    if (arena != static_cast<const std::uint32_t *>(f.data.mapped)) std::memcpy(f.data.mapped, arena, arena_words * 4);  // built elsewhere (first frame, or outgrew the buffer)
+    ctx_.flush(f.data, 0, arena_words * 4);
     std::memcpy(f.params.mapped, params, param_bytes);
     hw_.begin_frame(frame_);
     record(f.cb, commands, f, profile_queries_, 0, true, arena, params);
@@ -492,6 +511,7 @@ void VkDevice_::submit_profiled(const std::vector<Command> &commands, const void
 }
 
 void VkDevice_::read_back(gpu::Buffer b, std::uint64_t offset, std::uint64_t bytes, void *out) {
+    cpu_timers::Scope timer(cpu_timers::kReadBack);
     if (b == gpu::Buffer::Vram && hw_on_) hw_.flush_sync(frames_[(frame_ + kFrames - 1) % kFrames].set, {static_cast<std::uint32_t>(offset), static_cast<std::uint32_t>(offset + bytes)});
     Buffer &src = buffer(b, &frames_[(frame_ + kFrames - 1) % kFrames]);
     auto *dst = static_cast<std::uint8_t *>(out);
@@ -509,6 +529,7 @@ void VkDevice_::read_back(gpu::Buffer b, std::uint64_t offset, std::uint64_t byt
         after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
         vk::vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
         ctx_.end_once(cb);
+        ctx_.invalidate(readback_, 0, chunk);
         std::memcpy(dst, readback_.mapped, chunk);
         dst += chunk;
         offset += chunk;
@@ -517,6 +538,7 @@ void VkDevice_::read_back(gpu::Buffer b, std::uint64_t offset, std::uint64_t byt
 }
 
 int VkDevice_::begin_read(gpu::Buffer b, std::uint64_t offset, std::uint64_t bytes) {
+    cpu_timers::Scope timer(cpu_timers::kReadBack);
     int slot = -1;
     for (int i = 0; i < kReadSlots; ++i)
         if (!reads_[i].busy) slot = i;
@@ -524,7 +546,7 @@ int VkDevice_::begin_read(gpu::Buffer b, std::uint64_t offset, std::uint64_t byt
     ReadSlot &r = reads_[slot];
     if (r.staging.size < bytes) {
         ctx_.destroy_buffer(r.staging);
-        if (!ctx_.create_buffer(r.staging, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true)) return -1;
+        if (!ctx_.create_buffer(r.staging, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, true)) return -1;
     }
     vk::vkResetFences(ctx_.device, 1, &r.fence);
     if (b == gpu::Buffer::Vram && hw_on_) hw_.flush_sync(frames_[(frame_ + kFrames - 1) % kFrames].set, {static_cast<std::uint32_t>(offset), static_cast<std::uint32_t>(offset + bytes)});
@@ -542,11 +564,13 @@ int VkDevice_::poll_read(int slot, void *out) {
     if (s == VK_NOT_READY) return 0;
     r.busy = false;
     if (s != VK_SUCCESS) return -1;
+    ctx_.invalidate(r.staging, 0, r.bytes);
     std::memcpy(out, r.staging.mapped, r.bytes);
     return 1;
 }
 
 int VkDevice_::wait_read(int slot, void *out) {
+    cpu_timers::Scope timer(cpu_timers::kReadBack);
     if (slot < 0 || slot >= kReadSlots || !reads_[slot].busy) return -1;
     vk::vkWaitForFences(ctx_.device, 1, &reads_[slot].fence, VK_TRUE, ~0ull);
     return poll_read(slot, out);

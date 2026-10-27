@@ -1,6 +1,7 @@
 #include "hw.hpp"
 #include "ps2/system.hpp"
 #include "../gs.hpp"
+#include "../gpu/cpu_timers.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -325,8 +326,13 @@ std::uint32_t HwRaster::blend_key(const std::uint32_t *w, bool dual_source) {
 }
 
 VkPipeline HwRaster::pipeline_for(const PipelineKey &key) {
+    for (const RecentPipeline &r : recent_)
+        if (r.pipeline && r.key == key) return r.pipeline;
     const auto it = draw_.find(key);
-    if (it != draw_.end()) return it->second;
+    if (it != draw_.end()) {
+        recent_[recent_next_++ % 8] = {key, it->second};
+        return it->second;
+    }
     VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attrs[4] = {
         {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, x)},
@@ -669,8 +675,7 @@ bool HwRaster::allocate(Surface &s, std::uint32_t width, std::uint32_t height) {
             s.set2 = VK_NULL_HANDLE;
         }
     }
-    s.plane.valid.reset();
-    s.plane.dirty.reset();
+    s.plane.reset();
     return true;
 }
 
@@ -699,8 +704,7 @@ void HwRaster::retire(Surface &s) {
     s.image = Image{};
     s.set1[0] = s.set1[1] = VK_NULL_HANDLE;
     s.width = s.height = 0;
-    s.plane.valid.reset();
-    s.plane.dirty.reset();
+    s.plane.reset();
 }
 
 // The resident surface for a buffer, created or grown so `needed` fits.
@@ -923,7 +927,7 @@ void HwRaster::import_tiles(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s
 // Writes the dirty tiles of `rect` back to memory. Other surfaces that
 // alias that memory lose the tiles the write covers.
 void HwRaster::write_back(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect, bool drop_aliases) {
-    if (s.plane.dirty.none() || !s.image.image) return;
+    if (!s.plane.dirty_count || !s.image.image) return;
     const auto rects = tile_rects(s.plane, rect, [](const Plane &q, std::uint32_t t) { return q.dirty[t]; });
     if (rects.empty()) return;
     copy_rects(cb, set0, s, false, rects);
@@ -946,7 +950,7 @@ void HwRaster::write_back(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
     }
     const std::uint32_t tx0 = rect.x0 / kTile, tx1 = rect.x1 / kTile, ty0 = rect.y0 / kTile, ty1 = rect.y1 / kTile;
     for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
-        for (std::uint32_t tx = tx0; tx <= tx1; ++tx) s.plane.dirty[ty * kTiles + tx] = false;
+        for (std::uint32_t tx = tx0; tx <= tx1; ++tx) s.plane.clear_dirty(ty * kTiles + tx);
 }
 
 void HwRaster::invalidate(Surface &s, const Rect &rect) {
@@ -954,7 +958,7 @@ void HwRaster::invalidate(Surface &s, const Rect &rect) {
     for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
         for (std::uint32_t tx = tx0; tx <= tx1; ++tx) {
             s.plane.valid[ty * kTiles + tx] = false;
-            s.plane.dirty[ty * kTiles + tx] = false;
+            s.plane.clear_dirty(ty * kTiles + tx);
         }
 }
 
@@ -963,7 +967,7 @@ void HwRaster::mark_dirty(Surface &s, const Rect &rect) {
     for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
         for (std::uint32_t tx = tx0; tx <= tx1; ++tx) {
             s.plane.valid[ty * kTiles + tx] = true;
-            s.plane.dirty[ty * kTiles + tx] = true;
+            s.plane.set_dirty(ty * kTiles + tx);
         }
 }
 
@@ -1033,13 +1037,12 @@ void HwRaster::barrier_copies_visible(VkCommandBuffer cb) {
 }
 
 void HwRaster::before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, bool next_is_hw_raster) {
+    cpu_timers::Scope timer(cpu_timers::kBefore);
     if (surfaces_.empty()) return;
     // The snapshot before a hardware-drawn batch copies memory the batch
     // will not read (it samples the surface image): no write-back for it.
     if (cmd.pipeline == gpu::kSnapshot && next_is_hw_raster) return;
     const std::uint64_t before = exported_px_;
-    bool any_dirty = false;
-    for (auto &s : surfaces_) any_dirty = any_dirty || s->plane.dirty.any();
     if (!cmd.ranged) {
         const Rect all{0, 0, kTargetSize - 1, kTargetSize - 1};
         for (auto &s : surfaces_) {
@@ -1089,7 +1092,7 @@ void HwRaster::before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDes
         for (const gpu::Span &sp : cmd.writes) memory_written(cb, set0, sp, own_color, own_depth);
         keep_textures_ = false;
     }
-    if (any_dirty && exported_px_ != before) {
+    if (exported_px_ != before) {
         static const bool trace = std::getenv("PS2_HW_TRACE") != nullptr;
         if (trace) {
             static const char *const names[] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode"};
@@ -1103,7 +1106,7 @@ void HwRaster::before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDes
 void HwRaster::flush_sync(VkDescriptorSet set0, const gpu::Span &span) {
     bool hit = false;
     Rect r;
-    for (auto &s : surfaces_) hit = hit || (s->plane.dirty.any() && span_rect(*s, span, r));
+    for (auto &s : surfaces_) hit = hit || (s->plane.dirty_count && span_rect(*s, span, r));
     if (!hit) return;
     VkCommandBuffer cb = ctx_->begin_once();
     memory_read(cb, set0, span);
@@ -1117,9 +1120,9 @@ void HwRaster::flush_sync(VkDescriptorSet set0, const gpu::Span &span) {
 void HwRaster::drop_all() {
     for (auto &t : textures_) retire_texture(*t);
     textures_.clear();
+    texture_index_.clear();
     for (auto &s : surfaces_) {
-        s->plane.valid.reset();
-        s->plane.dirty.reset();
+        s->plane.reset();
     }
 }
 
@@ -1228,23 +1231,19 @@ bool HwRaster::texture_texels(const std::uint32_t *w, const std::uint32_t *prims
     return texels.x0 <= texels.x1 && texels.y0 <= texels.y1;
 }
 
-void HwRaster::texel_blocks(const std::uint32_t *w, const Rect &texels, std::vector<std::uint32_t> &blocks) const {
-    blocks.clear();
-    std::uint32_t cw, ch;
-    block_cell(w[14], cw, ch);
-    for (std::uint32_t y = texels.y0 - texels.y0 % ch; y <= texels.y1; y += ch)
-        for (std::uint32_t x = texels.x0 - texels.x0 % cw; x <= texels.x1; x += cw) blocks.push_back(pixel_address(w[14], w[12], w[13], x, y) >> 8);
-    std::sort(blocks.begin(), blocks.end());
-    blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
-}
-
-// Still matches memory where this batch samples it: every footprint block
-// (and the whole CLUT) carries the id it had when the texture was decoded.
-bool HwRaster::texture_current(const Texture &t, const std::vector<std::uint32_t> &footprint) const {
-    for (std::uint32_t b : footprint) {
-        const auto it = std::lower_bound(t.blocks.begin(), t.blocks.end(), b);
-        if (it == t.blocks.end() || *it != b) return false;
-        if (t.ids[static_cast<std::size_t>(it - t.blocks.begin())] != block_ids_[b & 16383u]) return false;
+// Still matches memory where this batch samples it: every block cell under
+// the sampled rectangle (and the whole CLUT) carries the id it had when the
+// texture was decoded.
+bool HwRaster::texture_current(const Texture &t, const Rect *texels) const {
+    if (texels && t.cells_x && t.cells_y) {
+        const std::uint32_t cx0 = texels->x0 / t.cw, cx1 = std::min(texels->x1 / t.cw, t.cells_x - 1);
+        const std::uint32_t cy0 = texels->y0 / t.ch, cy1 = std::min(texels->y1 / t.ch, t.cells_y - 1);
+        for (std::uint32_t cy = cy0; cy <= cy1; ++cy) {
+            const std::uint32_t *blocks = t.cell_block.data() + static_cast<std::size_t>(cy) * t.cells_x;
+            const std::uint64_t *ids = t.cell_id.data() + static_cast<std::size_t>(cy) * t.cells_x;
+            for (std::uint32_t cx = cx0; cx <= cx1; ++cx)
+                if (ids[cx] != block_ids_[blocks[cx] & 16383u]) return false;
+        }
     }
     for (std::size_t i = 0; i < t.clut_blocks.size(); ++i)
         if (t.clut_ids[i] != block_ids_[t.clut_blocks[i] & 16383u]) return false;
@@ -1257,7 +1256,7 @@ void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture 
     memory_read(cb, set0, gpu::Span{t.lo, t.hi});
     if (t.chi > t.clo) memory_read(cb, set0, gpu::Span{t.clo, t.chi});
     if (exported_px_ != before) barrier_copies_visible(cb);
-    for (std::size_t i = 0; i < t.blocks.size(); ++i) t.ids[i] = block_ids_[t.blocks[i] & 16383u];
+    for (std::size_t i = 0; i < t.cell_block.size(); ++i) t.cell_id[i] = block_ids_[t.cell_block[i] & 16383u];
     for (std::size_t i = 0; i < t.clut_blocks.size(); ++i) t.clut_ids[i] = block_ids_[t.clut_blocks[i] & 16383u];
     const std::uint32_t width = 1u << t.tw, height = 1u << t.th;
     std::uint32_t words[kUniformWords] = {setup_offset, 0, 0, 0, 0, 0, width, height, scale_, 0, 0, 0};
@@ -1307,34 +1306,33 @@ VkDescriptorSet HwRaster::texture_set(VkCommandBuffer cb, VkDescriptorSet set0, 
 // for a setup's texture without filling it.
 HwRaster::Texture *HwRaster::texture_slot(VkCommandBuffer cb, const std::uint32_t *w, bool from_surface, bool &created) {
     created = false;
-    std::uint32_t key[11];
+    std::array<std::uint32_t, 11> key;
     for (int i = 0; i < 9; ++i) key[i] = w[12 + i];
     key[9] = from_surface ? 0xFFFFFFFFu : w[22] >> 12;  // the CLUT source, not the slot it was loaded into
     key[10] = (w[0] & 32768u) | (from_surface ? 1u : 0u);  // AEM
-    for (auto &tp : textures_)
-        if (std::memcmp(tp->key, key, sizeof key) == 0) {
-            tp->last_use = ++use_counter_;
-            return tp.get();
-        }
+    if (const auto it = texture_index_.find(key); it != texture_index_.end()) {
+        it->second->last_use = ++use_counter_;
+        textures_.splice(textures_.begin(), textures_, it->second->self);
+        return it->second;
+    }
     created = true;
     const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
     const std::uint32_t width = 1u << tw, height = 1u << th;
     if (textures_.size() >= kMaxTextures) {
         // Evict the least recently used; its image and set stay for reuse.
-        std::size_t victim = 0;
-        for (std::size_t i = 1; i < textures_.size(); ++i)
-            if (textures_[i]->last_use < textures_[victim]->last_use) victim = i;
+        std::unique_ptr<Texture> victim = std::move(textures_.back());
+        textures_.pop_back();
         ++tex_drops_[3];
-        free_textures_.push_back(std::move(textures_[victim]));
-        textures_.erase(textures_.begin() + static_cast<std::ptrdiff_t>(victim));
+        std::array<std::uint32_t, 11> victim_key;
+        std::memcpy(victim_key.data(), victim->key, sizeof victim_key);
+        texture_index_.erase(victim_key);
+        free_by_size_[(victim->tw << 8) | victim->th].push_back(std::move(victim));
     }
     std::unique_ptr<Texture> t;
-    for (std::size_t i = 0; i < free_textures_.size(); ++i)
-        if (free_textures_[i]->tw == tw && free_textures_[i]->th == th) {
-            t = std::move(free_textures_[i]);
-            free_textures_.erase(free_textures_.begin() + static_cast<std::ptrdiff_t>(i));
-            break;
-        }
+    if (const auto fit = free_by_size_.find((tw << 8) | th); fit != free_by_size_.end() && !fit->second.empty()) {
+        t = std::move(fit->second.back());
+        fit->second.pop_back();
+    }
     if (t) {
         // Whatever still samples the old contents in this command buffer
         // finishes before they are overwritten.
@@ -1384,7 +1382,7 @@ HwRaster::Texture *HwRaster::texture_slot(VkCommandBuffer cb, const std::uint32_
         }
         vkUpdateDescriptorSets(ctx_->device, 2, ws, 0, nullptr);
     }
-    std::memcpy(t->key, key, sizeof key);
+    std::memcpy(t->key, key.data(), sizeof t->key);
     t->from_surface = from_surface;
     t->tw = tw;
     t->th = th;
@@ -1403,19 +1401,21 @@ HwRaster::Texture *HwRaster::texture_slot(VkCommandBuffer cb, const std::uint32_
                 t->chi = clut_spans_[id].hi;
             }
         }
-        std::uint32_t cw, ch;
-        block_cell(tpsm, cw, ch);
-        for (std::uint32_t y = 0; y < height; y += ch)
-            for (std::uint32_t x = 0; x < width; x += cw) t->blocks.push_back(pixel_address(tpsm, w[12], w[13], x, y) >> 8);
-        std::sort(t->blocks.begin(), t->blocks.end());
-        t->blocks.erase(std::unique(t->blocks.begin(), t->blocks.end()), t->blocks.end());
-        t->ids.resize(t->blocks.size());
+        block_cell(tpsm, t->cw, t->ch);
+        t->cells_x = (width + t->cw - 1) / t->cw;
+        t->cells_y = (height + t->ch - 1) / t->ch;
+        t->cell_block.resize(static_cast<std::size_t>(t->cells_x) * t->cells_y);
+        t->cell_id.assign(t->cell_block.size(), 0);
+        for (std::uint32_t cy = 0; cy < t->cells_y; ++cy)
+            for (std::uint32_t cx = 0; cx < t->cells_x; ++cx) t->cell_block[static_cast<std::size_t>(cy) * t->cells_x + cx] = pixel_address(tpsm, w[12], w[13], cx * t->cw, cy * t->ch) >> 8;
         for (std::uint32_t b = t->clo >> 8; b < (t->chi + 255) >> 8; ++b) t->clut_blocks.push_back(b);
         t->clut_ids.resize(t->clut_blocks.size());
     }
     t->last_use = ++use_counter_;
-    textures_.push_back(std::move(t));
-    return textures_.back().get();
+    textures_.push_front(std::move(t));
+    textures_.front()->self = textures_.begin();
+    texture_index_.emplace(key, textures_.front().get());
+    return textures_.front().get();
 }
 
 // Copies the texels a batch reads from the surface it also draws into.
@@ -1445,45 +1445,53 @@ void HwRaster::copy_surface_texels(VkCommandBuffer cb, VkDescriptorSet set0, Sur
 }
 
 HwRaster::Texture *HwRaster::texture_for(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *w, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index) {
-    static std::vector<std::uint32_t> footprint;
+    cpu_timers::Scope timer(cpu_timers::kTextureFor);
     Rect texels;
-    const bool sampled = texture_texels(w, prims, count, setup_index, texels);
-    bool fresh = false;
-    Texture *slot = texture_slot(cb, w, false, fresh);
-    if (!slot) return nullptr;
-    if (!fresh && sampled) texel_blocks(w, texels, footprint);
-    if (!sampled) footprint.clear();
+    bool sampled;
     {
-        Texture &t = *slot;
-        static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
-        if (!fresh && ((debug & 131072u) || texture_current(t, footprint))) {  // 131072: timing only, never re-decode
-            ++texture_hits_;
-            return &t;
-        }
-        if (!fresh) ++tex_drops_[4];
-        static int shown = 0;
-        if (std::getenv("PS2_TEX_TRACE") && shown < 4000 && frame_count() == 5404) {
-            ++shown;
-            std::fprintf(stderr, "[tex] f%llu stale tbp %u tbw %u psm %02x %ux%u clut %u footprint %zu blocks:", static_cast<unsigned long long>(frame_count()), w[12], w[13], w[14], 1u << t.tw, 1u << t.th, w[22] >> 12, footprint.size());
-            int listed = 0;
-            for (std::uint32_t b : footprint) {
-                const auto it = std::lower_bound(t.blocks.begin(), t.blocks.end(), b);
-                if (it == t.blocks.end() || *it != b) { std::fprintf(stderr, " [%u not in texture]", b); continue; }
-                const std::uint64_t was = t.ids[static_cast<std::size_t>(it - t.blocks.begin())], now = block_ids_[b & 16383u];
-                if (was != now && listed++ < 4) std::fprintf(stderr, " [%u: %s%llx -> %s%llx]", b, (was >> 63) ? "w" : "u", (unsigned long long)(was & 0xFFFFFFFFull), (now >> 63) ? "w" : "u", (unsigned long long)(now & 0xFFFFFFFFull));
-            }
-            for (std::size_t i = 0; i < t.clut_blocks.size() && listed < 6; ++i)
-                if (t.clut_ids[i] != block_ids_[t.clut_blocks[i] & 16383u]) { ++listed; std::fprintf(stderr, " [clut %u: %llx -> %llx]", t.clut_blocks[i], (unsigned long long)(t.clut_ids[i] & 0xFFFFFFFFull), (unsigned long long)(block_ids_[t.clut_blocks[i] & 16383u] & 0xFFFFFFFFull)); }
-            std::fprintf(stderr, "\n");
-        }
-        decode_texture(cb, set0, t, setup_offset);
+        cpu_timers::Scope t(cpu_timers::kTexels);
+        sampled = texture_texels(w, prims, count, setup_index, texels);
+    }
+    bool fresh = false;
+    Texture *slot;
+    {
+        cpu_timers::Scope t(cpu_timers::kSlot);
+        slot = texture_slot(cb, w, false, fresh);
+    }
+    if (!slot) return nullptr;
+    Texture &t = *slot;
+    static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
+    bool current;
+    {
+        cpu_timers::Scope tc(cpu_timers::kCurrent);
+        current = !fresh && ((debug & 131072u) || texture_current(t, sampled ? &texels : nullptr));  // 131072: timing only, never re-decode
+    }
+    if (current) {
+        ++texture_hits_;
         return &t;
     }
+    if (!fresh) ++tex_drops_[4];
+    static int shown = 0;
+    if (std::getenv("PS2_TEX_TRACE") && shown < 4000 && frame_count() == 5404) {
+        ++shown;
+        std::size_t stale = 0;
+        for (std::size_t i = 0; i < t.cell_block.size(); ++i) stale += t.cell_id[i] != block_ids_[t.cell_block[i] & 16383u];
+        std::size_t stale_clut = 0;
+        for (std::size_t i = 0; i < t.clut_blocks.size(); ++i) stale_clut += t.clut_ids[i] != block_ids_[t.clut_blocks[i] & 16383u];
+        std::fprintf(stderr, "[tex] f%llu %s tbp %u tbw %u psm %02x %ux%u clut %u: texels %u,%u-%u,%u, %zu of %zu cells stale, %zu of %zu clut blocks stale\n", static_cast<unsigned long long>(frame_count()), fresh ? "new" : "stale", w[12], w[13], w[14], 1u << t.tw, 1u << t.th, w[22] >> 12,
+                     texels.x0, texels.y0, texels.x1, texels.y1, stale, t.cell_block.size(), stale_clut, t.clut_blocks.size());
+    }
+    {
+        cpu_timers::Scope td(cpu_timers::kDecode);
+        decode_texture(cb, set0, t, setup_offset);
+    }
+    return &t;
 }
 
 // ---- Drawing ---------------------------------------------------------------
 
 bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, VkBuffer) {
+    cpu_timers::Scope timer(cpu_timers::kDraw);
     // PS2_HW_DEBUG bits, for isolating driver trouble: 1 skip batches that
     // need depth, 8 paint every fragment magenta, 16 paint the raw texel,
     // 256 skip blended, 512 skip textured, 1024 skip triangles, 2048 print
@@ -1808,6 +1816,10 @@ void HwRaster::destroy() {
     ctx_->destroy_image(decoded_);
     for (auto &t : textures_) ctx_->destroy_image(t->image);
     textures_.clear();
+    texture_index_.clear();
+    for (auto &[size, list] : free_by_size_)
+        for (auto &t : list) ctx_->destroy_image(t->image);
+    free_by_size_.clear();
     for (VkSampler sm : samplers_)
         if (sm) vkDestroySampler(ctx_->device, sm, nullptr);
     if (pool2_) vkDestroyDescriptorPool(ctx_->device, pool2_, nullptr);

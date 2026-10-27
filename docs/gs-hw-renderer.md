@@ -303,3 +303,43 @@ for the first time); the texture cache costs about 20 ms of CPU per frame
 in the single-threaded figure, which is the next thing to cut: block-id
 validation over the sampled footprint, `blocks_of` per upload chunk, and
 the linear key search in `texture_slot`.
+
+### 2026-10-27, evening: the render thread, measured and trimmed
+
+With the GPU at 41.6 ms the threaded run sat at 47-56 ms, so the CPU was
+the limit. Per-thread sampling on the Switch showed the main thread, which
+runs the render queue in this host, at 98% of a core while the emulation
+and VU threads were at about 50% each. Section timers (`PS2_HW_TIMERS=1`
+or `from,to`, printed with the device stats as `[cpu]` lines) and `perf`
+(installed on the device; `/usr/lib/linux-tools/*/perf record -g -t <main
+tid>`) on the race frames gave, per frame on the main thread:
+
+| Section | before | after |
+|---|---|---|
+| present (device submit: record, draws, texture lookups) | 42.0 ms | 29.0 ms |
+| texture_slot (key lookup: linear scan of 1536 keys, LRU scan on creation) | 11.8 ms | 1.7 ms |
+| texture validity (sorted block list built and binary-searched per lookup) | 1.6 ms | 0.2 ms |
+| submit memcpy of the arena into the mapped buffer | ~4 ms (10% of the thread) | 0 |
+| gif::render (register writes, batching, uploads) | 21.4 ms | 21.9 ms |
+
+Changes: a hash index over texture keys with the texture list kept in LRU
+order (victim at the back) and evicted images filed by size; texture
+validity as a grid of block cells checked by indexing the sampled
+rectangle; a dirty-tile counter per surface instead of bitset scans; a
+small recent-pipeline cache ahead of the pipeline map; the data arena built
+directly in the device's mapped buffer for the coming submit (host-cached
+memory, flushed at submit; the read-back buffers are host-cached too and
+invalidated before the CPU reads them). Threaded race: 41-42.5 ms per
+frame, GPU busy near or over 100% again, main thread about 50 ms of work
+per 55 ms of wall time.
+
+The GPU side, from a least-squares fit of the per-batch timestamps against
+batch size: about 18 us fixed per batch (4 ms per frame), the rest
+proportional to covered tiles, which is fragment work. The fragment shader
+rebuilds the whole setup record per fragment and keeps every GS feature
+live; specialising it per batch kind (texturing, alpha test, fog, blend)
+is the next GPU item. Next CPU items: the GS front end (write_packed,
+kick, draw: 22 ms per frame, shared code), the compute tile lists built
+for batches the hardware draws (about 3 ms), the SDL presentation path
+(two copies of the frame plus a GPU read-back: about 3 ms and a sync),
+and the 48-byte vertex format.

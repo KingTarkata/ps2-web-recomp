@@ -108,6 +108,10 @@ struct Device {
     // the same upload repeated gives the same ids, so a texture cache can
     // tell a texture re-streamed unchanged from one that changed.
     virtual void blocks_written(const std::uint32_t *, std::size_t, std::uint64_t) {}
+    // Memory the next submit's arena may be built in directly (the device's
+    // own mapped buffer for that submit), so nothing is copied at submit time.
+    // False when the device has no such memory; the caller then keeps its own.
+    virtual bool arena_storage(std::uint32_t *&, std::size_t &) { return false; }
 
     virtual bool attach_surface(const SurfaceTarget &target) = 0;
     virtual void resize_surface(std::uint32_t width, std::uint32_t height) = 0;

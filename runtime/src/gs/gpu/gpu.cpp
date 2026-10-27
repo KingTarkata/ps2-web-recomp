@@ -4,6 +4,7 @@
 #include "gpu.hpp"
 #include "device.hpp"
 #include "../gs.hpp"
+#include "cpu_timers.hpp"
 #include "ps2/system.hpp"
 
 #include <algorithm>
@@ -59,28 +60,47 @@ std::uint64_t g_profile_from = 0, g_profile_to = 0;
 
 std::vector<Command> g_commands;
 std::vector<std::array<std::uint32_t, kParamStride / 4>> g_param_records;
+// The per-submit data arena. Between submits it is built directly in the
+// device's mapped buffer for the coming submit when the device offers one
+// (Device::arena_storage), so the submit copies nothing; a frame that
+// outgrows that buffer moves to heap storage and is copied as before.
 struct Arena {
-    std::unique_ptr<std::uint32_t[]> words;
+    std::unique_ptr<std::uint32_t[]> owned;
+    std::uint32_t *base = nullptr;  // owned.get(), or the device's memory
     std::size_t used = 0, capacity = 0;
 
+    void adopt(std::uint32_t *external, std::size_t words) {
+        owned.reset();
+        base = external;
+        capacity = words;
+        used = 0;
+    }
+    void release_external() {
+        if (!owned) {
+            base = nullptr;
+            capacity = 0;
+        }
+        used = 0;
+    }
     std::uint32_t *grow(std::size_t count) {
         if (used + count > capacity) {
             std::size_t next = std::max<std::size_t>(capacity * 2, 1u << 20);
             while (next < used + count) next *= 2;
             auto bigger = std::make_unique_for_overwrite<std::uint32_t[]>(next);
-            if (used) std::memcpy(bigger.get(), words.get(), used * 4);
-            words = std::move(bigger);
+            if (used) std::memcpy(bigger.get(), base, used * 4);
+            owned = std::move(bigger);
+            base = owned.get();
             capacity = next;
         }
-        std::uint32_t *at = words.get() + used;
+        std::uint32_t *at = base + used;
         used += count;
         return at;
     }
     std::size_t size() const { return used; }
     bool empty() const { return !used; }
     void clear() { used = 0; }
-    std::uint32_t *data() { return words.get(); }
-    std::uint32_t &operator[](std::size_t i) { return words[i]; }
+    std::uint32_t *data() { return base; }
+    std::uint32_t &operator[](std::size_t i) { return base[i]; }
 } g_arena;
 std::uint32_t g_clut_slot = 0, g_clut_loads = 0, g_texflushes = 0;
 std::map<std::array<std::uint32_t, 6>, std::uint32_t> g_clut_sources;  // (cbp, cbw, cpsm, csm, cou, cov) -> id, for texture caches
@@ -522,6 +542,7 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
 void batch_ranges();
 
 void flush_batch() {
+    cpu_timers::Scope timer(cpu_timers::kFlushBatch);
     Batch &b = g_batch;
     if (b.prims.empty()) {
         b.key = ~0ull;
@@ -665,6 +686,7 @@ void emit_pre() {
 }
 
 void emit_all() {
+    cpu_timers::Scope timer(cpu_timers::kEmitAll);
     emit_pre();
     flush_batch();
 }
@@ -688,6 +710,7 @@ void blocks_of(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, int x0, in
 }
 
 std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uint32_t lead_bits) {
+    cpu_timers::Scope timer(cpu_timers::kQueueUpload);
     Image &im = g_image;
     const std::uint64_t bits = static_cast<std::uint64_t>(size) * 8;
     if (bits <= lead_bits) return 0;
@@ -711,6 +734,7 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     // Tell the device which blocks this chunk writes and with what content,
     // so textures decoded from them survive the same upload next frame.
     {
+        cpu_timers::Scope timer(cpu_timers::kUploadBlocks);
         static std::vector<std::uint32_t> blocks;
         blocks_of(im.dpsm, im.dbp, im.dbw, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1), static_cast<int>(im.dsay + last), blocks);
         const std::uint64_t id = content_key(bytes, n) ^ (static_cast<std::uint64_t>(im.done) << 40) ^ (static_cast<std::uint64_t>(im.dbp) << 20) ^ 0x9E3779B97F4A7C15ull;
@@ -763,6 +787,12 @@ void finish_submit() {
     ++g_serial;
     g_param_records.clear();
     g_arena.clear();
+    {
+        std::uint32_t *words = nullptr;
+        std::size_t capacity = 0;
+        if (g_dev->arena_storage(words, capacity)) g_arena.adopt(words, capacity);
+        else g_arena.release_external();
+    }
     g_decoded_used = 0;
     g_clut_loads = 0;
 }
@@ -1207,6 +1237,7 @@ void local_copy(const State &s) {
 }
 
 void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
+    cpu_timers::Scope timer(cpu_timers::kLoadClut);
     flush_image();
     if (g_clut_loads + 2 >= kClutSlots) {
         emit_all();

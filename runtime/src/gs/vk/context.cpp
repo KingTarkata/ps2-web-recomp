@@ -1,5 +1,6 @@
 #include "context.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -147,7 +148,7 @@ std::uint32_t Context::memory_type(std::uint32_t allowed, VkMemoryPropertyFlags 
     return ~0u;
 }
 
-bool Context::create_buffer(Buffer &b, VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible) {
+bool Context::create_buffer(Buffer &b, VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible, bool cached) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;
     bci.usage = usage;
@@ -155,10 +156,13 @@ bool Context::create_buffer(Buffer &b, VkDeviceSize size, VkBufferUsageFlags usa
     if (vkCreateBuffer(device, &bci, nullptr, &b.buffer) != VK_SUCCESS) return false;
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(device, b.buffer, &req);
-    const VkMemoryPropertyFlags wanted = host_visible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    const VkMemoryPropertyFlags fallback = host_visible ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT : 0;
-    const std::uint32_t type = memory_type(req.memoryTypeBits, wanted, fallback);
+    const VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags wanted = !host_visible ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : cached ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) : coherent;
+    const VkMemoryPropertyFlags fallback = host_visible ? (cached ? coherent : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) : 0;
+    std::uint32_t type = memory_type(req.memoryTypeBits, wanted, fallback);
+    if (type == ~0u && host_visible) type = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 0);
     if (type == ~0u) return false;
+    b.coherent = (memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = type;
@@ -167,6 +171,30 @@ bool Context::create_buffer(Buffer &b, VkDeviceSize size, VkBufferUsageFlags usa
     b.size = size;
     if (host_visible && vkMapMemory(device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped) != VK_SUCCESS) return false;
     return true;
+}
+
+namespace {
+VkMappedMemoryRange atom_range(const Buffer &b, VkDeviceSize atom, VkDeviceSize offset, VkDeviceSize bytes) {
+    VkMappedMemoryRange r{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    r.memory = b.memory;
+    const VkDeviceSize lo = offset / atom * atom;
+    const VkDeviceSize hi = std::min<VkDeviceSize>((offset + bytes + atom - 1) / atom * atom, b.size);
+    r.offset = lo;
+    r.size = hi > lo ? (hi == b.size ? VK_WHOLE_SIZE : hi - lo) : 0;
+    return r;
+}
+}  // namespace
+
+void Context::flush(const Buffer &b, VkDeviceSize offset, VkDeviceSize bytes) const {
+    if (b.coherent || !b.mapped || !bytes) return;
+    const VkMappedMemoryRange r = atom_range(b, std::max<VkDeviceSize>(1, properties.limits.nonCoherentAtomSize), offset, bytes);
+    if (r.size) vkFlushMappedMemoryRanges(device, 1, &r);
+}
+
+void Context::invalidate(const Buffer &b, VkDeviceSize offset, VkDeviceSize bytes) const {
+    if (b.coherent || !b.mapped || !bytes) return;
+    const VkMappedMemoryRange r = atom_range(b, std::max<VkDeviceSize>(1, properties.limits.nonCoherentAtomSize), offset, bytes);
+    if (r.size) vkInvalidateMappedMemoryRanges(device, 1, &r);
 }
 
 void Context::destroy_buffer(Buffer &b) {

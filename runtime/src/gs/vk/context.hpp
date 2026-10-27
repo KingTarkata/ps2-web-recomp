@@ -15,6 +15,7 @@ struct Buffer {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
     void *mapped = nullptr;  // set for host-visible buffers
+    bool coherent = true;    // false: host-cached memory, flush() after writing, invalidate() before reading
 };
 
 struct Image {
@@ -48,7 +49,12 @@ struct Context {
     void destroy();
 
     std::uint32_t memory_type(std::uint32_t allowed, VkMemoryPropertyFlags wanted, VkMemoryPropertyFlags fallback) const;
-    bool create_buffer(Buffer &b, VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible);
+    // host_visible buffers are host-coherent (write-combined on NVIDIA; fine
+    // for streaming writes). `cached` asks for host-cached memory instead, for
+    // buffers the CPU also reads, at the price of explicit flush/invalidate.
+    bool create_buffer(Buffer &b, VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible, bool cached = false);
+    void flush(const Buffer &b, VkDeviceSize offset, VkDeviceSize bytes) const;
+    void invalidate(const Buffer &b, VkDeviceSize offset, VkDeviceSize bytes) const;
     void destroy_buffer(Buffer &b);
     bool create_image(Image &i, std::uint32_t width, std::uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect);
     void destroy_image(Image &i);

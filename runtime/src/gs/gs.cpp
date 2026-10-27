@@ -10,6 +10,7 @@
 
 #include "ps2/state.hpp"
 
+#include "gpu/cpu_timers.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1018,24 +1019,34 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
         if (!(n & 7u) && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget_ms) return Rendered::busy;
         bool presented = false;
         switch (h.type) {
-        case queue::kGif: gif::render(static_cast<int>(h.arg0), payload, h.arg1); break;
+        case queue::kGif: {
+            cpu_timers::Scope t(cpu_timers::kGif);
+            gif::render(static_cast<int>(h.arg0), payload, h.arg1);
+            break;
+        }
         case queue::kGifReset: gif::render_reset(); break;
         case queue::kReset: render_reset(); break;
         case queue::kSoftReset: soft_reset(); break;
-        case queue::kVblank:
+        case queue::kVblank: {
+            cpu_timers::Scope t(cpu_timers::kVblankFlush);
 #ifdef PS2_GPU
             if (gpu_on()) gpu::flush();
 #endif
             break;
+        }
         case queue::kPresent: {
             DisplayRegs regs;
             std::memcpy(&regs, payload, sizeof regs);
-            on_present(regs);
+            {
+                cpu_timers::Scope t(cpu_timers::kPresent);
+                on_present(regs);
+            }
             presented = true;
             break;
         }
         case queue::kState: serve_state(payload); break;
         case queue::kDownload: {
+            cpu_timers::Scope t(cpu_timers::kDownload);
             std::uintptr_t target;
             std::memcpy(&target, payload, sizeof target);
             exact_download();
@@ -1045,6 +1056,7 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
             break;
         }
         case queue::kDownloadAsync: {
+            cpu_timers::Scope t(cpu_timers::kDownload);
             DownloadKey key;
             std::memcpy(&key, payload, sizeof key);
             std::vector<std::uint8_t> fresh(static_cast<std::size_t>(h.arg0) * 16);
