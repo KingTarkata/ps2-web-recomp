@@ -1079,7 +1079,10 @@ void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
         const std::uint32_t rw = (r.x1 - r.x0 + 1) * scale_, rh = (r.y1 - r.y0 + 1) * scale_;
         std::uint32_t words[kUniformWords] = {s.bp, s.bw, s.psm, 0, r.x0, r.y0, rw, rh, scale_, 0, 0, 0};
         const std::uint32_t uniform = push_uniform(f, words);
-        const std::uint32_t gx = (rw + 15) / 16, gy = (rh + 15) / 16;
+        // Measurement only (wrong output): bit 29 keeps every barrier, bind
+        // and dispatch of the copies but launches one workgroup, to split
+        // the copies' cost into dispatch overhead and per-sample work.
+        const std::uint32_t gx = (debug & 536870912u) ? 1u : (rw + 15) / 16, gy = (debug & 536870912u) ? 1u : (rh + 15) / 16;
         const VkBufferImageCopy region{0, rw, rh, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {static_cast<std::int32_t>(r.x0 * scale_), static_cast<std::int32_t>(r.y0 * scale_), 0}, {rw, rh, 1}};
         (import ? imported_px_ : exported_px_) += static_cast<std::uint64_t>(rw) * rh;
         static std::uint64_t trace_from = ~0ull, trace_to = 0;
