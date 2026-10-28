@@ -14,7 +14,6 @@
 #include "context.hpp"
 
 #include <array>
-#include <bitset>
 #include <functional>
 #include <list>
 #include <cstdint>
@@ -125,24 +124,52 @@ public:
 private:
     static constexpr std::uint32_t kTargetSize = 2048, kTile = 32, kTiles = kTargetSize / kTile;
     static constexpr std::size_t kMaxSurfaces = 32;
+    // Tile validity and dirtiness, one 64-bit word per tile row (kTiles is
+    // 64): rectangle operations are a few word operations per row instead of
+    // a bit test per tile (the per-tile loops were 3% of the render thread).
     struct Plane {
-        std::bitset<kTiles * kTiles> valid, dirty;
-        std::uint32_t dirty_count = 0;  // tiles set in `dirty` (a bitset scan per query was 2% of the render thread)
+        std::uint64_t valid[kTiles] = {}, dirty[kTiles] = {};
+        std::uint32_t dirty_count = 0;  // bits set in `dirty`
+        static std::uint64_t row_mask(std::uint32_t tx0, std::uint32_t tx1) { return tx1 - tx0 >= 63 ? ~0ull : (((1ull << (tx1 - tx0 + 1)) - 1) << tx0); }
+        bool is_valid(std::uint32_t t) const { return (valid[t >> 6] >> (t & 63)) & 1; }
+        bool is_dirty(std::uint32_t t) const { return (dirty[t >> 6] >> (t & 63)) & 1; }
+        void set_valid(std::uint32_t t) { valid[t >> 6] |= 1ull << (t & 63); }
         void reset() {
-            valid.reset();
-            dirty.reset();
+            for (std::uint32_t i = 0; i < kTiles; ++i) valid[i] = dirty[i] = 0;
             dirty_count = 0;
         }
-        void set_dirty(std::size_t t) {
-            if (!dirty[t]) {
-                dirty[t] = true;
-                ++dirty_count;
+        // Tile rectangles, inclusive.
+        bool all_valid(std::uint32_t tx0, std::uint32_t ty0, std::uint32_t tx1, std::uint32_t ty1) const {
+            const std::uint64_t m = row_mask(tx0, tx1);
+            for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
+                if ((valid[ty] & m) != m) return false;
+            return true;
+        }
+        void set_valid(std::uint32_t tx0, std::uint32_t ty0, std::uint32_t tx1, std::uint32_t ty1) {
+            const std::uint64_t m = row_mask(tx0, tx1);
+            for (std::uint32_t ty = ty0; ty <= ty1; ++ty) valid[ty] |= m;
+        }
+        void invalidate(std::uint32_t tx0, std::uint32_t ty0, std::uint32_t tx1, std::uint32_t ty1) {
+            const std::uint64_t m = row_mask(tx0, tx1);
+            for (std::uint32_t ty = ty0; ty <= ty1; ++ty) {
+                valid[ty] &= ~m;
+                dirty_count -= static_cast<std::uint32_t>(__builtin_popcountll(dirty[ty] & m));
+                dirty[ty] &= ~m;
             }
         }
-        void clear_dirty(std::size_t t) {
-            if (dirty[t]) {
-                dirty[t] = false;
-                --dirty_count;
+        void mark_dirty(std::uint32_t tx0, std::uint32_t ty0, std::uint32_t tx1, std::uint32_t ty1) {
+            const std::uint64_t m = row_mask(tx0, tx1);
+            for (std::uint32_t ty = ty0; ty <= ty1; ++ty) {
+                valid[ty] |= m;
+                dirty_count += static_cast<std::uint32_t>(__builtin_popcountll(m & ~dirty[ty]));
+                dirty[ty] |= m;
+            }
+        }
+        void clear_dirty(std::uint32_t tx0, std::uint32_t ty0, std::uint32_t tx1, std::uint32_t ty1) {
+            const std::uint64_t m = row_mask(tx0, tx1);
+            for (std::uint32_t ty = ty0; ty <= ty1; ++ty) {
+                dirty_count -= static_cast<std::uint32_t>(__builtin_popcountll(dirty[ty] & m));
+                dirty[ty] &= ~m;
             }
         }
     };
@@ -262,6 +289,7 @@ public:
     }
     void blocks_written(const std::uint32_t *blocks, std::size_t n, std::uint64_t id) {
         for (std::size_t i = 0; i < n; ++i) block_ids_[blocks[i] & 16383u] = id;
+        ++block_gen_;
     }
 
 private:
@@ -270,6 +298,11 @@ private:
     // a texture remembers a hash of its blocks' ids from when it was decoded.
     std::uint64_t block_ids_[16384] = {};
     std::uint64_t write_counter_ = 0;
+    // textures_written fills the ids of every block of a span; the fill is
+    // redundant while no texture has recorded ids and no upload has set ids
+    // since the last fill covering the span (block_gen_ counts both).
+    std::uint64_t block_gen_ = 0, fill_gen_ = ~0ull, fill_skips_ = 0;
+    std::uint32_t fill_lo_ = 0, fill_hi_ = 0;
     void retire_texture(Texture &t);
 
     Context *ctx_ = nullptr;

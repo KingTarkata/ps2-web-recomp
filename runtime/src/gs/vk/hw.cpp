@@ -1149,12 +1149,7 @@ void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
 // memory. GT4's post-process chain draws into one half of its 24-bit frame
 // and reads the result through a texture based at the other half, block by
 // block, and its second Z buffer sits one page (64 pixels) after the first.
-bool HwRaster::all_valid(const Plane &p, const Rect &rect) {
-    for (std::uint32_t ty = rect.y0 / kTile; ty <= rect.y1 / kTile; ++ty)
-        for (std::uint32_t tx = rect.x0 / kTile; tx <= rect.x1 / kTile; ++tx)
-            if (!p.valid[ty * kTiles + tx]) return false;
-    return true;
-}
+bool HwRaster::all_valid(const Plane &p, const Rect &rect) { return p.all_valid(rect.x0 / kTile, rect.y0 / kTile, rect.x1 / kTile, rect.y1 / kTile); }
 
 bool HwRaster::import_from_aliases(VkCommandBuffer cb, Surface &s, const std::vector<Rect> &rects) {
     if (rects.empty() || !s.image.image || (!s.depth && s.psm != 0x00 && s.psm != 0x01) || (debug_bits() & 1073741824u)) return false;  // bit 30: measurement, no alias copies
@@ -1181,12 +1176,12 @@ bool HwRaster::import_from_aliases(VkCommandBuffer cb, Surface &s, const std::ve
         const std::uint32_t dx = static_cast<std::uint32_t>(r / 32) * 64;  // s pixel (x, y) is o pixel (x + dx, y + 32 q), wrapping into the next row at the pitch
         // Where s tile (tx, ty) lies in o, or false.
         auto locate = [&](std::uint32_t tx, std::uint32_t ty, std::uint32_t &ox, std::uint32_t &oty) {
-            if ((tx + 1) * kTile > s.width || s.plane.valid[ty * kTiles + tx]) return false;
+            if ((tx + 1) * kTile > s.width || s.plane.is_valid(ty * kTiles + tx)) return false;
             std::int64_t y = static_cast<std::int64_t>(ty) + q;
             std::uint32_t x = tx * kTile + dx;
             if (x >= pitch) { x -= pitch; ++y; }
             if (y < 0 || (y + 1) * kTile > o->height || x + kTile > o->width) return false;
-            if (!o->plane.valid[static_cast<std::uint32_t>(y) * kTiles + x / kTile]) return false;
+            if (!o->plane.is_valid(static_cast<std::uint32_t>(y) * kTiles + x / kTile)) return false;
             ox = x; oty = static_cast<std::uint32_t>(y);
             return true;
         };
@@ -1209,7 +1204,7 @@ bool HwRaster::import_from_aliases(VkCommandBuffer cb, Surface &s, const std::ve
                 c.extent = {(tx - start) * kTile * scale_, kTile * scale_, 1};
                 regions.push_back(c);
                 px += static_cast<std::uint64_t>(c.extent.width) * c.extent.height;
-                for (std::uint32_t t = start; t < tx; ++t) s.plane.valid[ty * kTiles + t] = true;  // clean: memory's words or the alias's newer ones
+                s.plane.set_valid(start, ty, tx - 1, ty);  // clean: memory's words or the alias's newer ones
             }
         }
         if (regions.empty()) continue;
@@ -1252,7 +1247,7 @@ bool HwRaster::import_from_aliases(VkCommandBuffer cb, Surface &s, const std::ve
 }
 
 void HwRaster::import_tiles(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect) {
-    const auto invalid = [](const Plane &q, std::uint32_t t) { return !q.valid[t]; };
+    const auto invalid = [](const Plane &q, std::uint32_t t) { return !q.is_valid(t); };
     if (all_valid(s.plane, rect)) return;
     auto rects = tile_rects(s.plane, rect, invalid);
     if (import_from_aliases(cb, s, rects)) {
@@ -1261,16 +1256,14 @@ void HwRaster::import_tiles(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s
     }
     close_pass(cb, import_why_);
     copy_rects(cb, set0, s, true, rects);
-    const std::uint32_t tx0 = rect.x0 / kTile, tx1 = rect.x1 / kTile, ty0 = rect.y0 / kTile, ty1 = rect.y1 / kTile;
-    for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
-        for (std::uint32_t tx = tx0; tx <= tx1; ++tx) s.plane.valid[ty * kTiles + tx] = true;
+    s.plane.set_valid(rect.x0 / kTile, rect.y0 / kTile, rect.x1 / kTile, rect.y1 / kTile);
 }
 
 // Writes the dirty tiles of `rect` back to memory. Other surfaces that
 // alias that memory lose the tiles the write covers.
 void HwRaster::write_back(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect, bool drop_aliases) {
     if (!s.plane.dirty_count || !s.image.image) return;
-    const auto rects = tile_rects(s.plane, rect, [](const Plane &q, std::uint32_t t) { return q.dirty[t]; });
+    const auto rects = tile_rects(s.plane, rect, [](const Plane &q, std::uint32_t t) { return q.is_dirty(t); });
     if (rects.empty()) return;
     close_pass(cb, wb_why_);
     copy_rects(cb, set0, s, false, rects);
@@ -1293,26 +1286,12 @@ void HwRaster::write_back(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
     }
     const std::uint32_t tx0 = rect.x0 / kTile, tx1 = rect.x1 / kTile, ty0 = rect.y0 / kTile, ty1 = rect.y1 / kTile;
     for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
-        for (std::uint32_t tx = tx0; tx <= tx1; ++tx) s.plane.clear_dirty(ty * kTiles + tx);
+        s.plane.clear_dirty(tx0, ty, tx1, ty);
 }
 
-void HwRaster::invalidate(Surface &s, const Rect &rect) {
-    const std::uint32_t tx0 = rect.x0 / kTile, tx1 = rect.x1 / kTile, ty0 = rect.y0 / kTile, ty1 = rect.y1 / kTile;
-    for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
-        for (std::uint32_t tx = tx0; tx <= tx1; ++tx) {
-            s.plane.valid[ty * kTiles + tx] = false;
-            s.plane.clear_dirty(ty * kTiles + tx);
-        }
-}
+void HwRaster::invalidate(Surface &s, const Rect &rect) { s.plane.invalidate(rect.x0 / kTile, rect.y0 / kTile, rect.x1 / kTile, rect.y1 / kTile); }
 
-void HwRaster::mark_dirty(Surface &s, const Rect &rect) {
-    const std::uint32_t tx0 = rect.x0 / kTile, tx1 = rect.x1 / kTile, ty0 = rect.y0 / kTile, ty1 = rect.y1 / kTile;
-    for (std::uint32_t ty = ty0; ty <= ty1; ++ty)
-        for (std::uint32_t tx = tx0; tx <= tx1; ++tx) {
-            s.plane.valid[ty * kTiles + tx] = true;
-            s.plane.set_dirty(ty * kTiles + tx);
-        }
-}
+void HwRaster::mark_dirty(Surface &s, const Rect &rect) { s.plane.mark_dirty(rect.x0 / kTile, rect.y0 / kTile, rect.x1 / kTile, rect.y1 / kTile); }
 
 void HwRaster::memory_read(VkCommandBuffer cb, VkDescriptorSet set0, const gpu::Span &span, const Surface *except) {
     if (span.hi <= span.lo) return;
@@ -1551,9 +1530,19 @@ void HwRaster::retire_texture(Texture &t) {
 // content first, their stamps match again and nothing is redone.
 void HwRaster::textures_written(const gpu::Span &span) {
     if (span.hi <= span.lo) return;
-    const std::uint64_t id = ++write_counter_ | (1ull << 63);
     const std::uint32_t lo = span.lo >> 8, hi = std::min<std::uint32_t>((span.hi + 255) >> 8, 16384);
+    // Redundant while nothing recorded or rewrote ids since a fill that
+    // covered the span (GT4 draws hundreds of batches into the same frame
+    // between texture decodes; the fill was 2% of the render thread).
+    if (fill_gen_ == block_gen_ && lo >= fill_lo_ && hi <= fill_hi_) {
+        ++fill_skips_;
+        return;
+    }
+    const std::uint64_t id = ++write_counter_ | (1ull << 63);
     for (std::uint32_t b = lo; b < hi; ++b) block_ids_[b] = id;
+    fill_gen_ = block_gen_;
+    fill_lo_ = lo;
+    fill_hi_ = hi;
     ++tex_drops_[tex_drop_cause_];
 }
 
@@ -1663,7 +1652,7 @@ void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture 
     // would move more than the decode saves (an atlas region drew 790 kpx of
     // imports per frame that way).
     if (v && span_rect(*v, span, vr)) {
-        if (!all_valid(v->plane, vr)) import_from_aliases(cb, *v, tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t tile) { return !q.valid[tile]; }));
+        if (!all_valid(v->plane, vr)) import_from_aliases(cb, *v, tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t tile) { return !q.is_valid(tile); }));
         if (!all_valid(v->plane, vr)) v = nullptr;
     } else {
         v = nullptr;
@@ -1677,6 +1666,7 @@ void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture 
     if (exported_px_ != before || v) barrier_copies_visible(cb);  // write-backs, or imports into the surface read below
     for (std::size_t i = 0; i < t.cell_block.size(); ++i) t.cell_id[i] = block_ids_[t.cell_block[i] & 16383u];
     for (std::size_t i = 0; i < t.clut_blocks.size(); ++i) t.clut_ids[i] = block_ids_[t.clut_blocks[i] & 16383u];
+    ++block_gen_;  // ids recorded: the next write there must change them
     const std::uint32_t width = 1u << t.tw, height = 1u << t.th;
     std::uint32_t words[kUniformWords] = {setup_offset, 0, 0, v ? 4096u : 0u, 0, 0, width, height, scale_, 0, 0, v ? inverse32_words_ : 0u, v ? v->bp * 64u : 0u, v ? v->bw : 0u, v ? static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u : 0u, 0};
     const std::uint32_t uniform = push_uniform(*frame_, words);
@@ -2100,7 +2090,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
                 // A same-layout surface holding the span (the other half of
                 // GT4's 24-bit frame) fills the viewed tiles by an image copy;
                 // then neither the write-back nor the import from memory runs.
-                if (!all_valid(v->plane, vr)) import_from_aliases(cb, *v, tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t t) { return !q.valid[t]; }));
+                if (!all_valid(v->plane, vr)) import_from_aliases(cb, *v, tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t t) { return !q.is_valid(t); }));
                 if (!all_valid(v->plane, vr)) {
                     // Another surface may hold the span dirty: GT4 reads its
                     // depth buffer as a 24-bit colour texture, so the colour
