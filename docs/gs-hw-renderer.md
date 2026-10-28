@@ -888,3 +888,30 @@ CPU items, in order of size, are the upload copy (shared code, ~3 ms),
 the GS front end (gif::render, write_packed, kick, vertex, gpu::draw:
 about 20% of the thread, shared code) and the per-batch record work in
 HwRaster::draw (supported, append_prims, texture_texels).
+
+### 2026-10-28: where the re-decodes come from, and partial decodes
+
+Fixed cost on the current build (Switch, no draws, hardware raster 16.4
+ms): no render passes 11.4, never re-decode 11.2, no copies 9.2, and
+with `PS2_HW_DEBUG` bit 21 (one-workgroup decodes) 11.3. So the ~5 ms of
+decodes was texel work, not launches: 151 decodes per race frame, 4.8
+Mpx of texels. `PS2_TEX_TRACE=<frame>` shows them: 70 8-bit 128x64
+tiles whose memory (inside the Z buffer's range) the post-process
+rewrites every frame, and 4-bit atlases up to 512x512 re-uploaded with
+new content each frame (upload ids traced across frames: 131 of 193
+upload ranges move, 17 change content; nothing false-stale there).
+Correction to the earlier attribution: the depth exports around these
+batches come from the DATE batches' compute depth test (their setups:
+flags 6aaf, DATM 0, blend, Z test GEQUAL without write, alpha written
+unmasked, texture 11200/4/00), not from texture reads; a depth view
+built to serve Z reads as textures never triggered and was dropped.
+Hardware DATE stays out: with alpha written from a texture, a stencil
+mirror of the destination alpha cannot be exact.
+
+Partial decodes: cells keep a decoded flag; a decode covers the sampled
+cells that are stale or undecoded. Texels decoded 4.8 -> 2.0 Mpx per
+frame; GPU total 43.0 -> 40.6 ms; threaded 34.8-35.2 ms/frame (the
+30 fps budget is 33.3). Still on the list: the DATE batches (compute
+raster 4.5 ms plus the depth and frame round trips around them, about
+1 ms), 213 render passes (~5 ms), the copies (7 ms, 6.2 Mpx), and the
+post-process target imports forced by write-back ordering (0.9 Mpx).
