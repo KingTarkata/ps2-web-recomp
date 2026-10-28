@@ -56,6 +56,8 @@ public:
     bool held_conflict(const gpu::Command &cmd) const;
     // Whether a setup record alone (blend, tests, formats) is drawable here.
     bool setup_supported(const std::uint32_t *setup) const;
+    bool load_clut_from_surface(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0);
+    static unsigned debug_bits();
     const char *last_reason_name() const;
     // The whole batch, by the same rules draw() applies (supported()).
     bool batch_supported(const std::uint32_t *setups, std::uint32_t nsetups, const std::uint32_t *prims, std::uint32_t nprims) const;
@@ -69,6 +71,9 @@ public:
     // hardware path will draw; a snapshot copy before it then skips its
     // write-back (the batch samples the surface image instead).
     void before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, bool next_is_hw_raster = false);
+    // before_command ran the command itself (a CLUT load reading a resident
+    // surface's image): the device skips its dispatch. Cleared by the call.
+    bool take_command_done() { const bool d = command_done_; command_done_ = false; return d; }
     bool would_draw(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) const;
     // Whether the hardware path would draw `cmd` without the per-submit
     // decode the batching layer emitted for it (every texture it samples is
@@ -272,6 +277,9 @@ private:
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkRenderPass pass_depth_rp_ = VK_NULL_HANDLE, pass_nodepth_ = VK_NULL_HANDLE;
     VkPipeline import_frame_ = VK_NULL_HANDLE, export_frame_ = VK_NULL_HANDLE, export_depth_ = VK_NULL_HANDLE, import_depth_ = VK_NULL_HANDLE;
+    VkPipeline clut_view_ = VK_NULL_HANDLE;  // gs.wgsl load_clut with this module's surface_word: palettes read from a surface image
+    bool command_done_ = false;
+    std::uint64_t clut_views_ = 0;  // CLUT loads answered from a surface image instead of a write-back
     VkShaderModule module_ = VK_NULL_HANDLE;
     VkShaderModule variant_modules_[8] = {};  // specialised fragment shaders, or null
     // Draw pipelines by state: depth mode and write, depth attachment, the

@@ -658,3 +658,47 @@ answering the 24-bit frame reads from the depth image or keeping the
 two coherent without a full export; (3) cheaper import/export shaders
 (they cost about 1.4 ms per Mpx); (4) fewer passes once the copies
 between batches are gone, since every copy closes the pass.
+
+### 2026-10-28: the real-time display glitch, and CLUT loads from surface images
+
+The windowed display showed green/magenta tile garbage on every other
+frame (the user's photo), on the Switch and natively, in both thread
+modes, while every headless frame dump was bit-identical: the dumps go
+through the synchronous display call, the window through the
+asynchronous read-back, and nobody had looked at the presented frames.
+`PS2_DUMP_PRESENT=<dir>` now writes every presented frame as a PPM; on
+the Switch `scrot` works over SSH (`DISPLAY=:0 XAUTHORITY=...`).
+
+Two causes, both in the surface-view path (`PS2_HW_DEBUG=33554432`
+disables views and was the bisect):
+
+1. GT4 reads its depth buffer as a 24-bit colour texture (2240/10/01 over
+   the Z buffer 2240/10/31). A view answered that read from the colour
+   surface aliasing the depth memory, a stale copy until the depth
+   surface is written back. The view now writes back any other surface
+   holding the span dirty first (which also drops the viewed tiles for
+   the import). Fixed natively; the Switch still showed residual blocks.
+2. A write-back of one surface followed by an import of another aliasing
+   it had no barrier between the two compute dispatches: llvmpipe
+   serialises, the Tegra does not. `copy_rects` now starts with a
+   compute-to-compute memory barrier on GS memory. All 155 sampled
+   presented frames on the Switch are clean after both.
+
+CLUT loads whose palette lies in a resident colour surface (GT4's
+post-process, 71 per frame) now run gs.wgsl's `load_clut` from the
+hardware module, whose `surface_word` reads the surface image
+(`read_palette` in gs.wgsl asks the hook; the plain module's answers 0),
+instead of writing the frame back first. 64934 loads over the run.
+Lesson from the Tegra: a descriptor binding used by a compute entry
+point must list the compute stage, or the GPU faults (MMU fault in
+dmesg, "submit failed", frames frozen, "GPU 0%").
+
+Cost: the correctness fix roughly doubled the import/export traffic
+(2412 Mpx imported over the run, from 1132; written back 1710 from 856)
+because every view of the 24-bit alias now writes the depth surface
+back, so the GPU profile is 45.5 ms/frame (44.6 before) and the CLUT
+change is neutral for now. Threaded race 36.3-38.8 ms/frame. The
+next item is therefore a depth view: answer the 24-bit colour reads of
+the Z buffer from the depth image itself (exact if the float depth
+round-trips the 24-bit integer, which the export path already relies
+on), which removes the depth export/import per frame entirely.

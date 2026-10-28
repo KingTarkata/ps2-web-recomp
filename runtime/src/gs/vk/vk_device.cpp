@@ -399,7 +399,9 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
     std::vector<Deferred> deferred;
     const auto dispatch = [&](const Command &k, std::uint32_t index, bool timed, bool top_written) {
         if (timed && !top_written) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, index * 2);
-        if (k.pipeline == kDecode && hw_on_) {
+        if (hw_on_ && hw_.take_command_done()) {
+            // before_command ran it from a surface image (CLUT load).
+        } else if (k.pipeline == kDecode && hw_on_) {
             hw_.dispatch_decode(cb, k, f.set);  // fills the cache image the fragment shader reads too
         } else {
             vk::vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[k.pipeline]);

@@ -106,7 +106,7 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
         if (vkCreateSampler(ctx.device, &sci, nullptr, &samplers_[i]) != VK_SUCCESS) return false;
     }
     VkDescriptorSetLayoutBinding t[6] = {};
-    t[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    t[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr};  // compute too: load_clut through surface_word (an MMU fault on the Tegra without it)
     t[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     for (int i = 0; i < 4; ++i) t[2 + i] = {static_cast<std::uint32_t>(2 + i), VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, &samplers_[i]};
     VkDescriptorSetLayoutCreateInfo tci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -250,9 +250,9 @@ bool HwRaster::build_pipelines(VkShaderModule module) {
         if (vkCreateRenderPass(ctx_->device, &rpi, nullptr, with_depth ? &pass_depth_rp_ : &pass_nodepth_) != VK_SUCCESS) return false;
     }
     // Compute pipelines for the import/export passes.
-    const char *compute_names[6] = {"import_frame", "export_frame", "export_depth", "import_depth", "decode", "decode_tex"};
-    VkPipeline *compute_out[6] = {&import_frame_, &export_frame_, &export_depth_, &import_depth_, &decode_, &decode_tex_};
-    for (int i = 0; i < 6; ++i) {
+    const char *compute_names[7] = {"import_frame", "export_frame", "export_depth", "import_depth", "decode", "decode_tex", "load_clut"};
+    VkPipeline *compute_out[7] = {&import_frame_, &export_frame_, &export_depth_, &import_depth_, &decode_, &decode_tex_, &clut_view_};
+    for (int i = 0; i < 7; ++i) {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -613,6 +613,7 @@ void HwRaster::print_reasons() const {
         if (closes_[i]) std::fprintf(stderr, " %s %llu", kCloseNames[i], static_cast<unsigned long long>(closes_[i]));
     std::fprintf(stderr, "\n");
     if (fragment_frames_) std::fprintf(stderr, "[vk] fragments: %.2f M per frame reached the colour stage over %llu frames (hardware-drawn batches)\n", static_cast<double>(fragments_) / static_cast<double>(fragment_frames_) / 1e6, static_cast<unsigned long long>(fragment_frames_));
+    if (clut_views_) std::fprintf(stderr, "[vk] CLUT loads read from surface images: %llu\n", static_cast<unsigned long long>(clut_views_));
     std::fprintf(stderr, "[vk] surfaces: %zu resident, %.1f Mpx imported, %.1f Mpx written back, %llu evictions, %llu aliased batches, %llu uniform overflows\n", surfaces_.size(), static_cast<double>(imported_px_) / 1e6,
                  static_cast<double>(exported_px_) / 1e6, static_cast<unsigned long long>(evictions_), static_cast<unsigned long long>(alias_batches_), static_cast<unsigned long long>(uniform_overflows_));
     std::fprintf(stderr, "[vk] textures: %zu resident, %llu decoded, %llu hits, %llu sampled from surfaces, %llu copied from own surface, %llu memory reads answered by surface views; block writes by commands %llu, write-backs %llu, own draws %llu; evictions %llu, stale at lookup %llu\n", textures_.size(),
@@ -1049,6 +1050,13 @@ void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
     if (debug & 32768u) return;  // measurement only: no copies at all (wrong output)
     FrameScratch &f = *frame_;
     VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    // Earlier compute stores to GS memory (an export, a decode, an upload)
+    // must land before these dispatches read or overwrite it: a write-back
+    // of one surface followed by an import of another aliasing it read
+    // stale words on the Tegra (llvmpipe serialises and never showed it).
+    mem.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mem.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
     for (const Rect &r0 : rects) {
         if (r0.x0 >= s.width || r0.y0 >= s.height) continue;
         const Rect r{r0.x0, r0.y0, std::min(r0.x1, s.width - 1), std::min(r0.y1, s.height - 1)};
@@ -1235,6 +1243,47 @@ void HwRaster::barrier_copies_visible(VkCommandBuffer cb) {
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
 }
 
+unsigned HwRaster::debug_bits() {
+    static const unsigned debug = std::getenv("PS2_HW_DEBUG") ? static_cast<unsigned>(std::atoi(std::getenv("PS2_HW_DEBUG"))) : 0u;
+    return debug;
+}
+
+// A CLUT load whose palette lies in a resident 32/24-bit colour surface runs
+// gs.wgsl's load_clut from this module, whose surface_word reads the
+// surface image, instead of writing the surface back first (GT4's
+// post-process loads a palette from the frame 70 times a frame).
+bool HwRaster::load_clut_from_surface(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0) {
+    const gpu::Span span = cmd.reads[0];
+    if (span.hi <= span.lo) return false;
+    Surface *v = viewable_surface(span, nullptr, nullptr);
+    Rect vr;
+    if (!v || !span_rect(*v, span, vr)) return false;
+    {
+        // Another surface (the depth buffer read as colour) may hold the span dirty.
+        WhyScope wb(wb_why_, kCloseWbOverlap);
+        memory_read(cb, set0, span, v);
+    }
+    {
+        WhyScope why(import_why_, kCloseImportSource);
+        import_tiles(cb, set0, *v, vr);  // what memory still owns there
+    }
+    close_pass(cb, kCloseDevice);
+    // Attachment writes were made visible at the pass close; imports are compute stores.
+    VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mem.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mem.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
+    FrameScratch &f = *frame_;
+    std::uint32_t words[kUniformWords] = {0, 0, 0, 0, 0, 0, 0, 0, scale_, 0, 0, inverse32_words_, v->bp * 64u, v->bw, static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u, 0};
+    const std::uint32_t uniform = push_uniform(f, words);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, clut_view_);
+    bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, set0, v->set1[slot_], cmd.param * gpu::kParamStride, uniform);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 2, 1, &v->set2, 0, nullptr);
+    vkCmdDispatch(cb, cmd.x, cmd.y, 1);
+    ++clut_views_;
+    return true;
+}
+
 void HwRaster::before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet set0, const std::uint32_t *arena, const std::uint32_t *params, bool next_is_hw_raster) {
     cpu_timers::Scope timer(cpu_timers::kBefore);
     if (surfaces_.empty()) return;
@@ -1285,6 +1334,10 @@ void HwRaster::before_command(VkCommandBuffer cb, const gpu::Command &cmd, VkDes
                     }
                 }
             }
+        }
+        if (cmd.pipeline == gpu::kLoadClut && clut_view_ && !(debug_bits() & 33554432u) && load_clut_from_surface(cb, cmd, set0)) {
+            command_done_ = true;
+            return;
         }
         WhyScope why(wb_why_, kCloseWbBefore);
         for (const gpu::Span &sp : cmd.reads) memory_read(cb, set0, sp);
@@ -2138,7 +2191,7 @@ void HwRaster::destroy() {
     vkDeviceWaitIdle(ctx_->device);
     for (auto &[key, p] : draw_)
         if (p) vkDestroyPipeline(ctx_->device, p, nullptr);
-    for (VkPipeline p : {import_frame_, export_frame_, export_depth_, import_depth_, decode_, decode_tex_})
+    for (VkPipeline p : {import_frame_, export_frame_, export_depth_, import_depth_, decode_, decode_tex_, clut_view_})
         if (p) vkDestroyPipeline(ctx_->device, p, nullptr);
     ctx_->destroy_image(decoded_);
     for (auto &t : textures_) ctx_->destroy_image(t->image);

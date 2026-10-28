@@ -354,6 +354,17 @@ fn copy_write(@builtin(global_invocation_id) gid: vec3<u32>) {
     write_sample(prm(2u), prm(0u), prm(1u), (prm(3u) + x) & 0x7FFu, (prm(4u) + y) & 0x7FFu, k, scratch[(sy * w + sx) * n + k]);
 }
 
+// A palette word, asking the device's surface hook first (a resident
+// render target holding the palette); the plain device's hook answers 0.
+fn read_palette(psm: u32, bp: u32, bw: u32, x: u32, y: u32) -> u32 {
+    let l = locate(psm, bp, bw, x, y);
+    let v = surface_word(l.word);
+    if (v.x != 0u) {
+        return (v.y >> l.shift) & l.mask;
+    }
+    return (atomicLoad(&vram[l.word * SCALE * SCALE]) >> l.shift) & l.mask;
+}
+
 @compute @workgroup_size(256)
 fn load_clut(@builtin(local_invocation_index) k: u32) {
     let count = prm(1u);
@@ -375,7 +386,7 @@ fn load_clut(@builtin(local_invocation_index) k: u32) {
         }
         if (k < entries) {
             if (csm != 0u) {
-                clut[dst + ((csa * 16u + k) & 511u)] = read_pixel(cpsm, cbp, data[r + 7u], data[r + 8u] * 16u + k, data[r + 9u]);
+                clut[dst + ((csa * 16u + k) & 511u)] = read_palette(cpsm, cbp, data[r + 7u], data[r + 8u] * 16u + k, data[r + 9u]);
             } else {
                 var x = k & 7u;
                 var y = k >> 3u;
@@ -386,7 +397,7 @@ fn load_clut(@builtin(local_invocation_index) k: u32) {
                     y = j >> 4u;
                     slot = k;
                 }
-                clut[dst + slot] = read_pixel(cpsm, cbp, 1u, x, y);
+                clut[dst + slot] = read_palette(cpsm, cbp, 1u, x, y);
             }
         }
         storageBarrier();
