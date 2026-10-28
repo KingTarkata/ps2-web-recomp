@@ -97,3 +97,35 @@ second). On the Switch over SSH: `DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority
 | 2026-10-28 | same, threaded, uploads to different base pointers in one page compared by exact block lists before being split into separate dispatches | 29.8-33.3 | upload dispatches ~120 -> 23 a frame, upload 2.36 -> 1.98 ms; GPU profile total 36.3 -> 35.7 ms; bit-identical |
 
 Mode 0 "Console" (768 MHz GPU) throughout. Target remains 16.7 ms.
+
+## CPU threads per vblank (2026-10-28)
+
+GT4 asks for an interlaced NTSC display in frame mode (`SetGsCrt interlace
+1 mode 0x2 field 1`): it draws one 640x224 field per vblank and advances its
+simulation once per vblank, so it is a 60 Hz game and the runner, which
+emulates one vblank per host iteration, runs it at half speed whenever a
+field takes more than 16.7 ms. The threaded path was measured unpaced on
+the race (state at frame 6000, 700 frames) with per-thread CPU time sampled
+from `/proc/<pid>/task/*/stat` once a second, and with `perf record -a`
+(the kernel-tools 6.8 perf binary; `-p` cannot build the thread map on the
+4.9 kernel).
+
+| Date | Build | ms/frame | render thread | emulation thread | VU1 thread | Notes |
+|---|---|---|---|---|---|---|
+| 2026-10-28 | 3506bb0, hardware path | 31-33 (44 in the pre-race section sampled) | 34.5 ms CPU | 30.5 ms CPU | 28.0 ms CPU | CPU per frame from the thread samples; process 230-265% |
+| 2026-10-28 | same with `PS2_GS_DISCARD=1` (render thread drops every GIF packet and flush) | 30-32, falling to 18-23 late in the race | 21.0 ms CPU | 29.3 ms CPU (94% of a core) | 22.6 ms CPU | the emulation and VU1 threads alone hold the race at 30 ms a field |
+| 2026-10-28 | same, `[ee]` idle report | | | 62.9% of emulated EE cycles skipped with every thread idle | | the EE thread is slow per cycle executed, not saturated by game work |
+
+perf, discard run, share of each thread's busy samples: emulation thread
+43% recompiled EE units, 22% memcpy (all of it `queue::Ring::post`, the DMA
+data copied into the VU and render rings), 10% load/store and float
+helpers, 9% VU0 interpreter helpers, 4% SPU2, 4% IOP; VU1 thread 66%
+compiled VU1 programs (the hottest, `vu1_936075FFBE07F724`, is 15% of the
+thread alone), 14% VIF unpack; render thread (hardware path run) 46% GS
+batching and `HwRaster`, 15% GS core register writes and kicks.
+
+Conclusion: every stage is near 30 ms a field: GPU 36 (profile), render
+thread 34, emulation thread 30, VU1 thread 28. Skipping the drawing of
+alternate fields would relieve the GPU and part of the render thread only;
+60 fields a second also needs the emulation and VU1 threads roughly twice
+as fast.

@@ -1015,6 +1015,9 @@ void post_present() {
 
 Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms) {
     queue::role() = queue::Role::Render;
+    // PS2_GS_DISCARD drops the GIF packets and flushes on the render thread, to
+    // measure what the emulation and VU threads cost on their own.
+    static const bool discard = std::getenv("PS2_GS_DISCARD") != nullptr;
     queue::Header h;
     const std::uint8_t *payload = nullptr;
     const auto start = std::chrono::steady_clock::now();
@@ -1023,6 +1026,7 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
         bool presented = false;
         switch (h.type) {
         case queue::kGif: {
+            if (discard) break;
             cpu_timers::Scope t(cpu_timers::kGif);
             gif::render(static_cast<int>(h.arg0), payload, h.arg1);
             break;
@@ -1031,6 +1035,7 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
         case queue::kReset: render_reset(); break;
         case queue::kSoftReset: soft_reset(); break;
         case queue::kVblank: {
+            if (discard) break;
             cpu_timers::Scope t(cpu_timers::kVblankFlush);
 #ifdef PS2_GPU
             if (gpu_on()) gpu::flush();

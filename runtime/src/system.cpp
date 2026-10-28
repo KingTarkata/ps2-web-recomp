@@ -47,7 +47,7 @@ struct Event {
     std::function<void()> action;
 };
 
-std::uint64_t g_base = 0;
+std::uint64_t g_base = 0, g_idle_cycles = 0;
 std::int64_t g_given = 0;
 std::vector<Event> g_events;
 bool g_halted = false;
@@ -175,6 +175,7 @@ void idle(Cpu &c) {
         return;
     }
     next = std::min(next, now() + kEeClock / 2000);
+    g_idle_cycles += std::max(now(), next) - now();
     g_base = std::max(now(), next);
     g_given = 0;
     c.budget = 0;
@@ -404,6 +405,7 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
 int run() {
     Cpu &c = g_cpu;
     if (!g_resumed) set_budget(c, kMaxSlice);
+    const std::uint64_t run_start = now();
     while (!g_halted) {
         if (g_state_request) {
             g_state_request = false;
@@ -420,6 +422,8 @@ int run() {
         if (c.budget <= 0) refill(c);
         dispatch(c, 0, 0);
     }
+    if (std::getenv("PS2_SPEED_LOG"))
+        std::fprintf(stderr, "[ee] %llu frames, %.1f%% of emulated cycles skipped with every thread idle\n", static_cast<unsigned long long>(g_frames), 100.0 * static_cast<double>(g_idle_cycles) / static_cast<double>(std::max<std::uint64_t>(now() - run_start, 1)));
     kernel::dump();
     iop::dump();
     sif::dump();
