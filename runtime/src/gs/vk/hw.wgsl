@@ -555,14 +555,17 @@ fn sample_cached(s: Setup, uin: f32, vin: f32) -> u32 {
     return blend4(fetch_cached(s, x0, y0), fetch_cached(s, x0 + 1, y0), fetch_cached(s, x0, y0 + 1), fetch_cached(s, x0 + 1, y0 + 1), u - f32(x0), v - f32(y0));
 }
 
-// Decodes one texture (the setup at hw.base) into the set-2 image.
+// Decodes the texel rectangle (hw.ox, hw.oy, hw.width x hw.height) of one
+// texture (the setup at hw.base) into the set-2 image.
 @compute @workgroup_size(16, 16)
 fn decode_tex(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let s = load_setup(hw.base);
-    if (gid.x >= (1u << s.tw) || gid.y >= (1u << s.th)) {
+    if (gid.x >= hw.width || gid.y >= hw.height) {
         return;
     }
-    textureStore(tex_store, vec2<i32>(i32(gid.x), i32(gid.y)), unpack_word(convert(s, load_texel(addr(s.tf, gid.x, gid.y), 0u))));
+    let s = load_setup(hw.base);
+    let x = u32(hw.ox) + gid.x;
+    let y = u32(hw.oy) + gid.y;
+    textureStore(tex_store, vec2<i32>(i32(x), i32(y)), unpack_word(convert(s, load_texel(addr(s.tf, x, y), 0u))));
 }
 
 // The copies below address GS memory through the frame or depth buffer

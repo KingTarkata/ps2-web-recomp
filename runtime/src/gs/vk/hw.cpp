@@ -451,6 +451,16 @@ VkPipeline HwRaster::pipeline_for(const PipelineKey &key) {
 }
 
 void HwRaster::begin_frame(int slot) {
+    {
+        static std::uint64_t trace_from = ~0ull, trace_to = 0;
+        static const bool trace = [] {
+            const char *spec = std::getenv("PS2_HW_TRACE");
+            unsigned long long a = 0, z = ~0ull;
+            if (spec && std::sscanf(spec, "%llu,%llu", &a, &z) >= 1) { trace_from = a; trace_to = z; }
+            return spec != nullptr;
+        }();
+        upload_trace_ = trace && frame_count() >= trace_from && frame_count() < trace_to;
+    }
     slot_ = slot & 1;
     frame_ = &frames_[slot_];
     query_open_ = false;
@@ -658,7 +668,7 @@ void HwRaster::print_reasons() const {
     std::fprintf(stderr, "[vk] textures: %zu resident, %llu decoded, %llu hits, %llu sampled from surfaces, %llu copied from own surface, %llu memory reads answered by surface views; block writes by commands %llu, write-backs %llu, own draws %llu; evictions %llu, stale at lookup %llu\n", textures_.size(),
                  static_cast<unsigned long long>(decoded_textures_), static_cast<unsigned long long>(texture_hits_), static_cast<unsigned long long>(surface_samples_), static_cast<unsigned long long>(surface_copies_), static_cast<unsigned long long>(surface_views_), static_cast<unsigned long long>(tex_drops_[0]), static_cast<unsigned long long>(tex_drops_[1]),
                  static_cast<unsigned long long>(tex_drops_[2]), static_cast<unsigned long long>(tex_drops_[3]), static_cast<unsigned long long>(tex_drops_[4]));
-    std::fprintf(stderr, "[vk] textures decoded from surface images: %llu\n", static_cast<unsigned long long>(decoded_from_surfaces_));
+    std::fprintf(stderr, "[vk] textures decoded from surface images: %llu; %.1f Mpx of texels decoded\n", static_cast<unsigned long long>(decoded_from_surfaces_), static_cast<double>(decoded_texels_) / 1e6);
     std::fprintf(stderr, "[vk] fallback reasons:");
     for (int i = 0; i < 14; ++i)
         if (reasons_[i]) std::fprintf(stderr, " %s %llu", kReasons[i], static_cast<unsigned long long>(reasons_[i]));
@@ -1642,16 +1652,20 @@ bool HwRaster::texture_current(const Texture &t, const Rect *texels) const {
         for (std::uint32_t cy = cy0; cy <= cy1; ++cy) {
             const std::uint32_t *blocks = t.cell_block.data() + static_cast<std::size_t>(cy) * t.cells_x;
             const std::uint64_t *ids = t.cell_id.data() + static_cast<std::size_t>(cy) * t.cells_x;
+            const std::uint8_t *done = t.cell_done.data() + static_cast<std::size_t>(cy) * t.cells_x;
             for (std::uint32_t cx = cx0; cx <= cx1; ++cx)
-                if (ids[cx] != block_ids_[blocks[cx] & 16383u]) return false;
+                if (!done[cx] || ids[cx] != block_ids_[blocks[cx] & 16383u]) return false;
         }
+    } else {
+        for (std::size_t i = 0; i < t.cell_block.size(); ++i)
+            if (!t.cell_done[i] || t.cell_id[i] != block_ids_[t.cell_block[i] & 16383u]) return false;
     }
     for (std::size_t i = 0; i < t.clut_blocks.size(); ++i)
         if (t.clut_ids[i] != block_ids_[t.clut_blocks[i] & 16383u]) return false;
     return true;
 }
 
-void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture &t, std::uint32_t setup_offset) {
+void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture &t, std::uint32_t setup_offset, const Rect &rect) {
     const std::uint64_t before = exported_px_;
     WhyScope why(wb_why_, kCloseWbDecode);
     // Texels inside a resident 32/24-bit colour surface decode from its
@@ -1680,11 +1694,18 @@ void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture 
     }
     if (t.chi > t.clo) memory_read(cb, set0, gpu::Span{t.clo, t.chi});
     if (exported_px_ != before || v) barrier_copies_visible(cb);  // write-backs, or imports into the surface read below
-    for (std::size_t i = 0; i < t.cell_block.size(); ++i) t.cell_id[i] = block_ids_[t.cell_block[i] & 16383u];
+    // The cells under `rect` take the ids memory has now and count as decoded.
+    for (std::uint32_t cy = rect.y0 / t.ch; cy <= std::min(rect.y1 / t.ch, t.cells_y - 1); ++cy)
+        for (std::uint32_t cx = rect.x0 / t.cw; cx <= std::min(rect.x1 / t.cw, t.cells_x - 1); ++cx) {
+            const std::size_t i = static_cast<std::size_t>(cy) * t.cells_x + cx;
+            t.cell_id[i] = block_ids_[t.cell_block[i] & 16383u];
+            t.cell_done[i] = 1;
+        }
     for (std::size_t i = 0; i < t.clut_blocks.size(); ++i) t.clut_ids[i] = block_ids_[t.clut_blocks[i] & 16383u];
     ++block_gen_;  // ids recorded: the next write there must change them
-    const std::uint32_t width = 1u << t.tw, height = 1u << t.th;
-    std::uint32_t words[kUniformWords] = {setup_offset, 0, 0, v ? 4096u : 0u, 0, 0, width, height, scale_, 0, 0, v ? inverse32_words_ : 0u, v ? v->bp * 64u : 0u, v ? v->bw : 0u, v ? static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u : 0u, 0};
+    const std::uint32_t width = rect.x1 - rect.x0 + 1, height = rect.y1 - rect.y0 + 1;
+    decoded_texels_ += static_cast<std::uint64_t>(width) * height;
+    std::uint32_t words[kUniformWords] = {setup_offset, 0, 0, v ? 4096u : 0u, rect.x0, rect.y0, width, height, scale_, 0, 0, v ? inverse32_words_ : 0u, v ? v->bp * 64u : 0u, v ? v->bw : 0u, v ? static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u : 0u, 0};
     const std::uint32_t uniform = push_uniform(*frame_, words);
     close_pass(cb, kCloseDecode);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, decode_tex_);
@@ -1843,6 +1864,7 @@ HwRaster::Texture *HwRaster::texture_slot(VkCommandBuffer cb, const std::uint32_
         t->cells_y = (height + t->ch - 1) / t->ch;
         t->cell_block.resize(static_cast<std::size_t>(t->cells_x) * t->cells_y);
         t->cell_id.assign(t->cell_block.size(), 0);
+        t->cell_done.assign(t->cell_block.size(), 0);
         for (std::uint32_t cy = 0; cy < t->cells_y; ++cy)
             for (std::uint32_t cx = 0; cx < t->cells_x; ++cx) t->cell_block[static_cast<std::size_t>(cy) * t->cells_x + cx] = pixel_address(tpsm, w[12], w[13], cx * t->cw, cy * t->ch) >> 8;
         for (std::uint32_t b = t->clo >> 8; b < (t->chi + 255) >> 8; ++b) t->clut_blocks.push_back(b);
@@ -1927,7 +1949,27 @@ HwRaster::Texture *HwRaster::texture_for(VkCommandBuffer cb, VkDescriptorSet set
     }
     {
         cpu_timers::Scope td(cpu_timers::kDecode);
-        decode_texture(cb, set0, t, setup_offset);
+        // Decode the cells this batch samples that are stale or not yet
+        // decoded (their bounding rectangle, one dispatch); a palette change
+        // invalidates every cell. The whole texture when the sampled
+        // rectangle is unknown. Atlases hundreds of texels wide were decoded
+        // whole for a few dozen texels a batch (4.8 Mpx a frame, 2.5 sampled).
+        const std::uint32_t tw = 1u << t.tw, th = 1u << t.th;
+        bool clut_stale = fresh;
+        for (std::size_t i = 0; !clut_stale && i < t.clut_blocks.size(); ++i) clut_stale = t.clut_ids[i] != block_ids_[t.clut_blocks[i] & 16383u];
+        if (clut_stale) std::fill(t.cell_done.begin(), t.cell_done.end(), 0);
+        Rect want = sampled ? Rect{texels.x0, texels.y0, std::min(texels.x1, tw - 1), std::min(texels.y1, th - 1)} : Rect{0, 0, tw - 1, th - 1};
+        std::uint32_t cx0 = t.cells_x, cy0 = t.cells_y, cx1 = 0, cy1 = 0;
+        for (std::uint32_t cy = want.y0 / t.ch; cy <= std::min(want.y1 / t.ch, t.cells_y - 1); ++cy)
+            for (std::uint32_t cx = want.x0 / t.cw; cx <= std::min(want.x1 / t.cw, t.cells_x - 1); ++cx) {
+                const std::size_t i = static_cast<std::size_t>(cy) * t.cells_x + cx;
+                if (t.cell_done[i] && t.cell_id[i] == block_ids_[t.cell_block[i] & 16383u]) continue;
+                cx0 = std::min(cx0, cx);
+                cy0 = std::min(cy0, cy);
+                cx1 = std::max(cx1, cx);
+                cy1 = std::max(cy1, cy);
+            }
+        if (cx0 <= cx1 && cy0 <= cy1) decode_texture(cb, set0, t, setup_offset, Rect{cx0 * t.cw, cy0 * t.ch, std::min((cx1 + 1) * t.cw, tw) - 1, std::min((cy1 + 1) * t.ch, th) - 1});
     }
     return &t;
 }

@@ -215,6 +215,7 @@ private:
         std::uint32_t cw = 1, ch = 1, cells_x = 0, cells_y = 0;
         std::vector<std::uint32_t> cell_block, clut_blocks;
         std::vector<std::uint64_t> cell_id, clut_ids;
+        std::vector<std::uint8_t> cell_done;  // decoded since the last palette change: cells decode on demand, where a batch samples
         std::uint32_t tw = 0, th = 0;
         bool from_surface = false;  // filled by image copies from a surface, not decoded
         VkDescriptorSet set2 = VK_NULL_HANDLE;
@@ -278,7 +279,7 @@ private:
     VkDescriptorSet texture_set(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *setup, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, const Surface *color,
                                 const Surface *depth);
     bool texture_current(const Texture &t, const Rect *texels) const;  // texels null: CLUT only
-    void decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture &t, std::uint32_t setup_offset);
+    void decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture &t, std::uint32_t setup_offset, const Rect &rect);  // rect: texels to decode (cell aligned)
     void copy_surface_texels(VkCommandBuffer cb, VkDescriptorSet set0, Surface &src, Texture &t, const Rect &texels);
     void textures_written(const gpu::Span &span);
 
@@ -290,6 +291,7 @@ public:
     void blocks_written(const std::uint32_t *blocks, std::size_t n, std::uint64_t id) {
         for (std::size_t i = 0; i < n; ++i) block_ids_[blocks[i] & 16383u] = id;
         ++block_gen_;
+        if (upload_trace_ && n) std::fprintf(stderr, "[hw] f%llu upload id %016llx blocks %u..%u (%zu)\n", static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(id), blocks[0] & 16383u, blocks[n - 1] & 16383u, n);
     }
 
 private:
@@ -302,6 +304,7 @@ private:
     // redundant while no texture has recorded ids and no upload has set ids
     // since the last fill covering the span (block_gen_ counts both).
     std::uint64_t block_gen_ = 0, fill_gen_ = ~0ull, fill_skips_ = 0;
+    bool upload_trace_ = false;  // PS2_HW_TRACE window: print upload ids (hw.cpp sets it per frame)
     std::uint32_t fill_lo_ = 0, fill_hi_ = 0;
     void retire_texture(Texture &t);
 
@@ -406,7 +409,7 @@ private:
     std::uint64_t fragments_ = 0, fragment_frames_ = 0;
     std::uint64_t drawn_ = 0, fallback_ = 0;
     std::uint64_t imported_px_ = 0, exported_px_ = 0, evictions_ = 0, uniform_overflows_ = 0, alias_batches_ = 0;
-    std::uint64_t alias_copied_px_ = 0, decoded_from_surfaces_ = 0;  // tiles filled from another surface's image instead of memory (import_from_aliases)
+    std::uint64_t alias_copied_px_ = 0, decoded_from_surfaces_ = 0, decoded_texels_ = 0;  // tiles filled from another surface's image instead of memory (import_from_aliases)
     // Why batches fell back, by the first reason met (see hw.cpp kReasons).
     mutable std::uint64_t reasons_[14] = {};
     mutable int last_reason_ = 0;
