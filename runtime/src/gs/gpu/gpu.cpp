@@ -729,7 +729,23 @@ void emit_pre() {
         Range touched;
         for (std::size_t k = i; k < j; ++k) touched.add(g_pre[k].range.lo, g_pre[k].range.hi);
         if (clut) {
-            g_commands.push_back({kLoadClut, 1, 1, push_params({offset, count})});
+            // Loads that all write the same CLUT chunks (same csm, csa and
+            // width) leave the same chunks untouched, inherited along the
+            // chain from the slot before it: resolved on the CPU here, each
+            // record copies from a slot no record of the group writes, and
+            // the shader runs one workgroup per record instead of looping.
+            bool parallel = count > 1;
+            for (std::size_t k = i + 1; k < j && parallel; ++k) parallel = records[(k - i) * 12 + 4] == records[4] && records[(k - i) * 12 + 5] == records[5] && records[(k - i) * 12 + 6] == records[6];
+            if (parallel)
+                for (std::size_t k = i + 1; k < j; ++k) {
+                    std::uint32_t &src = records[(k - i) * 12];
+                    for (std::size_t m = k; m-- > i;)
+                        if (records[(m - i) * 12 + 1] == src) {
+                            src = records[(m - i) * 12];
+                            m = k;  // the resolved source may be another record's slot
+                        }
+                }
+            g_commands.push_back({kLoadClut, parallel ? count : 1u, 1, push_params({offset, count, parallel ? 1u : 0u})});
             note_ranges(&g_commands.back(), {touched}, {});
         } else {
             note_ranges(dispatch_linear(kUpload, total, push_params({offset, count, total})), {}, {touched});

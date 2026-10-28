@@ -366,9 +366,16 @@ fn read_palette(psm: u32, bp: u32, bw: u32, x: u32, y: u32) -> u32 {
 }
 
 @compute @workgroup_size(256)
-fn load_clut(@builtin(local_invocation_index) k: u32) {
-    let count = prm(1u);
-    for (var n = 0u; n < count; n = n + 1u) {
+fn load_clut(@builtin(local_invocation_index) k: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    // One workgroup loops over the records in order, or (params word 2) one
+    // workgroup per record when the batching layer resolved their sources.
+    var n0 = 0u;
+    var n1 = prm(1u);
+    if (prm(2u) != 0u) {
+        n0 = wg.x;
+        n1 = wg.x + 1u;
+    }
+    for (var n = n0; n < n1; n = n + 1u) {
         let r = prm(0u) + n * 12u;
         let src = data[r] * CLUT_ENTRIES;
         let dst = data[r + 1u] * CLUT_ENTRIES;

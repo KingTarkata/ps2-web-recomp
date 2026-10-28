@@ -915,3 +915,37 @@ frame; GPU total 43.0 -> 40.6 ms; threaded 34.8-35.2 ms/frame (the
 raster 4.5 ms plus the depth and frame round trips around them, about
 1 ms), 213 render passes (~5 ms), the copies (7 ms, 6.2 Mpx), and the
 post-process target imports forced by write-back ordering (0.9 Mpx).
+
+### 2026-10-28: barriers are free, launches are not; parallel CLUT loads
+
+Two measurement knobs (not kept): no attachment barriers around render
+passes gave 40.47 vs 40.62 ms (no-draws 14.12 vs 14.13), and no memory
+barrier after upload and CLUT dispatches gave 40.55 vs 40.62 (load_clut
+3.39 vs 3.44, upload 2.31 vs 2.36). So the ~5 ms of pass cost is the
+begin/end itself and the 30 us per CLUT load and 20 us per upload are the
+dispatches, not their barriers: only fewer or shorter launches help.
+
+Profile of one race frame (6300), command by command: the post-process
+chain shows up as 70 repetitions of `load_clut` 34 us, the tile draw
+(8 sprites) 17 us and the block draw (48 sprites) 41 us, about 6.4 ms a
+frame. The CLUT loads there are eight 256-entry palettes per dispatch,
+loaded from the scratch page (15616/15680, double-buffered by frame) that
+the block draw rewrites for every strip; they are emitted every time (the
+page generation moves with each block draw, correctly), so the earlier
+note that these loads were reused was wrong. The 34 us was the shader:
+one workgroup looping over the eight records, each iteration a 512-entry
+slot copy, a barrier, 256 palette reads through the surface view and a
+barrier.
+
+Change (gpu.cpp `emit_pre`, gs.wgsl `load_clut`): when every record of a
+group writes the same CLUT chunks (same CSM, CSA and width), the chunks a
+record leaves untouched are the same for all of them and come, along the
+chain, from the slot before the group. The batching layer resolves each
+record's source slot to one no record of the group writes (following
+`src == dst of an earlier record` back), passes params word 2 = 1, and
+dispatches `count` workgroups; the shader runs record `workgroup_id.x`
+only. Groups with mixed chunk sets keep the single-workgroup loop. Exact
+by construction (the inherited chunks are the same words either way);
+native frames 5500-6000 and Switch frame 6100 bit-identical.
+Switch: load_clut 3.44 -> 1.69 ms/frame, GPU profile total 40.6 -> 38.8
+ms, threaded race 31.1-33.9 ms/frame (budget 33.3).
