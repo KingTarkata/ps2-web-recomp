@@ -796,3 +796,41 @@ remove only 77 of the 381 launches (most calls carry one rectangle). The
 copy cost is now a per-event cost: the way down is fewer copy events,
 i.e. the structural candidates above (24-bit alias decodes from the
 frame image; a DATE path inside the pass), not cheaper shaders.
+
+### 2026-10-28: the exact route for the alias traffic, measured
+
+Three steps toward serving GT4's alias reads from the images that hold
+them instead of round-tripping through GS memory, all bit-identical
+natively and on the Switch (`PS2_HW_DEBUG` bit 30 disables them):
+
+1. `import_from_aliases`: invalid tiles of a surface that another
+   resident surface of the same kind and pitch holds valid at a
+   whole-page offset are filled by `vkCmdCopyImage` (the chain draws into
+   one half of its 24-bit frame and reads it back through a texture based
+   at the other half; the second Z buffer sits one page after the first).
+2. Texture decodes whose texels a resident 32/24-bit surface holds
+   entirely read that surface's image (`surface_word` through
+   `target_load`, flags bit 12) instead of forcing its write-back. Only
+   when the surface already holds every texel: decoding through a surface
+   that had to import them first cost 790 kpx of imports per frame, and
+   letting reads keep a surface resident kept an atlas region alive for
+   another 660 kpx per frame.
+3. `viewable_surface` prefers the surface whose tiles under the span are
+   all valid, so the chain's views read the drawn half directly and the
+   copies of step 1 mostly disappear.
+
+| build | imports Mpx (600 frames) | write-backs | alias copies | GPU total ms | threaded ms/frame |
+|---|---|---|---|---|---|
+| 818db0c (morning) | 2527 | 1666 | 0 | 43.3 | 35.9-37.3 |
+| steps 1+2 (08b55ac) | 2265 | 1567 | 311 | 43.5 | 36.4-37.1 |
+| step 3 | 2231 | 1518 | 184 | 43.0 | 36.1-36.3 |
+
+Lessons: an image copy on the Tegra costs about what the compute round
+trip it replaces did (step 1 alone was neutral), so the win only comes
+from not moving the pixels at all (step 3). The remaining traffic in
+frame 6100 (6.2 Mpx, from 6.9) is the depth 2240 round trips around the
+compute-drawn DATE batches (1.6 Mpx), the frame 6720 round trips for
+DATE and uploads (1.0 Mpx), the target imports of the post-process frame
+and its Z buffer (2240/10/01, 2272/10/31, 4480/10/01: 0.9 Mpx, forced by
+`memory_written` writing the old Z back and invalidating it before the
+targets import), and the scratch 11200/4/00 imports (0.36 Mpx).
