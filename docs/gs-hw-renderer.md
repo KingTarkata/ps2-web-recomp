@@ -702,3 +702,57 @@ next item is therefore a depth view: answer the 24-bit colour reads of
 the Z buffer from the depth image itself (exact if the float depth
 round-trips the 24-bit integer, which the export path already relies
 on), which removes the depth export/import per frame entirely.
+
+### 2026-10-28: depth views tried and dropped; where the copies really come from
+
+A depth view (the 24-bit colour reads of the Z buffer answered from the
+depth image, with a PSMZ32 inverse page table, depth surfaces given a
+texture set, and `export_depth`'s float-to-integer conversion in
+`surface_word`) was built and measured: frames 5500-5700 differed
+natively (146-716 pixels in small boxes, so not rounding) even when
+restricted to 24-bit readers, and the traffic barely moved (2431 Mpx
+imported over the run, from 2527). Dropped; the reason it could not
+help is in the attribution below: the memory-sampled (view) path is not
+where the Z buffer's reads go.
+
+Frame 6100 imports and exports attributed to the command that forced
+them (`PS2_HW_TRACE`, pixels):
+
+| what | cause | px |
+|---|---|---|
+| export depth 2240 | compute-drawn (DATE) batches | 655k in 60 rects |
+| import depth 2240 | the next hardware batch | 614k |
+| import frame 4480/10/01 (24-bit alias) | a batch's texture | 512k |
+| import frame 2240/10/01 (24-bit alias) | a batch's texture | 328k |
+| import depth 2272 | a batch | 328k |
+| export depth 2240 | own write-back | 287k |
+| export frame 2240/10/01 | a batch | 258k |
+| export frame 6720 / import frame 6720 | DATE batches | 231k + 225k |
+| export frame 6720 | uploads | 211k |
+
+So the DATE batches on the compute path drive about 1.7 Mpx of the 6.9
+per frame directly (the depth and frame round trips around each one),
+and the 24-bit alias imports are texture decodes (cacheable textures
+decoded from memory), not views. The hardware DATE patch is being
+re-measured on the fixed base for the traffic it removes.
+
+Re-measured hardware DATE on the fixed base (the saved patch applied):
+traffic 6.9 -> 6.1 Mpx per frame, compute raster 4.5 -> 1.6 ms, but
+hardware raster 34.4 -> 39.7 ms, total 45.5 -> 47.5 ms, threaded
+unchanged at 37-40 ms/frame. Still parked: the 17 DATE batches each cost
+a pass close, a snapshot copy and their own imports, about 0.3 ms apiece,
+more than the round trips they save.
+
+State at the end of 2026-10-28: switch-port is verified (native frames
+bit-identical, Switch presented frames clean, frame 6100 identical) at
+36-39 ms/frame threaded; GPU 45.5 ms in the profile (the alias
+write-backs of the correctness fix cost about 1 ms over the 44.6
+before). The remaining GPU budget is structural: 6.1-6.9 Mpx of
+import/export per frame from GT4's aliasing of its frame, its halves and
+its Z buffer, at about 1.4 ms per Mpx. Candidates, none measured yet:
+cheaper import/export shaders; serving the 24-bit-alias texture decodes
+from the frame surface image (a surface_texture through a converting
+copy) instead of memory; and a DATE path that does not close the pass
+(stencil pre-pass inside the pass is not possible either, since the
+snapshot needs the pass closed; a per-batch read of the own target
+through an input attachment would).
