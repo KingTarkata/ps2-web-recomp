@@ -560,6 +560,22 @@ HwRaster::Plan HwRaster::plan(const gpu::Command &cmd, const std::uint32_t *aren
     std::uint32_t zmode = 0;
     if (!supported(cmd, arena, params, setups, zmode)) {
         ++fallback_;
+        // PS2_HW_TRACE: the batches the compute rasterizer draws, setup by setup.
+        static std::uint64_t trace_from = ~0ull, trace_to = 0;
+        static const bool trace = [] {
+            const char *spec = std::getenv("PS2_HW_TRACE");
+            unsigned long long a = 0, z = ~0ull;
+            if (spec && std::sscanf(spec, "%llu,%llu", &a, &z) >= 1) { trace_from = a; trace_to = z; }
+            return spec != nullptr;
+        }();
+        if (trace && frame_count() >= trace_from && frame_count() < trace_to) {
+            const std::uint32_t *all = arena + (params + cmd.param * (gpu::kParamStride / 4))[2];
+            for (std::uint32_t i = 0; i < cmd.setups; ++i) {
+                const std::uint32_t *w = all + i * kSetupWords;
+                std::fprintf(stderr, "[hw] f%llu declined (%s) prims %u setup %u/%u flags %04x fpsm %02x fbp %u fbmsk %08x zpsm %02x zbp %u ztst %u zmsk %u tex %u/%u/%02x\n", static_cast<unsigned long long>(frame_count()), kReasons[last_reason_], cmd.prims, i, cmd.setups, w[0], w[3], w[1], w[4], w[6], w[5],
+                             (w[0] & F_ZTE) ? (w[7] >> 8) & 3u : 9u, (w[0] & F_ZMSK) ? 1u : 0u, w[12], w[13], w[14]);
+            }
+        }
         return Plan::Declined;
     }
     if (!pass_cb_) return Plan::Draw;
@@ -1674,7 +1690,10 @@ void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture 
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, decode_tex_);
     bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, set0, v ? v->set1[slot_] : misc_set1_[slot_], 0, uniform);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 2, 1, &t.set2, 0, nullptr);
-    vkCmdDispatch(cb, (width + 15) / 16, (height + 15) / 16, 1);
+    // Measurement only (wrong output): bit 21 launches one workgroup per
+    // decode, to split the decodes' cost into launches and texel work.
+    if (debug_bits() & 2097152u) vkCmdDispatch(cb, 1, 1, 1);
+    else vkCmdDispatch(cb, (width + 15) / 16, (height + 15) / 16, 1);
     ++decoded_textures_;
 }
 
@@ -1896,15 +1915,15 @@ HwRaster::Texture *HwRaster::texture_for(VkCommandBuffer cb, VkDescriptorSet set
         return &t;
     }
     if (!fresh) ++tex_drops_[4];
-    static int shown = 0;
-    if (std::getenv("PS2_TEX_TRACE") && shown < 4000 && frame_count() == 5404) {
-        ++shown;
+    // PS2_TEX_TRACE=<frame>: why each texture of that frame is (re)decoded.
+    static const unsigned long long tex_trace_frame = std::getenv("PS2_TEX_TRACE") ? std::strtoull(std::getenv("PS2_TEX_TRACE"), nullptr, 10) : ~0ull;
+    if (frame_count() == tex_trace_frame) {
         std::size_t stale = 0;
         for (std::size_t i = 0; i < t.cell_block.size(); ++i) stale += t.cell_id[i] != block_ids_[t.cell_block[i] & 16383u];
         std::size_t stale_clut = 0;
         for (std::size_t i = 0; i < t.clut_blocks.size(); ++i) stale_clut += t.clut_ids[i] != block_ids_[t.clut_blocks[i] & 16383u];
-        std::fprintf(stderr, "[tex] f%llu %s tbp %u tbw %u psm %02x %ux%u clut %u: texels %u,%u-%u,%u, %zu of %zu cells stale, %zu of %zu clut blocks stale\n", static_cast<unsigned long long>(frame_count()), fresh ? "new" : "stale", w[12], w[13], w[14], 1u << t.tw, 1u << t.th, w[22] >> 12,
-                     texels.x0, texels.y0, texels.x1, texels.y1, stale, t.cell_block.size(), stale_clut, t.clut_blocks.size());
+        std::fprintf(stderr, "[tex] f%llu %s tbp %u tbw %u psm %02x %ux%u clut %u source %u: texels %u,%u-%u,%u, %zu of %zu cells stale, %zu of %zu clut blocks stale, span %x-%x clut %x-%x\n", static_cast<unsigned long long>(frame_count()), fresh ? "new" : "stale", w[12], w[13], w[14], 1u << t.tw, 1u << t.th, w[22] & 0xFFFu, w[22] >> 12,
+                     texels.x0, texels.y0, texels.x1, texels.y1, stale, t.cell_block.size(), stale_clut, t.clut_blocks.size(), t.lo, t.hi, t.clo, t.chi);
     }
     {
         cpu_timers::Scope td(cpu_timers::kDecode);

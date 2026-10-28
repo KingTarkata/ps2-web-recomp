@@ -391,7 +391,8 @@ private:
     struct View {
         std::uint32_t base = 0, bw = 0, words = 0, shift = 0;
     };
-    // The resident 32/24-bit colour surface holding `span` whole (not this batch's own), or null.
+    // The resident 32/24-bit colour surface holding `span` whole (not this
+    // batch's own), preferring one whose tiles there are all valid, or null.
     Surface *viewable_surface(const gpu::Span &span, const Surface *color, const Surface *depth);
     std::size_t deferred_count_ = 0;
     Surface *pass_color_ = nullptr, *pass_depth_ = nullptr;
