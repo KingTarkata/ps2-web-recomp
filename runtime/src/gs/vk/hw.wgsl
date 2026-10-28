@@ -104,6 +104,9 @@ fn setup_u() -> Setup {
 // as `decoded`, which is kept in step for the compute rasterizer.
 @group(1) @binding(4) var decoded_write: texture_storage_2d<r32uint, write>;
 @group(1) @binding(5) var decoded_read: texture_2d<u32>;
+// The surface's own depth image (depth surfaces; a dummy otherwise):
+// export_depth reads it directly instead of through a copy to depth_stage.
+@group(1) @binding(6) var depth_image: texture_depth_2d;
 
 // Set 2 is one cached texture: decoded once from GS memory into an RGBA8
 // image (decode_tex), then sampled with the texture unit. The samplers
@@ -618,8 +621,9 @@ fn depth_max(psm: u32) -> u32 {
     }
 }
 
-// Depth cannot be a storage image, so it goes through depth_stage and a
-// buffer/image copy on the host side. Both passes work on the rectangle.
+// Depth cannot be a storage image, so the import goes through depth_stage
+// and a buffer/image copy on the host side; the export reads the depth
+// image itself. Both work on the rectangle.
 @compute @workgroup_size(16, 16)
 fn import_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= hw.width || gid.y >= hw.height) {
@@ -640,7 +644,7 @@ fn export_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     // The rasterizer interpolates depth between integer vertex values; the
     // GS keeps the integer part, so floor it back (round would lift half of
     // the pixels by one and break greater-or-equal tests on coplanar draws).
-    let d = bitcast<f32>(depth_stage[gid.y * hw.width + gid.x]);
+    let d = textureLoad(depth_image, vec2<i32>(i32(c.x), i32(c.y)), 0);
     var z = 0xFFFFFFFFu;
     if (d < 1.0) {
         z = u32(floor(d * 4294967296.0 + 0.001));

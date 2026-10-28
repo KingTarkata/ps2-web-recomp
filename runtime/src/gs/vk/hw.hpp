@@ -302,10 +302,11 @@ private:
     static std::uint32_t blend_key(const std::uint32_t *setup, bool dual_source);
     Buffer depth_stage_;  // D32 bits of the rectangle in flight, shared by all surfaces
     Image dummy_;         // stands in for the image bindings of depth surfaces
+    Image dummy_depth_;   // stands in for the depth image binding of colour surfaces
     Image decoded_;       // the decoded texture cache as a 2048-wide R32_UINT image
     VkDescriptorSet misc_set1_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};  // set 1 without a surface, for decodes
     VkPipeline decode_ = VK_NULL_HANDLE, decode_tex_ = VK_NULL_HANDLE;
-    bool write_set1(VkDescriptorSet set, int slot, VkImageView surface_view);
+    bool write_set1(VkDescriptorSet set, int slot, VkImageView surface_view, VkImageView depth_view);
     VkDescriptorSetLayout set2_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool2_ = VK_NULL_HANDLE;
     VkSampler samplers_[4] = {};

@@ -83,15 +83,16 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
         vci.pCode = variants[v];
         if (vkCreateShaderModule(ctx.device, &vci, nullptr, &variant_modules_[v]) != VK_SUCCESS) variant_modules_[v] = VK_NULL_HANDLE;
     }
-    VkDescriptorSetLayoutBinding b[6] = {};
+    VkDescriptorSetLayoutBinding b[7] = {};
     b[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[3] = {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[4] = {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[5] = {5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[6] = {6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};  // the surface's depth image (export_depth reads it directly)
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 6;
+    lci.bindingCount = 7;
     lci.pBindings = b;
     if (vkCreateDescriptorSetLayout(ctx.device, &lci, nullptr, &set1_layout_) != VK_SUCCESS) return false;
     // Samplers for the cached-texture path: bilinear, REPEAT or CLAMP per axis.
@@ -150,6 +151,7 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     // Depth surfaces never use the image bindings of set 1, but every
     // binding is written so no descriptor is left undefined.
     if (!ctx.create_image(dummy_, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+    if (!ctx.create_image(dummy_depth_, 1, 1, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT)) return false;
     {
         VkCommandBuffer cb = ctx.begin_once();
         VkImageMemoryBarrier bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -158,6 +160,17 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
         bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bar.image = dummy_.image;
         bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+        ctx.end_once(cb);
+    }
+    {
+        VkCommandBuffer cb = ctx.begin_once();
+        VkImageMemoryBarrier bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        bar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bar.image = dummy_depth_.image;
+        bar.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
         ctx.end_once(cb);
     }
@@ -180,18 +193,19 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     dai.descriptorSetCount = 2;
     dai.pSetLayouts = layouts;
     if (vkAllocateDescriptorSets(ctx.device, &dai, misc_set1_) != VK_SUCCESS) return false;
-    for (int i = 0; i < 2; ++i) write_set1(misc_set1_[i], i, dummy_.view);
+    for (int i = 0; i < 2; ++i) write_set1(misc_set1_[i], i, dummy_.view, dummy_depth_.view);
     frame_ = &frames_[0];
     return true;
 }
 
-bool HwRaster::write_set1(VkDescriptorSet set, int slot, VkImageView surface_view) {
+bool HwRaster::write_set1(VkDescriptorSet set, int slot, VkImageView surface_view, VkImageView depth_view) {
     VkDescriptorBufferInfo ub{frames_[slot].uniforms.buffer, 0, kUniformWords * 4};
     VkDescriptorImageInfo image{VK_NULL_HANDLE, surface_view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo stage{depth_stage_.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorImageInfo dec{VK_NULL_HANDLE, decoded_.view, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet w[6] = {};
-    for (int k = 0; k < 6; ++k) {
+    VkDescriptorImageInfo depth{VK_NULL_HANDLE, depth_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[7] = {};
+    for (int k = 0; k < 7; ++k) {
         w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[k].dstSet = set;
         w[k].dstBinding = static_cast<std::uint32_t>(k);
@@ -209,7 +223,9 @@ bool HwRaster::write_set1(VkDescriptorSet set, int slot, VkImageView surface_vie
     w[4].pImageInfo = &dec;
     w[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     w[5].pImageInfo = &dec;
-    vkUpdateDescriptorSets(ctx_->device, 6, w, 0, nullptr);
+    w[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    w[6].pImageInfo = &depth;
+    vkUpdateDescriptorSets(ctx_->device, 7, w, 0, nullptr);
     return true;
 }
 
@@ -811,7 +827,7 @@ HwRaster::Surface *HwRaster::find_surface(std::uint32_t bp, std::uint32_t bw, st
 
 bool HwRaster::allocate(Surface &s, std::uint32_t width, std::uint32_t height) {
     const VkImageUsageFlags color_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    const VkImageUsageFlags depth_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const VkImageUsageFlags depth_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!ctx_->create_image(s.image, width * scale_, height * scale_, s.depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM, s.depth ? depth_usage : color_usage,
                             s.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
@@ -844,7 +860,7 @@ bool HwRaster::allocate(Surface &s, std::uint32_t width, std::uint32_t height) {
         ctx_->destroy_image(s.image);
         return false;
     }
-    for (int i = 0; i < 2; ++i) write_set1(s.set1[i], i, s.depth ? dummy_.view : s.image.view);
+    for (int i = 0; i < 2; ++i) write_set1(s.set1[i], i, s.depth ? dummy_.view : s.image.view, s.depth ? s.image.view : dummy_depth_.view);
     if (!s.depth) {
         VkDescriptorSetAllocateInfo tai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         tai.descriptorPool = pool2_;
@@ -1095,20 +1111,17 @@ void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
             vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
             vkCmdCopyBufferToImage(cb, depth_stage_.buffer, s.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         } else {
-            VkImageMemoryBarrier to_transfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            to_transfer.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-            to_transfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            to_transfer.oldLayout = to_transfer.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            to_transfer.srcQueueFamilyIndex = to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            to_transfer.image = s.image.image;
-            to_transfer.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-            mem.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-            mem.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem, 0, nullptr, 1, &to_transfer);
-            vkCmdCopyImageToBuffer(cb, s.image.image, VK_IMAGE_LAYOUT_GENERAL, depth_stage_.buffer, 1, &region);
-            mem.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            mem.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
+            // export_depth reads the depth image through its sampled view
+            // (set 1 binding 6), so no staging copy: one barrier from the
+            // depth writes (attachment or import copy) to the shader read.
+            VkImageMemoryBarrier to_read{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            to_read.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            to_read.oldLayout = to_read.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            to_read.srcQueueFamilyIndex = to_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_read.image = s.image.image;
+            to_read.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_read);
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, export_depth_);
             bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, set0, s.set1[slot_], 0, uniform);
             vkCmdDispatch(cb, gx, gy, 1);
@@ -2214,6 +2227,7 @@ void HwRaster::destroy() {
     bounds_dirty_ = true;
     ctx_->destroy_buffer(depth_stage_);
     ctx_->destroy_image(dummy_);
+    ctx_->destroy_image(dummy_depth_);
     for (FrameScratch &f : frames_) {
         ctx_->destroy_buffer(f.vertices);
         ctx_->destroy_buffer(f.uniforms);
