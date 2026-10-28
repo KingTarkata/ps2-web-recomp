@@ -756,3 +756,43 @@ copy) instead of memory; and a DATE path that does not close the pass
 (stencil pre-pass inside the pass is not possible either, since the
 snapshot needs the pass closed; a per-batch read of the own target
 through an input attachment would).
+
+### 2026-10-28: cheaper import/export shaders, measured
+
+Baseline for the day (Switch, race frames 6050-6650, GPU profile): total
+45.5 ms; no draws (bit 27) 18.1 ms of hardware raster; no draws and no
+copies (27 + 32768) 8.7 ms, so the copies cost 9.4 ms for 6.9 Mpx in 381
+dispatches per frame (`PS2_HW_TRACE`: 239 of them 4 kpx or smaller,
+together only 0.5 Mpx; 304 copy calls, 274 with a single rectangle).
+
+Two shader changes, both bit-identical natively and on the Switch:
+
+1. The copy entry points divided by the uniform `hw.scale` four times
+   per sample. The hardware module is compiled once per scale, so `SCALE`
+   is a constant there; the divisions now fold away. The draw shaders had
+   the same pattern per fragment (the GS pixel and sample index) and got
+   the same change.
+2. `export_depth` reads the depth image through a sampled view (set 1
+   binding 6, `texture_depth_2d`; depth surfaces now carry SAMPLED usage,
+   colour surfaces bind a 1x1 dummy) instead of a `vkCmdCopyImageToBuffer`
+   into `depth_stage` behind two barriers. About 62 depth exports per
+   frame lost their copy. Imports still stage through the buffer.
+
+| run | raster-hw ms/frame | total ms/frame | threaded ms/frame |
+|---|---|---|---|
+| baseline 33082db | 34.5 (no draws 18.1, no copies 8.7) | 45.5 | 38.1-39.6 |
+| copy shaders (d26780c, 2e7daf8) | 32.8 (no draws 16.5, no copies 8.5) | 43.8 | 36.6-37.6 |
+| plus draw shaders (818db0c) | 32.3 (no draws 16.6, no copies 8.6) | 43.3 | 35.9-37.3 |
+
+Where the remaining 8.1 ms of copies goes: `PS2_HW_DEBUG` bit 29
+(536870912) keeps every barrier, bind and dispatch but launches one
+workgroup per copy; with it (and bit 27) the hardware raster is 10.4 ms
+against 8.5 without copies and 16.5 with them. So the 381 dispatches
+cost about 2.0 ms (5 us each: barrier, bind, launch) and the samples 6.1
+ms, 0.88 ms per Mpx. At 12-16 bytes moved per sample that is within
+about 2x of the Tegra's memory bandwidth, so the per-sample work is
+close to its floor; packing a call's rectangles into one dispatch would
+remove only 77 of the 381 launches (most calls carry one rectangle). The
+copy cost is now a per-event cost: the way down is fewer copy events,
+i.e. the structural candidates above (24-bit alias decodes from the
+frame image; a DATE path inside the pass), not cheaper shaders.
