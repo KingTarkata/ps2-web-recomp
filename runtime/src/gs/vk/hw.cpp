@@ -539,13 +539,20 @@ bool HwRaster::held_conflict(const gpu::Command &cmd) const {
 
 HwRaster::Surface *HwRaster::viewable_surface(const gpu::Span &span, const Surface *color, const Surface *depth) {
     if (span.hi <= span.lo) return nullptr;
+    // Several surfaces may hold the span (GT4's frame halves alias its
+    // 24-bit frame): the one whose tiles there are all valid needs no
+    // write-back or import before the view reads it.
+    Surface *first = nullptr;
     for (auto &sp : surfaces_) {
         Surface &s = *sp;
         if (s.depth || !s.image.image || !s.set2 || (s.psm != 0x00u && s.psm != 0x01u) || &s == color || &s == depth) continue;
         const std::uint64_t base = static_cast<std::uint64_t>(s.bp) * 256, end = base + static_cast<std::uint64_t>(s.height / 32) * s.bw * 8192;
-        if (span.lo >= base && span.hi <= end) return &s;
+        if (span.lo < base || span.hi > end) continue;
+        if (!first) first = &s;
+        Rect r;
+        if (span_rect(s, span, r) && tile_rects(s.plane, r, [](const Plane &q, std::uint32_t t) { return !q.valid[t]; }).empty()) return &s;
     }
-    return nullptr;
+    return first;
 }
 
 HwRaster::Plan HwRaster::plan(const gpu::Command &cmd, const std::uint32_t *arena, const std::uint32_t *params) {
