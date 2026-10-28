@@ -127,7 +127,7 @@ fn surface_word(word: u32) -> vec2<u32> {
     let e = tables[hw.view_table + (rel % 2048u)];
     let x = (page % hw.view_bw) * 64u + (e & 0xFFu);
     let y = (page / hw.view_bw) * 32u + (e >> 8u) + hw.view_shift;
-    return vec2<u32>(1u, pack_word(textureLoad(tex_image, vec2<i32>(i32(x * hw.scale), i32(y * hw.scale)), 0)));
+    return vec2<u32>(1u, pack_word(textureLoad(tex_image, vec2<i32>(i32(x * SCALE), i32(y * SCALE)), 0)));
 }
 
 fn decoded_load(i: u32) -> u32 {
@@ -156,8 +156,8 @@ struct VsOut {
 @vertex
 fn hw_vs(v: VsIn) -> VsOut {
     var o: VsOut;
-    let w = f32(hw.width) / f32(hw.scale);
-    let h = f32(hw.height) / f32(hw.scale);
+    let w = f32(hw.width) / f32(SCALE);
+    let h = f32(hw.height) / f32(SCALE);
     // GS pixel centers are at integer coordinates; Vulkan's are at +0.5.
     let x = (v.pos.x + 0.5) / w * 2.0 - 1.0;
     let y = (v.pos.y + 0.5) / h * 2.0 - 1.0;
@@ -208,8 +208,8 @@ fn hw_fs(i: VsOut) -> FsOut {
     snapshot_hi = hw.snap_hi;
     let sx = u32(i.clip.x);
     let sy = u32(i.clip.y);
-    let x = i32(sx / hw.scale);
-    let y = i32(sy / hw.scale);
+    let x = i32(sx / SCALE);
+    let y = i32(sy / SCALE);
     // The GS scissor is the Vulkan scissor rectangle (set per setup by the host).
     if (v_may_discard()) {
         let scanmsk = mode(s, 28u, 2u);
@@ -217,7 +217,7 @@ fn hw_fs(i: VsOut) -> FsOut {
             discard;
         }
     }
-    let k = (sy % hw.scale) * hw.scale + sx % hw.scale;
+    let k = (sy % SCALE) * SCALE + sx % SCALE;
     var r = i32(i.color.x);
     var g = i32(i.color.y);
     var b = i32(i.color.z);
@@ -363,8 +363,8 @@ fn hw_fs_cached(i: VsOut) -> FsOut {
     snapshot_hi = hw.snap_hi;
     let sx = u32(i.clip.x);
     let sy = u32(i.clip.y);
-    let x = i32(sx / hw.scale);
-    let y = i32(sy / hw.scale);
+    let x = i32(sx / SCALE);
+    let y = i32(sy / SCALE);
     // The GS scissor is the Vulkan scissor rectangle (set per setup by the host).
     if (v_may_discard()) {
         let scanmsk = mode(s, 28u, 2u);
@@ -372,7 +372,7 @@ fn hw_fs_cached(i: VsOut) -> FsOut {
             discard;
         }
     }
-    let k = (sy % hw.scale) * hw.scale + sx % hw.scale;
+    let k = (sy % SCALE) * SCALE + sx % SCALE;
     var r = i32(i.color.x);
     var g = i32(i.color.y);
     var b = i32(i.color.z);
