@@ -221,7 +221,8 @@ private:
     template <class Pred> std::vector<Rect> tile_rects(const Plane &p, const Rect &within, Pred pred) const;
     void copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, bool import, const std::vector<Rect> &rects);
     void import_tiles(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect);
-    bool import_from_aliases(VkCommandBuffer cb, Surface &s, const Rect &rect);
+    bool import_from_aliases(VkCommandBuffer cb, Surface &s, const std::vector<Rect> &rects);  // rects: runs of invalid tiles
+    static bool all_valid(const Plane &p, const Rect &rect);
     void write_back(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect, bool drop_aliases = true);
     void invalidate(Surface &s, const Rect &rect);
     void mark_dirty(Surface &s, const Rect &rect);

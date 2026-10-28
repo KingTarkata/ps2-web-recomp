@@ -550,7 +550,7 @@ HwRaster::Surface *HwRaster::viewable_surface(const gpu::Span &span, const Surfa
         if (span.lo < base || span.hi > end) continue;
         if (!first) first = &s;
         Rect r;
-        if (span_rect(s, span, r) && tile_rects(s.plane, r, [](const Plane &q, std::uint32_t t) { return !q.valid[t]; }).empty()) return &s;
+        if (span_rect(s, span, r) && all_valid(s.plane, r)) return &s;
     }
     return first;
 }
@@ -1149,11 +1149,24 @@ void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
 // memory. GT4's post-process chain draws into one half of its 24-bit frame
 // and reads the result through a texture based at the other half, block by
 // block, and its second Z buffer sits one page (64 pixels) after the first.
-bool HwRaster::import_from_aliases(VkCommandBuffer cb, Surface &s, const Rect &rect) {
-    if (!s.image.image || (!s.depth && s.psm != 0x00 && s.psm != 0x01) || (debug_bits() & 1073741824u)) return false;  // bit 30: measurement, no alias copies
+bool HwRaster::all_valid(const Plane &p, const Rect &rect) {
+    for (std::uint32_t ty = rect.y0 / kTile; ty <= rect.y1 / kTile; ++ty)
+        for (std::uint32_t tx = rect.x0 / kTile; tx <= rect.x1 / kTile; ++tx)
+            if (!p.valid[ty * kTiles + tx]) return false;
+    return true;
+}
+
+bool HwRaster::import_from_aliases(VkCommandBuffer cb, Surface &s, const std::vector<Rect> &rects) {
+    if (rects.empty() || !s.image.image || (!s.depth && s.psm != 0x00 && s.psm != 0x01) || (debug_bits() & 1073741824u)) return false;  // bit 30: measurement, no alias copies
     const std::uint32_t stride = s.per_row * 32;  // blocks per page row (32 pixel rows)
     const std::uint32_t pitch = s.bw * 64;        // pixels per row
-    const std::uint32_t tx0 = rect.x0 / kTile, tx1 = std::min(rect.x1, s.width - 1) / kTile, ty0 = rect.y0 / kTile, ty1 = std::min(rect.y1, s.height - 1) / kTile;
+    // The tile rows the runs span, for a cheap rejection of candidates that
+    // cannot hold them (this runs per import on the render thread).
+    std::uint32_t ty_lo = kTiles, ty_hi = 0;
+    for (const Rect &r : rects) {
+        ty_lo = std::min(ty_lo, r.y0 / kTile);
+        ty_hi = std::max(ty_hi, std::min(r.y1, s.height - 1) / kTile);
+    }
     const VkImageAspectFlags aspect = s.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     bool any = false;
     for (const Bound &b : bounds()) {
@@ -1164,6 +1177,7 @@ bool HwRaster::import_from_aliases(VkCommandBuffer cb, Surface &s, const Rect &r
         std::int64_t r = (static_cast<std::int64_t>(s.bp) - static_cast<std::int64_t>(o->bp)) % static_cast<std::int64_t>(stride);
         if (r < 0) { r += stride; --q; }
         if (r % 32 != 0) continue;  // not a whole page: no pixel-aligned mapping
+        if (static_cast<std::int64_t>(ty_hi) + q < 0 || (static_cast<std::int64_t>(ty_lo) + q) * kTile >= o->height) continue;  // no overlap in rows
         const std::uint32_t dx = static_cast<std::uint32_t>(r / 32) * 64;  // s pixel (x, y) is o pixel (x + dx, y + 32 q), wrapping into the next row at the pitch
         // Where s tile (tx, ty) lies in o, or false.
         auto locate = [&](std::uint32_t tx, std::uint32_t ty, std::uint32_t &ox, std::uint32_t &oty) {
@@ -1178,8 +1192,10 @@ bool HwRaster::import_from_aliases(VkCommandBuffer cb, Surface &s, const Rect &r
         };
         std::vector<VkImageCopy> regions;
         std::uint64_t px = 0;
-        for (std::uint32_t ty = ty0; ty <= ty1; ++ty) {
-            std::uint32_t tx = tx0;
+        for (const Rect &rect : rects)
+        for (std::uint32_t ty = rect.y0 / kTile, ty1 = std::min(rect.y1, s.height - 1) / kTile; ty <= ty1; ++ty) {
+            const std::uint32_t tx1 = std::min(rect.x1, s.width - 1) / kTile;
+            std::uint32_t tx = rect.x0 / kTile;
             while (tx <= tx1) {
                 std::uint32_t ox, oty;
                 if (!locate(tx, ty, ox, oty)) { ++tx; continue; }
@@ -1237,11 +1253,11 @@ bool HwRaster::import_from_aliases(VkCommandBuffer cb, Surface &s, const Rect &r
 
 void HwRaster::import_tiles(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect) {
     const auto invalid = [](const Plane &q, std::uint32_t t) { return !q.valid[t]; };
+    if (all_valid(s.plane, rect)) return;
     auto rects = tile_rects(s.plane, rect, invalid);
-    if (rects.empty()) return;
-    if (import_from_aliases(cb, s, rect)) {
+    if (import_from_aliases(cb, s, rects)) {
+        if (all_valid(s.plane, rect)) return;
         rects = tile_rects(s.plane, rect, invalid);
-        if (rects.empty()) return;
     }
     close_pass(cb, import_why_);
     copy_rects(cb, set0, s, true, rects);
@@ -1647,8 +1663,8 @@ void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture 
     // would move more than the decode saves (an atlas region drew 790 kpx of
     // imports per frame that way).
     if (v && span_rect(*v, span, vr)) {
-        import_from_aliases(cb, *v, vr);
-        if (!tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t tile) { return !q.valid[tile]; }).empty()) v = nullptr;
+        if (!all_valid(v->plane, vr)) import_from_aliases(cb, *v, tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t tile) { return !q.valid[tile]; }));
+        if (!all_valid(v->plane, vr)) v = nullptr;
     } else {
         v = nullptr;
     }
@@ -2084,8 +2100,8 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
                 // A same-layout surface holding the span (the other half of
                 // GT4's 24-bit frame) fills the viewed tiles by an image copy;
                 // then neither the write-back nor the import from memory runs.
-                import_from_aliases(cb, *v, vr);
-                if (!tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t t) { return !q.valid[t]; }).empty()) {
+                if (!all_valid(v->plane, vr)) import_from_aliases(cb, *v, tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t t) { return !q.valid[t]; }));
+                if (!all_valid(v->plane, vr)) {
                     // Another surface may hold the span dirty: GT4 reads its
                     // depth buffer as a 24-bit colour texture, so the colour
                     // surface viewed here is a stale copy of the depth

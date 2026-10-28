@@ -264,6 +264,11 @@ bool VkDevice_::ensure_frame_capacity(Frame &f, std::size_t param_bytes, std::si
         ctx_.destroy_buffer(f.data);
         const std::uint64_t size = std::max<std::uint64_t>(f.data.size * 2, (data_bytes + (4u << 20) - 1) & ~((4ull << 20) - 1));
         if (!ctx_.create_buffer(f.data, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, true)) return false;  // cached: the CPU reads the arena back (hardware path)
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::fprintf(stderr, "[vk] arena memory is %s\n", f.data.coherent ? "host-coherent (uncached on the Tegra: uploads copy slowly)" : "host-cached");
+        }
         changed = true;
     }
     const std::uint64_t wanted = std::max<std::uint64_t>(param_bytes, kParamStride);
