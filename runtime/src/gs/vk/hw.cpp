@@ -86,7 +86,7 @@ bool HwRaster::init(Context &ctx, const std::uint32_t *code, std::size_t words, 
     VkDescriptorSetLayoutBinding b[7] = {};
     b[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    b[2] = {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    b[2] = {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};  // surface_word (also in the fragment shaders) names it
     b[3] = {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[4] = {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[5] = {5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
@@ -630,11 +630,12 @@ void HwRaster::print_reasons() const {
     std::fprintf(stderr, "\n");
     if (fragment_frames_) std::fprintf(stderr, "[vk] fragments: %.2f M per frame reached the colour stage over %llu frames (hardware-drawn batches)\n", static_cast<double>(fragments_) / static_cast<double>(fragment_frames_) / 1e6, static_cast<unsigned long long>(fragment_frames_));
     if (clut_views_) std::fprintf(stderr, "[vk] CLUT loads read from surface images: %llu\n", static_cast<unsigned long long>(clut_views_));
-    std::fprintf(stderr, "[vk] surfaces: %zu resident, %.1f Mpx imported, %.1f Mpx written back, %llu evictions, %llu aliased batches, %llu uniform overflows\n", surfaces_.size(), static_cast<double>(imported_px_) / 1e6,
-                 static_cast<double>(exported_px_) / 1e6, static_cast<unsigned long long>(evictions_), static_cast<unsigned long long>(alias_batches_), static_cast<unsigned long long>(uniform_overflows_));
+    std::fprintf(stderr, "[vk] surfaces: %zu resident, %.1f Mpx imported, %.1f Mpx written back, %.1f Mpx copied from aliases, %llu evictions, %llu aliased batches, %llu uniform overflows\n", surfaces_.size(), static_cast<double>(imported_px_) / 1e6,
+                 static_cast<double>(exported_px_) / 1e6, static_cast<double>(alias_copied_px_) / 1e6, static_cast<unsigned long long>(evictions_), static_cast<unsigned long long>(alias_batches_), static_cast<unsigned long long>(uniform_overflows_));
     std::fprintf(stderr, "[vk] textures: %zu resident, %llu decoded, %llu hits, %llu sampled from surfaces, %llu copied from own surface, %llu memory reads answered by surface views; block writes by commands %llu, write-backs %llu, own draws %llu; evictions %llu, stale at lookup %llu\n", textures_.size(),
                  static_cast<unsigned long long>(decoded_textures_), static_cast<unsigned long long>(texture_hits_), static_cast<unsigned long long>(surface_samples_), static_cast<unsigned long long>(surface_copies_), static_cast<unsigned long long>(surface_views_), static_cast<unsigned long long>(tex_drops_[0]), static_cast<unsigned long long>(tex_drops_[1]),
                  static_cast<unsigned long long>(tex_drops_[2]), static_cast<unsigned long long>(tex_drops_[3]), static_cast<unsigned long long>(tex_drops_[4]));
+    std::fprintf(stderr, "[vk] textures decoded from surface images: %llu\n", static_cast<unsigned long long>(decoded_from_surfaces_));
     std::fprintf(stderr, "[vk] fallback reasons:");
     for (int i = 0; i < 14; ++i)
         if (reasons_[i]) std::fprintf(stderr, " %s %llu", kReasons[i], static_cast<unsigned long long>(reasons_[i]));
@@ -1132,9 +1133,109 @@ void HwRaster::copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, 
     }
 }
 
+// Fills the invalid tiles of `rect` that another resident surface of the same
+// kind (32/24-bit colour, or depth in the same format) and pitch holds valid
+// at a whole-page offset, by copying its image. That surface's tiles are
+// memory's words or newer (the alias machinery lets only one surface hold a
+// word dirty, and a draw into one invalidates the others), so the copy is
+// exact and saves both the write-back of that surface and the import from
+// memory. GT4's post-process chain draws into one half of its 24-bit frame
+// and reads the result through a texture based at the other half, block by
+// block, and its second Z buffer sits one page (64 pixels) after the first.
+bool HwRaster::import_from_aliases(VkCommandBuffer cb, Surface &s, const Rect &rect) {
+    if (!s.image.image || (!s.depth && s.psm != 0x00 && s.psm != 0x01) || (debug_bits() & 1073741824u)) return false;  // bit 30: measurement, no alias copies
+    const std::uint32_t stride = s.per_row * 32;  // blocks per page row (32 pixel rows)
+    const std::uint32_t pitch = s.bw * 64;        // pixels per row
+    const std::uint32_t tx0 = rect.x0 / kTile, tx1 = std::min(rect.x1, s.width - 1) / kTile, ty0 = rect.y0 / kTile, ty1 = std::min(rect.y1, s.height - 1) / kTile;
+    const VkImageAspectFlags aspect = s.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    bool any = false;
+    for (const Bound &b : bounds()) {
+        Surface *o = b.s;
+        if (o == &s || o->depth != s.depth || o->bw != s.bw || !o->image.image) continue;
+        if (s.depth ? o->psm != s.psm : (o->psm != 0x00 && o->psm != 0x01)) continue;
+        std::int64_t q = (static_cast<std::int64_t>(s.bp) - static_cast<std::int64_t>(o->bp)) / static_cast<std::int64_t>(stride);
+        std::int64_t r = (static_cast<std::int64_t>(s.bp) - static_cast<std::int64_t>(o->bp)) % static_cast<std::int64_t>(stride);
+        if (r < 0) { r += stride; --q; }
+        if (r % 32 != 0) continue;  // not a whole page: no pixel-aligned mapping
+        const std::uint32_t dx = static_cast<std::uint32_t>(r / 32) * 64;  // s pixel (x, y) is o pixel (x + dx, y + 32 q), wrapping into the next row at the pitch
+        // Where s tile (tx, ty) lies in o, or false.
+        auto locate = [&](std::uint32_t tx, std::uint32_t ty, std::uint32_t &ox, std::uint32_t &oty) {
+            if ((tx + 1) * kTile > s.width || s.plane.valid[ty * kTiles + tx]) return false;
+            std::int64_t y = static_cast<std::int64_t>(ty) + q;
+            std::uint32_t x = tx * kTile + dx;
+            if (x >= pitch) { x -= pitch; ++y; }
+            if (y < 0 || (y + 1) * kTile > o->height || x + kTile > o->width) return false;
+            if (!o->plane.valid[static_cast<std::uint32_t>(y) * kTiles + x / kTile]) return false;
+            ox = x; oty = static_cast<std::uint32_t>(y);
+            return true;
+        };
+        std::vector<VkImageCopy> regions;
+        std::uint64_t px = 0;
+        for (std::uint32_t ty = ty0; ty <= ty1; ++ty) {
+            std::uint32_t tx = tx0;
+            while (tx <= tx1) {
+                std::uint32_t ox, oty;
+                if (!locate(tx, ty, ox, oty)) { ++tx; continue; }
+                const std::uint32_t start = tx, ox0 = ox, oty0 = oty;
+                std::uint32_t nx, noty;
+                do { ++tx; } while (tx <= tx1 && locate(tx, ty, nx, noty) && noty == oty0 && nx == ox0 + (tx - start) * kTile);
+                VkImageCopy c{};
+                c.srcSubresource = c.dstSubresource = {aspect, 0, 0, 1};
+                c.srcOffset = {static_cast<std::int32_t>(ox0 * scale_), static_cast<std::int32_t>(oty0 * kTile * scale_), 0};
+                c.dstOffset = {static_cast<std::int32_t>(start * kTile * scale_), static_cast<std::int32_t>(ty * kTile * scale_), 0};
+                c.extent = {(tx - start) * kTile * scale_, kTile * scale_, 1};
+                regions.push_back(c);
+                px += static_cast<std::uint64_t>(c.extent.width) * c.extent.height;
+                for (std::uint32_t t = start; t < tx; ++t) s.plane.valid[ty * kTiles + t] = true;  // clean: memory's words or the alias's newer ones
+            }
+        }
+        if (regions.empty()) continue;
+        if (!any) {
+            close_pass(cb, kCloseCopy);
+            // The source's attachment, import and copy writes land before the
+            // transfer reads; earlier reads of the destination finish before
+            // it is overwritten.
+            VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mem.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+            mem.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mem, 0, nullptr, 0, nullptr);
+            any = true;
+        }
+        vkCmdCopyImage(cb, o->image.image, VK_IMAGE_LAYOUT_GENERAL, s.image.image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+        alias_copied_px_ += px;  // reads keep no surface resident: an atlas region kept alive this way cost 660 kpx of imports per frame
+        static std::uint64_t trace_from = ~0ull, trace_to = 0;
+        static const bool trace = [] {
+            const char *spec = std::getenv("PS2_HW_TRACE");
+            unsigned long long a = 0, z = ~0ull;
+            if (spec && std::sscanf(spec, "%llu,%llu", &a, &z) >= 1) { trace_from = a; trace_to = z; }
+            return spec != nullptr;
+        }();
+        if (trace && frame_count() >= trace_from && frame_count() < trace_to)
+            std::fprintf(stderr, "[hw] f%llu alias-copy %s %u/%u/%02x from %u/%u/%02x: %zu rects (%llu px)\n", static_cast<unsigned long long>(frame_count()), s.depth ? "depth" : "frame", s.bp, s.bw, s.psm, o->bp, o->bw, o->psm, regions.size(), static_cast<unsigned long long>(px));
+    }
+    if (any) {
+        // The copied tiles are read next as a texture, a view, a decode
+        // source or an attachment, or overwritten by an import.
+        VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mem.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mem.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             0, 1, &mem, 0, nullptr, 0, nullptr);
+    }
+    return any;
+}
+
 void HwRaster::import_tiles(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect) {
-    const auto rects = tile_rects(s.plane, rect, [](const Plane &q, std::uint32_t t) { return !q.valid[t]; });
+    const auto invalid = [](const Plane &q, std::uint32_t t) { return !q.valid[t]; };
+    auto rects = tile_rects(s.plane, rect, invalid);
     if (rects.empty()) return;
+    if (import_from_aliases(cb, s, rect)) {
+        rects = tile_rects(s.plane, rect, invalid);
+        if (rects.empty()) return;
+    }
     close_pass(cb, import_why_);
     copy_rects(cb, set0, s, true, rects);
     const std::uint32_t tx0 = rect.x0 / kTile, tx1 = rect.x1 / kTile, ty0 = rect.y0 / kTile, ty1 = rect.y1 / kTile;
@@ -1523,20 +1624,42 @@ bool HwRaster::texture_current(const Texture &t, const Rect *texels) const {
 }
 
 void HwRaster::decode_texture(VkCommandBuffer cb, VkDescriptorSet set0, Texture &t, std::uint32_t setup_offset) {
-    // The decode reads memory: surfaces holding newer pixels there store them first.
     const std::uint64_t before = exported_px_;
     WhyScope why(wb_why_, kCloseWbDecode);
-    memory_read(cb, set0, gpu::Span{t.lo, t.hi});
+    // Texels inside a resident 32/24-bit colour surface decode from its
+    // image: the decode binds that surface's set 1 and flags bit 12 makes
+    // surface_word read target_load, so the surface holding the newest
+    // pixels (often the frame GT4's post-process reads back) is not written
+    // back to memory first. Otherwise the decode reads memory, and surfaces
+    // holding newer pixels there store them first.
+    const gpu::Span span{t.lo, t.hi};
+    Surface *v = (debug_bits() & 1073741824u) ? nullptr : viewable_surface(span, nullptr, nullptr);
+    Rect vr;
+    // Only when the surface (or an alias copy into it) already holds every
+    // texel: importing texels from memory into a surface just to decode them
+    // would move more than the decode saves (an atlas region drew 790 kpx of
+    // imports per frame that way).
+    if (v && span_rect(*v, span, vr)) {
+        import_from_aliases(cb, *v, vr);
+        if (!tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t tile) { return !q.valid[tile]; }).empty()) v = nullptr;
+    } else {
+        v = nullptr;
+    }
+    if (v) {
+        ++decoded_from_surfaces_;
+    } else {
+        memory_read(cb, set0, span);
+    }
     if (t.chi > t.clo) memory_read(cb, set0, gpu::Span{t.clo, t.chi});
-    if (exported_px_ != before) barrier_copies_visible(cb);
+    if (exported_px_ != before || v) barrier_copies_visible(cb);  // write-backs, or imports into the surface read below
     for (std::size_t i = 0; i < t.cell_block.size(); ++i) t.cell_id[i] = block_ids_[t.cell_block[i] & 16383u];
     for (std::size_t i = 0; i < t.clut_blocks.size(); ++i) t.clut_ids[i] = block_ids_[t.clut_blocks[i] & 16383u];
     const std::uint32_t width = 1u << t.tw, height = 1u << t.th;
-    std::uint32_t words[kUniformWords] = {setup_offset, 0, 0, 0, 0, 0, width, height, scale_, 0, 0, 0};
+    std::uint32_t words[kUniformWords] = {setup_offset, 0, 0, v ? 4096u : 0u, 0, 0, width, height, scale_, 0, 0, v ? inverse32_words_ : 0u, v ? v->bp * 64u : 0u, v ? v->bw : 0u, v ? static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u : 0u, 0};
     const std::uint32_t uniform = push_uniform(*frame_, words);
     close_pass(cb, kCloseDecode);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, decode_tex_);
-    bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, set0, misc_set1_[slot_], 0, uniform);
+    bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, set0, v ? v->set1[slot_] : misc_set1_[slot_], 0, uniform);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 2, 1, &t.set2, 0, nullptr);
     vkCmdDispatch(cb, (width + 15) / 16, (height + 15) / 16, 1);
     ++decoded_textures_;
@@ -1936,9 +2059,9 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
         const std::uint32_t *w = setups + i * kSetupWords;
         if (!(w[0] & F_TME) || (!(debug & 65536u) && texture_cacheable(w))) continue;
         if (!(debug & 65536u)) {
-            const std::uint64_t before_imports = imported_px_, before_copies = surface_copies_;
+            const std::uint64_t before_imports = imported_px_, before_copies = surface_copies_, before_alias = alias_copied_px_;
             textures[i] = surface_texture(cb, set0, w, prims, cmd.prims, i, color, depth);
-            decoded_any = decoded_any || imported_px_ != before_imports || surface_copies_ != before_copies;
+            decoded_any = decoded_any || imported_px_ != before_imports || surface_copies_ != before_copies || alias_copied_px_ != before_alias;
         }
         if (!textures[i]) {
             // Memory inside a resident 32/24-bit surface: the fragment shader
@@ -1949,9 +2072,13 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
             Rect vr;
             if (v && span_rect(*v, span, vr)) {
                 if (pass_cb_ == cb && (v == pass_color_ || v == pass_depth_)) close_pass(cb, kCloseSurfaces);  // its attachment writes land first
-                const std::uint64_t before_imports = imported_px_;
+                const std::uint64_t before_imports = imported_px_, before_alias = alias_copied_px_;
                 WhyScope why(import_why_, kCloseImportSource);
-                {
+                // A same-layout surface holding the span (the other half of
+                // GT4's 24-bit frame) fills the viewed tiles by an image copy;
+                // then neither the write-back nor the import from memory runs.
+                import_from_aliases(cb, *v, vr);
+                if (!tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t t) { return !q.valid[t]; }).empty()) {
                     // Another surface may hold the span dirty: GT4 reads its
                     // depth buffer as a 24-bit colour texture, so the colour
                     // surface viewed here is a stale copy of the depth
@@ -1959,9 +2086,9 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
                     // also drops the viewed surface's tiles for the import).
                     WhyScope wb(wb_why_, kCloseWbOverlap);
                     memory_read(cb, set0, span, v);
+                    import_tiles(cb, set0, *v, vr);  // what memory still owns there
                 }
-                import_tiles(cb, set0, *v, vr);  // what memory still owns there
-                decoded_any = decoded_any || imported_px_ != before_imports;
+                decoded_any = decoded_any || imported_px_ != before_imports || alias_copied_px_ != before_alias;
                 views[i] = View{v->bp * 64u, v->bw, static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u, 0u};
                 textures[i] = v->set2;
                 memory_sampled = true;  // the shader still reads the CLUT buffer

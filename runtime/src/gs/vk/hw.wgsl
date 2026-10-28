@@ -16,7 +16,7 @@ struct HwParams {
     base: u32,       // draws: setup record offset in `data`; copies: frame or depth base (block address)
     bw: u32,         // copies: buffer width (64-pixel units)
     psm: u32,        // copies: pixel format
-    flags: u32,      // bit 0: depth attachment present; bits 1, 2: debug paints; bit 3: keep the fragments the alpha test fails (and drop the rest); bit 4: output the blend factor C as the colour; bit 5: output Cs * (1 + C); bit 6: output Cs * 127/128
+    flags: u32,      // bit 0: depth attachment present; bits 1, 2: debug paints; bit 3: keep the fragments the alpha test fails (and drop the rest); bit 4: output the blend factor C as the colour; bit 5: output Cs * (1 + C); bit 6: output Cs * 127/128; bit 12: surface_word reads target_load (texture decodes from a surface)
     ox: i32,         // rectangle origin in GS pixels (copies)
     oy: i32,
     width: u32,      // rectangle size in samples (copies), target size in samples (draws)
@@ -127,6 +127,11 @@ fn surface_word(word: u32) -> vec2<u32> {
     let e = tables[hw.view_table + (rel % 2048u)];
     let x = (page % hw.view_bw) * 64u + (e & 0xFFu);
     let y = (page / hw.view_bw) * 32u + (e >> 8u) + hw.view_shift;
+    // Texture decodes from a surface bind that surface's set 1 (flags bit 12)
+    // and keep set 2 for the texture image they fill.
+    if ((hw.flags & 4096u) != 0u) {
+        return vec2<u32>(1u, pack_word(textureLoad(target_load, vec2<i32>(i32(x * SCALE), i32(y * SCALE)), 0)));
+    }
     return vec2<u32>(1u, pack_word(textureLoad(tex_image, vec2<i32>(i32(x * SCALE), i32(y * SCALE)), 0)));
 }
 

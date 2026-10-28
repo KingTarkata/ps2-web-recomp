@@ -221,6 +221,7 @@ private:
     template <class Pred> std::vector<Rect> tile_rects(const Plane &p, const Rect &within, Pred pred) const;
     void copy_rects(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, bool import, const std::vector<Rect> &rects);
     void import_tiles(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect);
+    bool import_from_aliases(VkCommandBuffer cb, Surface &s, const Rect &rect);
     void write_back(VkCommandBuffer cb, VkDescriptorSet set0, Surface &s, const Rect &rect, bool drop_aliases = true);
     void invalidate(Surface &s, const Rect &rect);
     void mark_dirty(Surface &s, const Rect &rect);
@@ -370,6 +371,7 @@ private:
     std::uint64_t fragments_ = 0, fragment_frames_ = 0;
     std::uint64_t drawn_ = 0, fallback_ = 0;
     std::uint64_t imported_px_ = 0, exported_px_ = 0, evictions_ = 0, uniform_overflows_ = 0, alias_batches_ = 0;
+    std::uint64_t alias_copied_px_ = 0, decoded_from_surfaces_ = 0;  // tiles filled from another surface's image instead of memory (import_from_aliases)
     // Why batches fell back, by the first reason met (see hw.cpp kReasons).
     mutable std::uint64_t reasons_[14] = {};
     mutable int last_reason_ = 0;
