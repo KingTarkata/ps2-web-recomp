@@ -860,3 +860,31 @@ outside submit fell from about 5.4 to 2.4 ms. Screenshot (scrot on the
 Switch) correct and letterboxed. This also matters for Horizon, where
 the SDL renderer path would not exist: the device now owns its
 presentation end to end.
+
+### 2026-10-28: the CPU side, measured on the render thread
+
+Main-thread-only profile on the Switch (perf -t on the render thread,
+threaded race, 35-36 ms/frame): 65% in ps2run, 17% libc (memcpy), 12%
+the NVIDIA driver recording commands. Top symbols: memcpy 13.2% (9.4
+points of it the upload copies into the arena, 2.9 MB per frame),
+gpu::draw 6.7, gif::render 5.3, memory_written 4.0, write_packed 3.1,
+kick 3.1, import_from_aliases 3.0, load_clut 2.8, gs::write 2.8,
+append_prims 2.8, HwRaster::draw 2.6, vertex 2.3, supported 2.2,
+viewable_surface 2.1. `PS2_VK_MEMBENCH` showed the arena copies run at
+heap speed (2.0 GB/s, DRAM-bound on the A57); the staging (host-coherent)
+memory takes 1.1 GB/s. So the upload cost is the copy itself (ring to
+arena, after the EE thread's copy into the ring); removing it means
+restructuring the shared upload path.
+
+Done in our code: alias copies and views test tiles without allocating;
+tile maps as one 64-bit word per row; the block-id fill skipped while no
+texture recorded ids and no upload rewrote them since a covering fill.
+Each bit-identical; each within noise on the frame time. Per-thread
+samples explain why: the render thread runs at about 88% of a core, the
+EE and VU threads at 65% each, and the GPU (43 ms in the serialised
+profile, so about the 35 ms frame when overlapped) sets the frame. CPU
+savings on the render thread bank for when the GPU drops; the next
+CPU items, in order of size, are the upload copy (shared code, ~3 ms),
+the GS front end (gif::render, write_packed, kick, vertex, gpu::draw:
+about 20% of the thread, shared code) and the per-batch record work in
+HwRaster::draw (supported, append_prims, texture_texels).
