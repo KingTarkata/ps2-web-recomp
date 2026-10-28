@@ -1310,6 +1310,9 @@ void HwRaster::flush_sync(VkDescriptorSet set0, const gpu::Span &span) {
     if (!hit) return;
     VkCommandBuffer cb = ctx_->begin_once();
     memory_read(cb, set0, span);
+    // The write-backs' uniforms went into the frame scratch after end_frame
+    // flushed it: flush again (host-cached memory) before the GPU reads them.
+    ctx_->flush(frame_->uniforms, 0, frame_->uniform_used);
     VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mem.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     mem.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
@@ -1879,6 +1882,15 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
                 if (pass_cb_ == cb && (v == pass_color_ || v == pass_depth_)) close_pass(cb, kCloseSurfaces);  // its attachment writes land first
                 const std::uint64_t before_imports = imported_px_;
                 WhyScope why(import_why_, kCloseImportSource);
+                {
+                    // Another surface may hold the span dirty: GT4 reads its
+                    // depth buffer as a 24-bit colour texture, so the colour
+                    // surface viewed here is a stale copy of the depth
+                    // surface's memory until that is written back (which
+                    // also drops the viewed surface's tiles for the import).
+                    WhyScope wb(wb_why_, kCloseWbOverlap);
+                    memory_read(cb, set0, span, v);
+                }
                 import_tiles(cb, set0, *v, vr);  // what memory still owns there
                 decoded_any = decoded_any || imported_px_ != before_imports;
                 views[i] = View{v->bp * 64u, v->bw, static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u, 0u};

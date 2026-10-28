@@ -214,6 +214,22 @@ void poll() {
 }
 
 void show_pixels(const std::uint32_t *rgba, std::uint32_t w, std::uint32_t h) {
+    // PS2_DUMP_PRESENT=<dir>: write every presented frame as a PPM (debugging the
+    // real-time display path against the headless --frames-dir dumps).
+    static const char *const dump = std::getenv("PS2_DUMP_PRESENT");
+    if (dump) {
+        static unsigned long long n = 0;
+        char name[512];
+        std::snprintf(name, sizeof name, "%s/present_%05llu.ppm", dump, n++);
+        if (std::FILE *f = std::fopen(name, "wb")) {
+            std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+            for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i) {
+                const std::uint8_t px[3] = {static_cast<std::uint8_t>(rgba[i]), static_cast<std::uint8_t>(rgba[i] >> 8), static_cast<std::uint8_t>(rgba[i] >> 16)};
+                std::fwrite(px, 1, 3, f);
+            }
+            std::fclose(f);
+        }
+    }
     if (w != g_tex_w || h != g_tex_h) {
         if (g_texture) SDL_DestroyTexture(g_texture);
         g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, static_cast<int>(w), static_cast<int>(h));
