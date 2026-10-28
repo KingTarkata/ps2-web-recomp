@@ -413,6 +413,7 @@ private:
     std::uint64_t fragments_ = 0, fragment_frames_ = 0;
     std::uint64_t drawn_ = 0, fallback_ = 0;
     std::uint64_t imported_px_ = 0, exported_px_ = 0, evictions_ = 0, uniform_overflows_ = 0, alias_batches_ = 0;
+    std::uint64_t fill_tiles_ = 0, fill_batches_ = 0;  // tiles a batch of opaque sprites covers whole: valid without an import
     std::uint64_t alias_copied_px_ = 0, decoded_from_surfaces_ = 0, decoded_texels_ = 0, decode_skips_ = 0;  // tiles filled from another surface's image instead of memory (import_from_aliases)
     // Why batches fell back, by the first reason met (see hw.cpp kReasons).
     mutable std::uint64_t reasons_[14] = {};

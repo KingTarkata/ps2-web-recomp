@@ -974,3 +974,34 @@ us, GPU profile total 38.8 -> 37.5 ms, threaded race 29.7-34.5 ms/frame
 (mostly 30.5-32); frame 6100 and native frames 5500-6000 bit-identical.
 Remaining in the post-process chain: the two passes per strip (tile draw
 17 us, block draw now ~25 us) and the 8-record CLUT load (~10 us).
+
+### 2026-10-28: fills need no import
+
+Around GT4's frame clear the trace showed 0.45 Mpx of imports feeding a
+batch of 49 opaque 64x448 sprites (colour 6720/10/00 unmasked, Z 2240
+PSMZ24 written under ZTST ALWAYS, c 00000000): every pixel of every tile
+it touched was about to be replaced. `draw` now recognises a fill: all
+setups free of alpha test, destination alpha test and any depth test
+other than ALWAYS, all primitives sprites (their boxes are exact pixel
+bounds, gpu.cpp), colour 32-bit with FBMSK 0 and no blend, depth Z32 or
+Z24 with ZTE and no ZMSK. Each 32x32 tile of the batch rectangle inside
+some sprite box is marked valid without an import (its old contents are
+dead), and the fill imports only its own rectangle's partial tiles
+instead of the whole surface, leaving what it does not cover to the
+batches after it. Z24 is safe because `import_depth`/`export_depth` mask
+to `depth_max`, so memory's top byte never depends on the depth image;
+24-bit colour is not (a 32-bit view of the surface would read the image's
+alpha), and stays out. `PS2_HW_DEBUG` bit 7 (128) imports as before.
+
+Switch: imports 2231 -> 1931 Mpx and alias copies 184 -> 134 Mpx over
+the run, GPU profile 37.5 -> 36.3 ms, threaded race 29.0-33.0 ms/frame
+(every sample under the 30 fps budget for the first time); frame 6100 and
+native frames 5500-6000 bit-identical. The 20 Z-clearing strips after the
+fill alpha-test (ATST GEQUAL 16, AFAIL KEEP), so they are not fills; their
+one 287 kpx depth import a frame stays.
+
+Where the GPU frame stands (profile 6050-6650, 36.3 ms): hardware raster
+27.0 (draws ~15, copies ~6.3, passes ~5), compute raster 4.5 (DATE),
+uploads 2.4 (120 dispatches, ~80 of them single-block palettes to the same
+page split by the page-granular overlap rule), CLUT loads 1.7, decodes
+0.8.

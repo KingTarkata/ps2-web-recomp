@@ -670,6 +670,7 @@ void HwRaster::print_reasons() const {
                  static_cast<unsigned long long>(tex_drops_[2]), static_cast<unsigned long long>(tex_drops_[3]), static_cast<unsigned long long>(tex_drops_[4]));
     std::fprintf(stderr, "[vk] textures decoded from surface images: %llu; %.1f Mpx of texels decoded; %llu decodes skipped for sampling through a view\n", static_cast<unsigned long long>(decoded_from_surfaces_), static_cast<double>(decoded_texels_) / 1e6,
                  static_cast<unsigned long long>(decode_skips_));
+    if (fill_batches_) std::fprintf(stderr, "[vk] fills: %llu batches of opaque sprites covered %llu tiles whole (valid without an import)\n", static_cast<unsigned long long>(fill_batches_), static_cast<unsigned long long>(fill_tiles_));
     std::fprintf(stderr, "[vk] fallback reasons:");
     for (int i = 0; i < 14; ++i)
         if (reasons_[i]) std::fprintf(stderr, " %s %llu", kReasons[i], static_cast<unsigned long long>(reasons_[i]));
@@ -2222,12 +2223,53 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
                          cmd.writes[0].hi, cmd.writes[1].lo, cmd.writes[1].hi);
         barrier_copies_visible(cb);
     }
+    // A batch of sprites that writes every bit of every pixel it covers
+    // (32-bit colour unmasked, or Z32/Z24 written under ZTST ALWAYS, whose
+    // import and export mask to the Z bits so memory's top byte never
+    // depends on the depth image; nothing that
+    // can reject a fragment: no alpha test, destination alpha test or depth
+    // test other than ALWAYS; no blend for the colour) defines the tiles it
+    // covers whole: they are valid without an import. GT4 clears its frame
+    // and Z buffer with such sprites, and clears Z again in 32-pixel strips,
+    // 0.7 Mpx of imports a frame that only fed pixels about to be replaced.
+    // PS2_HW_DEBUG bit 7 (128): import as before (A/B).
+    bool fill_color = color_any && color->psm == 0x00u && !(debug & 128u), fill_depth = depth && (depth->psm == 0x30u || depth->psm == 0x31u) && !(debug & 128u);
+    for (std::uint32_t i = 0; (fill_color || fill_depth) && i < cmd.setups; ++i) {
+        const std::uint32_t *w = setups + i * kSetupWords;
+        const std::uint32_t f = w[0], ztst = (w[7] >> 8) & 3u;
+        if ((f & (F_ATE | F_DATE)) || ((f & F_ZTE) && ztst != 1u)) fill_color = fill_depth = false;
+        if ((f & F_ABE) || w[4] != 0) fill_color = false;
+        if (!(f & F_ZTE) || (f & F_ZMSK)) fill_depth = false;
+    }
+    for (std::uint32_t i = 0; (fill_color || fill_depth) && i < cmd.prims; ++i)
+        if (prims[i * kPrimWords + 1] != 1u) fill_color = fill_depth = false;
+    bool filled = false;
+    if (fill_color || fill_depth) {
+        // The primitive boxes are exact pixel bounds for sprites (gpu.cpp).
+        for (std::uint32_t ty = miny / kTile; ty <= maxy / kTile; ++ty)
+            for (std::uint32_t tx = minx / kTile; tx <= maxx / kTile; ++tx) {
+                const std::uint32_t x0 = tx * kTile, y0 = ty * kTile, x1 = x0 + kTile - 1, y1 = y0 + kTile - 1;
+                bool covered = false;
+                for (std::uint32_t i = 0; !covered && i < cmd.prims; ++i) {
+                    const std::uint32_t lo = prims[i * kPrimWords + 2], hi = prims[i * kPrimWords + 3];
+                    covered = (lo & 0xFFFFu) <= x0 && (lo >> 16) <= y0 && (hi & 0xFFFFu) >= x1 && (hi >> 16) >= y1;
+                }
+                if (!covered) continue;
+                if (fill_color) color->plane.set_valid(tx, ty, tx, ty);
+                if (fill_depth) depth->plane.set_valid(tx, ty, tx, ty);
+                ++fill_tiles_;
+                filled = true;
+            }
+        if (filled) ++fill_batches_;
+    }
     // Every tile memory still owns is imported, not only the batch rectangle:
     // the scene fills the screen batch by batch, and an import per batch
-    // closed the render pass every time (19 in a row in a race frame).
+    // closed the render pass every time (19 in a row in a race frame). A
+    // fill imports only the partial tiles of its own rectangle: what it
+    // does not cover, the batches after it decide.
     WhyScope why_import(import_why_, kCloseImportOwn);
-    if (color_any) import_tiles(cb, set0, *color, Rect{0, 0, color->width - 1, color->height - 1});
-    if (depth) import_tiles(cb, set0, *depth, Rect{0, 0, depth->width - 1, depth->height - 1});
+    if (color_any) import_tiles(cb, set0, *color, filled && fill_color ? rect : Rect{0, 0, color->width - 1, color->height - 1});
+    if (depth) import_tiles(cb, set0, *depth, filled && fill_depth ? rect : Rect{0, 0, depth->width - 1, depth->height - 1});
     // Textures: resolve (and decode, which reads memory the write-backs
     // above just stored) every textured setup's image before the pass.
     if (!(debug & 65536u))
