@@ -834,3 +834,29 @@ DATE and uploads (1.0 Mpx), the target imports of the post-process frame
 and its Z buffer (2240/10/01, 2272/10/31, 4480/10/01: 0.9 Mpx, forced by
 `memory_written` writing the old Z back and invalidating it before the
 targets import), and the scratch 11200/4/00 imports (0.36 Mpx).
+
+### 2026-10-28: presenting through a swapchain
+
+The Vulkan device had no window surface, so the windowed runner took the
+SDL path for every frame: the display dispatch into scratch, a GPU copy
+to a host-cached buffer, a host copy, `SDL_UpdateTexture` and a GL blit
+by SDL's renderer, on the same GPU. `vk/present.cpp` now attaches a
+`VK_KHR_surface` to the X11 (or Wayland) window the host hands to
+`attach_window`, builds a swapchain and draws scratch with the shared
+blit shader (`gs/gpu/blit.wgsl`, compiled to SPIR-V with the rest) at
+the end of each frame's command buffer. Decisions: acquires never block
+(timeout 0; a frame with no free image is skipped and counted, which
+never happened in 1,100 race frames); mailbox is preferred, then
+immediate (what the Switch's X server offers), then FIFO; the blit
+shader keeps WebGPU's clip space (naga `--keep-coordinate-space`), so a
+negative-height viewport flips it; the platform surface structures are
+declared locally since the Switch sysroot has no X11 headers. The SDL
+path remains the fallback (`PS2_SDL_RENDERER=1`, or no extensions) and
+is still where `PS2_DUMP_PRESENT` works.
+
+Switch, threaded race, A/B back to back twice: SDL path 35.3-36.7
+ms/frame, swapchain 34.8-36.1. Main-thread timers: the present scope
+outside submit fell from about 5.4 to 2.4 ms. Screenshot (scrot on the
+Switch) correct and letterboxed. This also matters for Horizon, where
+the SDL renderer path would not exist: the device now owns its
+presentation end to end.
