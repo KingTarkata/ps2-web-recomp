@@ -560,10 +560,13 @@ fn decode_tex(@builtin(global_invocation_id) gid: vec3<u32>) {
 // The copies below address GS memory through the frame or depth buffer
 // named in `hw` alone, so a target can be written back long after the
 // batch that drew it (its setup record is gone by then).
+// The module is compiled per scale (SCALE is a constant, hw.scale always
+// equals it), so the divisions below fold away: a division by a uniform
+// costs tens of instructions per sample on the Tegra.
 fn copy_sample(gid: vec3<u32>) -> vec4<u32> {
-    let tx = u32(hw.ox) * hw.scale + gid.x;
-    let ty = u32(hw.oy) * hw.scale + gid.y;
-    return vec4<u32>(tx, ty, (ty % hw.scale) * hw.scale + tx % hw.scale, 0u);
+    let tx = u32(hw.ox) * SCALE + gid.x;
+    let ty = u32(hw.oy) * SCALE + gid.y;
+    return vec4<u32>(tx, ty, (ty % SCALE) * SCALE + tx % SCALE, 0u);
 }
 
 // Fills a target from GS memory: one invocation per sample.
@@ -573,7 +576,7 @@ fn import_frame(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let c = copy_sample(gid);
-    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / hw.scale, c.y / hw.scale);
+    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / SCALE, c.y / SCALE);
     textureStore(target_store, vec2<i32>(i32(c.x), i32(c.y)), unpack_word(load_at(l, c.z)));
 }
 
@@ -602,7 +605,7 @@ fn export_frame(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let c = copy_sample(gid);
-    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / hw.scale, c.y / hw.scale);
+    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / SCALE, c.y / SCALE);
     let word = pack_word(textureLoad(target_load, vec2<i32>(i32(c.x), i32(c.y)), 0));
     store_frame(hw.psm, l, c.z, word);
 }
@@ -623,7 +626,7 @@ fn import_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let c = copy_sample(gid);
-    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / hw.scale, c.y / hw.scale);
+    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / SCALE, c.y / SCALE);
     depth_stage[gid.y * hw.width + gid.x] = bitcast<u32>(f32(load_at(l, c.z) & depth_max(hw.psm)) / 4294967296.0);
 }
 
@@ -633,7 +636,7 @@ fn export_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let c = copy_sample(gid);
-    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / hw.scale, c.y / hw.scale);
+    let l = addr(fmt_of(hw.psm, hw.base, hw.bw), c.x / SCALE, c.y / SCALE);
     // The rasterizer interpolates depth between integer vertex values; the
     // GS keeps the integer part, so floor it back (round would lift half of
     // the pixels by one and break greater-or-equal tests on coplanar draws).
