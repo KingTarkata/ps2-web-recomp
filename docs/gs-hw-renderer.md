@@ -1005,3 +1005,20 @@ Where the GPU frame stands (profile 6050-6650, 36.3 ms): hardware raster
 uploads 2.4 (120 dispatches, ~80 of them single-block palettes to the same
 page split by the page-granular overlap rule), CLUT loads 1.7, decodes
 0.8.
+
+### 2026-10-28: upload dispatches split by a page-granular overlap rule
+
+`emit_pre` merges consecutive uploads into one dispatch unless they may
+write the same memory (the merged shader runs records in any order).
+`uploads_overlap` compared exact pixel rectangles only for the same
+(DBP, DBW, DPSM) and called any two uploads in overlapping pages with
+different buffers overlapping; GT4 uploads each small palette or glyph to
+a base pointer of its own, several per page, so a run of 45 such uploads
+became 45 dispatches of 1-9 workgroups at 5-6 us each (~120 upload
+dispatches a frame; traced with a temporary `[pre]` print of each emitted
+group and its call site). `queue_upload` already computes the exact block
+list of each chunk for the texture caches; the PreOp keeps it (when at
+most 256 blocks) and different-buffer uploads in one page overlap only
+when the sorted lists share a block. Switch: upload dispatches 15189 over
+651 submits (23 a frame), upload 2.36 -> 1.98 ms, GPU profile total
+36.3 -> 35.7 ms; frames bit-identical.

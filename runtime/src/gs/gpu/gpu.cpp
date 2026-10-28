@@ -176,13 +176,26 @@ struct PreOp {
     std::uint32_t rec[12] = {};
     Range range;
     std::uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0, image = 0;
+    std::vector<std::uint32_t> blocks;  // uploads: the 256-byte blocks written, sorted (empty when too many to compare)
 };
 
+constexpr std::size_t kOverlapBlocks = 256;  // longer block lists are not compared: same page means overlap
+
+// Two uploads whose dispatches may be merged must write disjoint memory
+// (the merged shader runs their records in any order). Same buffer: exact
+// pixel rectangles. Different buffers in the same page (GT4 uploads a
+// palette per block to addresses of its own): their block lists.
 bool uploads_overlap(const PreOp &a, const PreOp &b) {
     if (a.image && a.image == b.image) return false;
     if (!a.range.overlaps(b.range.lo, b.range.hi)) return false;
-    if (a.rec[0] != b.rec[0] || a.rec[1] != b.rec[1] || a.rec[2] != b.rec[2]) return true;
-    return a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1;
+    if (a.rec[0] == b.rec[0] && a.rec[1] == b.rec[1] && a.rec[2] == b.rec[2]) return a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1;
+    if (a.blocks.empty() || b.blocks.empty()) return true;
+    for (std::size_t i = 0, j = 0; i < a.blocks.size() && j < b.blocks.size();) {
+        if (a.blocks[i] == b.blocks[j]) return true;
+        if (a.blocks[i] < b.blocks[j]) ++i;
+        else ++j;
+    }
+    return false;
 }
 
 // Uploads and CLUT loads run before the pending primitive batch unless they touch memory it reads or writes.
@@ -813,6 +826,7 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
         blocks_of(im.dpsm, im.dbp, im.dbw, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1), static_cast<int>(im.dsay + last), blocks);
         const std::uint64_t id = content_key(bytes, n) ^ (static_cast<std::uint64_t>(im.done) << 40) ^ (static_cast<std::uint64_t>(im.dbp) << 20) ^ 0x9E3779B97F4A7C15ull;
         g_dev->blocks_written(blocks.data(), blocks.size(), id);
+        if (blocks.size() <= kOverlapBlocks) op.blocks = blocks;  // sorted and unique (blocks_of)
     }
     ++g_uploads;
     bump_pages(op.range);
