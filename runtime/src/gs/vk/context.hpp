@@ -40,6 +40,8 @@ struct Context {
     std::string name;
     bool has_timestamps = false;
     float timestamp_period = 0.0f;
+    // Presentation extensions the instance and device were created with.
+    bool ext_surface = false, ext_xlib = false, ext_wayland = false, ext_swapchain = false;
 
     // Picks a device (an environment variable PS2_GPU_LOW_POWER prefers an
     // integrated one, otherwise a discrete one, otherwise the first) and

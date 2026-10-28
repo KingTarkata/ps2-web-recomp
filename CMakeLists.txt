@@ -96,8 +96,8 @@ if(PS2_GS_VK AND NOT EMSCRIPTEN AND EXISTS "${PS2_VULKAN_HEADERS}/vulkan/vulkan.
         COMMAND ${CMAKE_COMMAND} -DNAGA=${PS2_NAGA} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/blit.wgsl -DOUT=${out} -DNAME=kBlitSpv -DWORK=${PS2_SPV_DIR} -P ${CMAKE_SOURCE_DIR}/cmake/wgsl_to_spv.cmake
         DEPENDS runtime/src/gs/gpu/blit.wgsl cmake/wgsl_to_spv.cmake)
     list(APPEND PS2_SPV_SOURCES "${out}")
-    target_sources(ps2runtime PRIVATE runtime/src/gs/vk/loader.cpp runtime/src/gs/vk/context.cpp runtime/src/gs/vk/vk.cpp runtime/src/gs/vk/vk_device.cpp runtime/src/gs/vk/hw.cpp ${PS2_SPV_SOURCES})
-    set_source_files_properties(runtime/src/gs/vk/context.cpp runtime/src/gs/vk/vk_device.cpp runtime/src/gs/vk/hw.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
+    target_sources(ps2runtime PRIVATE runtime/src/gs/vk/loader.cpp runtime/src/gs/vk/context.cpp runtime/src/gs/vk/vk.cpp runtime/src/gs/vk/vk_device.cpp runtime/src/gs/vk/hw.cpp runtime/src/gs/vk/present.cpp ${PS2_SPV_SOURCES})
+    set_source_files_properties(runtime/src/gs/vk/context.cpp runtime/src/gs/vk/vk_device.cpp runtime/src/gs/vk/hw.cpp runtime/src/gs/vk/present.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
     target_include_directories(ps2runtime PRIVATE "${PS2_VULKAN_HEADERS}")
     target_compile_definitions(ps2runtime PUBLIC PS2_GS_VK)
     target_link_libraries(ps2runtime PUBLIC dl)

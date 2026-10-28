@@ -106,10 +106,30 @@ namespace ps2::gs::vk {
     X(vkGetQueryPoolResults) \
     X(vkFreeCommandBuffers)
 
+// Presentation (VK_KHR_surface, VK_KHR_swapchain): resolved when the driver
+// has them, null otherwise; the presenter checks before use.
+#define PS2_VK_OPTIONAL_INSTANCE_FUNCTIONS(X) \
+    X(vkDestroySurfaceKHR) \
+    X(vkGetPhysicalDeviceSurfaceSupportKHR) \
+    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
+    X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
+    X(vkGetPhysicalDeviceSurfacePresentModesKHR)
+
+#define PS2_VK_OPTIONAL_DEVICE_FUNCTIONS(X) \
+    X(vkCreateSwapchainKHR) \
+    X(vkDestroySwapchainKHR) \
+    X(vkGetSwapchainImagesKHR) \
+    X(vkAcquireNextImageKHR) \
+    X(vkQueuePresentKHR) \
+    X(vkCreateSemaphore) \
+    X(vkDestroySemaphore)
+
 #define PS2_VK_DECLARE(name) extern PFN_##name name;
 PS2_VK_GLOBAL_FUNCTIONS(PS2_VK_DECLARE)
 PS2_VK_INSTANCE_FUNCTIONS(PS2_VK_DECLARE)
 PS2_VK_DEVICE_FUNCTIONS(PS2_VK_DECLARE)
+PS2_VK_OPTIONAL_INSTANCE_FUNCTIONS(PS2_VK_DECLARE)
+PS2_VK_OPTIONAL_DEVICE_FUNCTIONS(PS2_VK_DECLARE)
 #undef PS2_VK_DECLARE
 
 extern PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;

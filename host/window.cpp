@@ -360,7 +360,7 @@ bool open_window(bool fullscreen) {
 int run_window(const std::function<int()> &emulate) {
     ps2::init_graphics();
     g_gpu_present = attach_gpu();
-    std::fprintf(stderr, "[window] %s\n", g_gpu_present ? "presenting through WebGPU" : "presenting through SDL");
+    std::fprintf(stderr, "[window] %s\n", g_gpu_present ? "presenting through the GPU's own surface" : "presenting through SDL");
     if (!g_gpu_present && !create_renderer()) return 1;
     const bool threads = !std::getenv("PS2_ONE_THREAD") && !std::getenv("PS2_TIME") && ps2::g_options.frames_dir.empty();
     if (!threads) {

@@ -10,6 +10,8 @@ namespace ps2::gs::vk {
 PS2_VK_GLOBAL_FUNCTIONS(PS2_VK_DEFINE)
 PS2_VK_INSTANCE_FUNCTIONS(PS2_VK_DEFINE)
 PS2_VK_DEVICE_FUNCTIONS(PS2_VK_DEFINE)
+PS2_VK_OPTIONAL_INSTANCE_FUNCTIONS(PS2_VK_DEFINE)
+PS2_VK_OPTIONAL_DEVICE_FUNCTIONS(PS2_VK_DEFINE)
 #undef PS2_VK_DEFINE
 
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
@@ -46,6 +48,9 @@ bool load_instance_functions(VkInstance instance) {
     if (!name) { std::fprintf(stderr, "[vk] missing %s\n", #name); ok = false; }
     PS2_VK_INSTANCE_FUNCTIONS(PS2_VK_LOAD)
 #undef PS2_VK_LOAD
+#define PS2_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(vkGetInstanceProcAddr(instance, #name));
+    PS2_VK_OPTIONAL_INSTANCE_FUNCTIONS(PS2_VK_LOAD)
+#undef PS2_VK_LOAD
     return ok;
 }
 
@@ -55,6 +60,9 @@ bool load_device_functions(VkDevice device) {
     name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)); \
     if (!name) { std::fprintf(stderr, "[vk] missing %s\n", #name); ok = false; }
     PS2_VK_DEVICE_FUNCTIONS(PS2_VK_LOAD)
+#undef PS2_VK_LOAD
+#define PS2_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name));
+    PS2_VK_OPTIONAL_DEVICE_FUNCTIONS(PS2_VK_LOAD)
 #undef PS2_VK_LOAD
     return ok;
 }

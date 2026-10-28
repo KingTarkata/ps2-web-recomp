@@ -6,6 +6,7 @@
 #include "../gpu/device.hpp"
 #include "context.hpp"
 #include "hw.hpp"
+#include "present.hpp"
 #include "../gpu/cpu_timers.hpp"
 #include "ps2/system.hpp"
 
@@ -64,6 +65,7 @@ public:
             std::fprintf(stderr, "[vk] hardware raster: %llu batches drawn, %llu through the compute rasterizer\n", static_cast<unsigned long long>(hw_.drawn_batches()),
                          static_cast<unsigned long long>(hw_.fallback_batches()));
         if (hw_on_) hw_.print_reasons();
+        presenter_.report();
         if (dropped_batches_) std::fprintf(stderr, "[vk] %llu batches promised to the hardware path were declined and lost\n", static_cast<unsigned long long>(dropped_batches_));
         if (hw_on_) {
             std::fprintf(stderr, "[vk] passes closed by commands:");
@@ -100,14 +102,14 @@ public:
     int wait_read(int slot, void *out) override;
     void wait_idle() override { vk::vkQueueWaitIdle(ctx_.queue); }
     double busy_ms() override;
-    // Presentation comes with the graphics stage; until then the runner's
-    // SDL path copies frames out through display_async.
-    bool attach_surface(const SurfaceTarget &) override { return false; }
-    void resize_surface(std::uint32_t, std::uint32_t) override {}
-    bool has_surface() const override { return false; }
-    void set_blit(const Blit &) override {}
-    std::uint32_t surface_width() const override { return 0; }
-    std::uint32_t surface_height() const override { return 0; }
+    // Presentation through a swapchain on the runner's window (vk/present);
+    // without one the runner's SDL path copies frames out through display_async.
+    bool attach_surface(const SurfaceTarget &target) override { return presenter_.attach(ctx_, target, scratch_.buffer, scratch_.size, kFrames); }
+    void resize_surface(std::uint32_t width, std::uint32_t height) override { presenter_.resize(width, height); }
+    bool has_surface() const override { return presenter_.active(); }
+    void set_blit(const Blit &blit) override { presenter_.set_blit(blit); }
+    std::uint32_t surface_width() const override { return presenter_.width(); }
+    std::uint32_t surface_height() const override { return presenter_.height(); }
 
 private:
     Buffer &buffer(gpu::Buffer b, Frame *f) {
@@ -127,11 +129,13 @@ private:
     bool ensure_frame_capacity(Frame &f, std::size_t param_bytes, std::size_t arena_words);
     void write_descriptors(Frame &f);
     void wait_frame(Frame &f);
-    void record(VkCommandBuffer cb, const std::vector<Command> &commands, Frame &f, VkQueryPool queries, std::uint32_t base, bool per_command, const std::uint32_t *arena, const void *params);
+    void record(VkCommandBuffer cb, const std::vector<Command> &commands, Frame &f, VkQueryPool queries, std::uint32_t base, bool per_command, const std::uint32_t *arena, const void *params,
+                const std::function<void(VkCommandBuffer)> *tail = nullptr);
     bool copy_once(VkBuffer src, std::uint64_t src_offset, VkBuffer dst, std::uint64_t dst_offset, std::uint64_t bytes, VkFence fence, VkCommandBuffer &cb);
 
     Context ctx_;
     vk::HwRaster hw_;
+    vk::Presenter presenter_;
     bool hw_on_ = false;
     std::uint64_t dropped_batches_ = 0;  // hardware-promised batches the hardware path then declined
     std::uint64_t closes_by_pipeline_[kPipelines] = {};  // passes closed by a command the device could not hold back
@@ -356,7 +360,8 @@ void VkDevice_::write(gpu::Buffer b, std::uint64_t offset, const void *data, std
     }
 }
 
-void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands, Frame &f, VkQueryPool queries, std::uint32_t base, bool per_command, const std::uint32_t *arena, const void *params) {
+void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands, Frame &f, VkQueryPool queries, std::uint32_t base, bool per_command, const std::uint32_t *arena, const void *params,
+                       const std::function<void(VkCommandBuffer)> *tail) {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk::vkBeginCommandBuffer(cb, &bi);
@@ -524,6 +529,7 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
         hw_.end_frame(cb);  // closes the pass, which records what was held back
         hw_.on_pass_closed(nullptr);
     }
+    if (tail) (*tail)(cb);  // the present blit, after every command of the frame
     if (queries && !per_command) vk::vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, base + 1);
     // Make the results visible to transfers (read-backs) and the host.
     VkMemoryBarrier done{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -533,7 +539,7 @@ void VkDevice_::record(VkCommandBuffer cb, const std::vector<Command> &commands,
     vk::vkEndCommandBuffer(cb);
 }
 
-void VkDevice_::submit(const std::vector<Command> &commands, const void *params, std::size_t param_bytes, const std::uint32_t *arena, std::size_t arena_words, bool) {
+void VkDevice_::submit(const std::vector<Command> &commands, const void *params, std::size_t param_bytes, const std::uint32_t *arena, std::size_t arena_words, bool present) {
     if (commands.empty()) return;
     cpu_timers::Scope timer(cpu_timers::kSubmit);
     // Collect the GPU time of the frame measured two submits ago.
@@ -555,8 +561,16 @@ void VkDevice_::submit(const std::vector<Command> &commands, const void *params,
     ctx_.flush(f.data, 0, arena_words * 4);
     std::memcpy(f.params.mapped, params, param_bytes);
     const bool measure = queries_ && !query_pending_;
+    // A presented frame: an acquired swapchain image gets the blit pass at
+    // the end of this command buffer; the submit waits for the acquire and
+    // signals the present.
+    std::uint32_t image = 0;
+    VkSemaphore acquired = VK_NULL_HANDLE;
+    const bool show = present && presenter_.active() && presenter_.acquire(frame_, image, acquired);
+    const int slot = frame_;
+    const std::function<void(VkCommandBuffer)> tail = [&](VkCommandBuffer cb) { presenter_.record(cb, slot, image); };
     hw_.begin_frame(frame_);
-    record(f.cb, commands, f, measure ? queries_ : VK_NULL_HANDLE, static_cast<std::uint32_t>(frame_) * 2, false, arena, params);
+    record(f.cb, commands, f, measure ? queries_ : VK_NULL_HANDLE, static_cast<std::uint32_t>(frame_) * 2, false, arena, params, show ? &tail : nullptr);
     if (measure) {
         query_pending_ = true;
         query_frame_ = frame_;
@@ -565,11 +579,21 @@ void VkDevice_::submit(const std::vector<Command> &commands, const void *params,
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &f.cb;
+    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSemaphore done = show ? presenter_.signal(slot) : VK_NULL_HANDLE;
+    if (show) {
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &acquired;
+        si.pWaitDstStageMask = &wait_stage;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &done;
+    }
     if (vk::vkQueueSubmit(ctx_.queue, 1, &si, f.fence) != VK_SUCCESS) {
         std::fprintf(stderr, "[vk] submit failed\n");
         return;
     }
     f.submitted = true;
+    if (show) presenter_.present(image, done);
     frame_ = (frame_ + 1) % kFrames;
 }
 

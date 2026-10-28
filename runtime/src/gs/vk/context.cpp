@@ -43,8 +43,36 @@ bool Context::init() {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "ps2run";
     app.apiVersion = VK_API_VERSION_1_1;
+    // Window-surface extensions, when the loader offers them (the runner
+    // presents through a swapchain then; otherwise through SDL).
+    std::vector<const char *> instance_exts;
+    {
+        std::uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> props(n);
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, props.data());
+        const auto has = [&](const char *name) {
+            for (const VkExtensionProperties &p : props)
+                if (std::strcmp(p.extensionName, name) == 0) return true;
+            return false;
+        };
+        if (has("VK_KHR_surface")) {
+            instance_exts.push_back("VK_KHR_surface");
+            ext_surface = true;
+            if (has("VK_KHR_xlib_surface")) {
+                instance_exts.push_back("VK_KHR_xlib_surface");
+                ext_xlib = true;
+            }
+            if (has("VK_KHR_wayland_surface")) {
+                instance_exts.push_back("VK_KHR_wayland_surface");
+                ext_wayland = true;
+            }
+        }
+    }
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    ici.enabledExtensionCount = static_cast<std::uint32_t>(instance_exts.size());
+    ici.ppEnabledExtensionNames = instance_exts.data();
     VkResult r = vkCreateInstance(&ici, nullptr, &instance);
     if (r != VK_SUCCESS) {
         std::fprintf(stderr, "[vk] vkCreateInstance: %s\n", result_name(r));
@@ -106,10 +134,25 @@ bool Context::init() {
     enabled.dualSrcBlend = features.dualSrcBlend;
     enabled.shaderInt16 = features.shaderInt16;
     enabled.fragmentStoresAndAtomics = features.fragmentStoresAndAtomics;
+    const char *device_exts[1] = {"VK_KHR_swapchain"};
+    std::uint32_t device_ext_count = 0;
+    if (ext_surface) {
+        std::uint32_t n = 0;
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> props(n);
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &n, props.data());
+        for (const VkExtensionProperties &p : props)
+            if (std::strcmp(p.extensionName, "VK_KHR_swapchain") == 0) {
+                ext_swapchain = true;
+                device_ext_count = 1;
+            }
+    }
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.pEnabledFeatures = &enabled;
+    dci.enabledExtensionCount = device_ext_count;
+    dci.ppEnabledExtensionNames = device_exts;
     r = vkCreateDevice(physical, &dci, nullptr, &device);
     if (r != VK_SUCCESS) {
         std::fprintf(stderr, "[vk] vkCreateDevice: %s\n", result_name(r));
