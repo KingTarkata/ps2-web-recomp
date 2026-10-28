@@ -668,7 +668,8 @@ void HwRaster::print_reasons() const {
     std::fprintf(stderr, "[vk] textures: %zu resident, %llu decoded, %llu hits, %llu sampled from surfaces, %llu copied from own surface, %llu memory reads answered by surface views; block writes by commands %llu, write-backs %llu, own draws %llu; evictions %llu, stale at lookup %llu\n", textures_.size(),
                  static_cast<unsigned long long>(decoded_textures_), static_cast<unsigned long long>(texture_hits_), static_cast<unsigned long long>(surface_samples_), static_cast<unsigned long long>(surface_copies_), static_cast<unsigned long long>(surface_views_), static_cast<unsigned long long>(tex_drops_[0]), static_cast<unsigned long long>(tex_drops_[1]),
                  static_cast<unsigned long long>(tex_drops_[2]), static_cast<unsigned long long>(tex_drops_[3]), static_cast<unsigned long long>(tex_drops_[4]));
-    std::fprintf(stderr, "[vk] textures decoded from surface images: %llu; %.1f Mpx of texels decoded\n", static_cast<unsigned long long>(decoded_from_surfaces_), static_cast<double>(decoded_texels_) / 1e6);
+    std::fprintf(stderr, "[vk] textures decoded from surface images: %llu; %.1f Mpx of texels decoded; %llu decodes skipped for sampling through a view\n", static_cast<unsigned long long>(decoded_from_surfaces_), static_cast<double>(decoded_texels_) / 1e6,
+                 static_cast<unsigned long long>(decode_skips_));
     std::fprintf(stderr, "[vk] fallback reasons:");
     for (int i = 0; i < 14; ++i)
         if (reasons_[i]) std::fprintf(stderr, " %s %llu", kReasons[i], static_cast<unsigned long long>(reasons_[i]));
@@ -1751,7 +1752,12 @@ VkDescriptorSet HwRaster::surface_texture(VkCommandBuffer cb, VkDescriptorSet se
 VkDescriptorSet HwRaster::texture_set(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *w, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, const Surface *color,
                                       const Surface *depth) {
     if (VkDescriptorSet s = surface_texture(cb, set0, w, prims, count, setup_index, color, depth)) return s;
-    const Texture *t = texture_for(cb, set0, w, setup_offset, prims, count, setup_index);
+    std::uint32_t fragments = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t *r = prims + i * kPrimWords;
+        if (r[0] == setup_index) fragments += ((r[3] & 0xFFFFu) - (r[2] & 0xFFFFu) + 1) * ((r[3] >> 16) - (r[2] >> 16) + 1);
+    }
+    const Texture *t = texture_for(cb, set0, w, setup_offset, prims, count, setup_index, fragments, color, depth);
     return t ? t->set2 : VK_NULL_HANDLE;
 }
 
@@ -1904,7 +1910,8 @@ void HwRaster::copy_surface_texels(VkCommandBuffer cb, VkDescriptorSet set0, Sur
     vkCmdCopyImage(cb, src.image.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
 }
 
-HwRaster::Texture *HwRaster::texture_for(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *w, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index) {
+HwRaster::Texture *HwRaster::texture_for(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *w, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, std::uint32_t fragments,
+                                         const Surface *color, const Surface *depth) {
     cpu_timers::Scope timer(cpu_timers::kTextureFor);
     Rect texels;
     bool sampled;
@@ -1935,6 +1942,26 @@ HwRaster::Texture *HwRaster::texture_for(VkCommandBuffer cb, VkDescriptorSet set
     if (current) {
         ++texture_hits_;
         return &t;
+    }
+    // A decode that covers more texels than the batch draws samples (GT4's
+    // post-process decodes a 128x64 tile per strip to draw 2048 pixels from
+    // it) costs more than sampling memory: when a surface view can serve
+    // the texture, leave it to the memory-sampling shader. The texture is
+    // left as it was; a later batch that samples it more decodes it then.
+    // Only nearest-filtered setups: the cached path filters bilinear through
+    // the sampler (8-bit weights) and the memory path in the shader, which
+    // round differently. PS2_HW_DEBUG bit 6 (64): always decode (A/B).
+    if (fragments && !(w[0] & 16384u) && !(debug & 64u)) {
+        const std::uint32_t texels_to_decode = sampled ? (texels.x1 - texels.x0 + 1) * (texels.y1 - texels.y0 + 1) : (1u << t.tw) * (1u << t.th);
+        const std::uint32_t samples = fragments * scale_ * scale_;
+        if (samples * 2 < texels_to_decode) {
+            const gpu::Span span = texture_span(w);
+            Rect vr;
+            if (Surface *v = viewable_surface(span, color, depth); v && span_rect(*v, span, vr)) {
+                ++decode_skips_;
+                return nullptr;
+            }
+        }
     }
     if (!fresh) ++tex_drops_[4];
     // PS2_TEX_TRACE=<frame>: why each texture of that frame is (re)decoded.
@@ -2126,6 +2153,48 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
     std::vector<VkDescriptorSet> textures(cmd.setups, VK_NULL_HANDLE);
     std::vector<View> views(cmd.setups);
     bool decoded_any = false, memory_sampled = false;
+    // A texture sampled from memory by the fragment shader: a resident 32/24-bit
+    // surface holding it is read through a view; otherwise memory is made current.
+    const auto sample_memory = [&](std::uint32_t i, const std::uint32_t *w) {
+        // Memory inside a resident 32/24-bit surface: the fragment shader
+        // reads that surface's image through its layout (surface view),
+        // so nothing is written back.
+        const gpu::Span span = texture_span(w);
+        Surface *v = (debug & 33554432u) ? nullptr : viewable_surface(span, color, depth);  // debug: no surface views
+        Rect vr;
+        if (v && span_rect(*v, span, vr)) {
+            if (pass_cb_ == cb && (v == pass_color_ || v == pass_depth_)) close_pass(cb, kCloseSurfaces);  // its attachment writes land first
+            const std::uint64_t before_imports = imported_px_, before_alias = alias_copied_px_;
+            WhyScope why(import_why_, kCloseImportSource);
+            // A same-layout surface holding the span (the other half of
+            // GT4's 24-bit frame) fills the viewed tiles by an image copy;
+            // then neither the write-back nor the import from memory runs.
+            if (!all_valid(v->plane, vr)) import_from_aliases(cb, *v, tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t t) { return !q.is_valid(t); }));
+            if (!all_valid(v->plane, vr)) {
+                // Another surface may hold the span dirty: GT4 reads its
+                // depth buffer as a 24-bit colour texture, so the colour
+                // surface viewed here is a stale copy of the depth
+                // surface's memory until that is written back (which
+                // also drops the viewed surface's tiles for the import).
+                WhyScope wb(wb_why_, kCloseWbOverlap);
+                memory_read(cb, set0, span, v);
+                import_tiles(cb, set0, *v, vr);  // what memory still owns there
+            }
+            decoded_any = decoded_any || imported_px_ != before_imports || alias_copied_px_ != before_alias;
+            views[i] = View{v->bp * 64u, v->bw, static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u, 0u};
+            textures[i] = v->set2;
+            memory_sampled = true;  // the shader still reads the CLUT buffer
+            ++surface_views_;
+            return;
+        }
+        memory_sampled = true;
+        static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
+        if (frame_count() == trace_frame)
+            std::fprintf(stderr, "[tex] memory-sampled: tbp %u tbw %u tpsm %02x tw %u th %u modes %u/%u region %08x/%08x surface %s\n", w[12], w[13], w[14], w[15] & 0xFFu, w[15] >> 8, (w[7] >> 24) & 3u, (w[7] >> 26) & 3u, w[18], w[19],
+                         find_surface(w[12], w[13], w[14], false) ? "same layout" : find_surface(w[12], w[13], w[14] ^ 1u, false) ? "24/32 sibling" : "none");
+        WhyScope why(wb_why_, kCloseWbUncached);
+        memory_read(cb, set0, texture_span(w));
+    };
     // Textures the cache does not take (tiny, or region modes outside the
     // texture): a surface in the same layout is sampled in place; otherwise
     // the fragment shader reads memory, which must be current.
@@ -2137,46 +2206,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
             textures[i] = surface_texture(cb, set0, w, prims, cmd.prims, i, color, depth);
             decoded_any = decoded_any || imported_px_ != before_imports || surface_copies_ != before_copies || alias_copied_px_ != before_alias;
         }
-        if (!textures[i]) {
-            // Memory inside a resident 32/24-bit surface: the fragment shader
-            // reads that surface's image through its layout (surface view),
-            // so nothing is written back.
-            const gpu::Span span = texture_span(w);
-            Surface *v = (debug & 33554432u) ? nullptr : viewable_surface(span, color, depth);  // debug: no surface views
-            Rect vr;
-            if (v && span_rect(*v, span, vr)) {
-                if (pass_cb_ == cb && (v == pass_color_ || v == pass_depth_)) close_pass(cb, kCloseSurfaces);  // its attachment writes land first
-                const std::uint64_t before_imports = imported_px_, before_alias = alias_copied_px_;
-                WhyScope why(import_why_, kCloseImportSource);
-                // A same-layout surface holding the span (the other half of
-                // GT4's 24-bit frame) fills the viewed tiles by an image copy;
-                // then neither the write-back nor the import from memory runs.
-                if (!all_valid(v->plane, vr)) import_from_aliases(cb, *v, tile_rects(v->plane, vr, [](const Plane &q, std::uint32_t t) { return !q.is_valid(t); }));
-                if (!all_valid(v->plane, vr)) {
-                    // Another surface may hold the span dirty: GT4 reads its
-                    // depth buffer as a 24-bit colour texture, so the colour
-                    // surface viewed here is a stale copy of the depth
-                    // surface's memory until that is written back (which
-                    // also drops the viewed surface's tiles for the import).
-                    WhyScope wb(wb_why_, kCloseWbOverlap);
-                    memory_read(cb, set0, span, v);
-                    import_tiles(cb, set0, *v, vr);  // what memory still owns there
-                }
-                decoded_any = decoded_any || imported_px_ != before_imports || alias_copied_px_ != before_alias;
-                views[i] = View{v->bp * 64u, v->bw, static_cast<std::uint32_t>(v->height / 32) * v->bw * 2048u, 0u};
-                textures[i] = v->set2;
-                memory_sampled = true;  // the shader still reads the CLUT buffer
-                ++surface_views_;
-                continue;
-            }
-            memory_sampled = true;
-            static const unsigned long long trace_frame = std::getenv("PS2_HW_PASS_TRACE") ? std::strtoull(std::getenv("PS2_HW_PASS_TRACE"), nullptr, 10) : ~0ull;
-            if (frame_count() == trace_frame)
-                std::fprintf(stderr, "[tex] memory-sampled: tbp %u tbw %u tpsm %02x tw %u th %u modes %u/%u region %08x/%08x surface %s\n", w[12], w[13], w[14], w[15] & 0xFFu, w[15] >> 8, (w[7] >> 24) & 3u, (w[7] >> 26) & 3u, w[18], w[19],
-                             find_surface(w[12], w[13], w[14], false) ? "same layout" : find_surface(w[12], w[13], w[14] ^ 1u, false) ? "24/32 sibling" : "none");
-            WhyScope why(wb_why_, kCloseWbUncached);
-            memory_read(cb, set0, texture_span(w));
-        }
+        if (!textures[i]) sample_memory(i, w);
     }
     // Memory sampling also reads the CLUT buffer, which held-back CLUT loads
     // have not written yet: they land first.
@@ -2207,6 +2237,7 @@ bool HwRaster::draw(VkCommandBuffer cb, const gpu::Command &cmd, VkDescriptorSet
             const std::uint64_t before_decodes = decoded_textures_, before_imports = imported_px_, before_copies = surface_copies_;
             textures[i] = texture_set(cb, set0, w, setup_offset + i * kSetupWords, prims, cmd.prims, i, color, depth);
             decoded_any = decoded_any || decoded_textures_ != before_decodes || imported_px_ != before_imports || surface_copies_ != before_copies;
+            if (!textures[i]) sample_memory(i, w);  // the decode was skipped for a view (texture_for), or the cache is full
         }
     if (decoded_any) {
         // Decodes and imports (compute stores, transfer writes) feed sampling.

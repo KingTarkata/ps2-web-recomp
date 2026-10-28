@@ -949,3 +949,28 @@ by construction (the inherited chunks are the same words either way);
 native frames 5500-6000 and Switch frame 6100 bit-identical.
 Switch: load_clut 3.44 -> 1.69 ms/frame, GPU profile total 40.6 -> 38.8
 ms, threaded race 31.1-33.9 ms/frame (budget 33.3).
+
+### 2026-10-28: decode or sample, decided per batch
+
+The block draw of the post-process decodes a 128x64 8-bit tile (7744
+sampled texels, from the frame surface through `target_load`) to draw
+2048 pixels from it, 70 times a frame: the decode dispatch, its barrier
+and the pass close around it were 24 of the batch's 43 us (profile with
+draws disabled). `texture_for` now takes the GS pixels the setup's
+primitives cover (box areas from the prim records, times scale^2): when
+the texture is not current in the cache and twice the samples are fewer
+than the texels the decode would cover, and a resident 32/24-bit surface
+can serve the texture through a view, it returns no texture and `draw`
+falls back to the memory-sampling shader (the fallback is shared with the
+uncacheable textures now, `sample_memory`). The texture is left as it
+was; a batch that samples it more decodes it then. Only nearest-filtered
+setups qualify: the cached path filters bilinear through the sampler
+(8-bit weights) and the memory path in the shader, and including them
+moved six pixels by one in frame 6100 and five of the six native check
+frames. `PS2_HW_DEBUG` bit 6 (64) always decodes (A/B).
+
+Switch: decodes 77k -> 30k over the 650-frame run, block draw 43 -> 25
+us, GPU profile total 38.8 -> 37.5 ms, threaded race 29.7-34.5 ms/frame
+(mostly 30.5-32); frame 6100 and native frames 5500-6000 bit-identical.
+Remaining in the post-process chain: the two passes per strip (tile draw
+17 us, block draw now ~25 us) and the 8-record CLUT load (~10 us).

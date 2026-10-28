@@ -265,7 +265,11 @@ private:
     // Textures.
     bool texture_cacheable(const std::uint32_t *setup) const;
     gpu::Span texture_span(const std::uint32_t *setup) const;
-    Texture *texture_for(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *setup, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index);
+    // `fragments` (GS pixels the setup's primitives cover, 0 unknown) lets a
+    // decode that would cost more than sampling memory be skipped when a
+    // surface view can serve the texture; `color`/`depth` are the batch's.
+    Texture *texture_for(VkCommandBuffer cb, VkDescriptorSet set0, const std::uint32_t *setup, std::uint32_t setup_offset, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, std::uint32_t fragments = 0,
+                         const Surface *color = nullptr, const Surface *depth = nullptr);
     // The texel rectangle a batch's primitives of `setup_index` can sample
     // (false when none do), and the blocks of memory holding a texel rectangle.
     bool texture_texels(const std::uint32_t *setup, const std::uint32_t *prims, std::uint32_t count, std::uint32_t setup_index, Rect &texels) const;
@@ -409,7 +413,7 @@ private:
     std::uint64_t fragments_ = 0, fragment_frames_ = 0;
     std::uint64_t drawn_ = 0, fallback_ = 0;
     std::uint64_t imported_px_ = 0, exported_px_ = 0, evictions_ = 0, uniform_overflows_ = 0, alias_batches_ = 0;
-    std::uint64_t alias_copied_px_ = 0, decoded_from_surfaces_ = 0, decoded_texels_ = 0;  // tiles filled from another surface's image instead of memory (import_from_aliases)
+    std::uint64_t alias_copied_px_ = 0, decoded_from_surfaces_ = 0, decoded_texels_ = 0, decode_skips_ = 0;  // tiles filled from another surface's image instead of memory (import_from_aliases)
     // Why batches fell back, by the first reason met (see hw.cpp kReasons).
     mutable std::uint64_t reasons_[14] = {};
     mutable int last_reason_ = 0;
