@@ -11,6 +11,7 @@
 #include "ps2/system.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <functional>
 #include <cstdio>
 #include <cstdlib>
@@ -268,6 +269,22 @@ bool VkDevice_::ensure_frame_capacity(Frame &f, std::size_t param_bytes, std::si
         if (!reported) {
             reported = true;
             std::fprintf(stderr, "[vk] arena memory is %s\n", f.data.coherent ? "host-coherent (uncached on the Tegra: uploads copy slowly)" : "host-cached");
+            // PS2_VK_MEMBENCH: how fast the CPU copies into the mapped memory
+            // types, against the heap (the upload copies into the arena were
+            // 9% of the render thread on the Switch).
+            if (std::getenv("PS2_VK_MEMBENCH") && size >= (4u << 20) && staging_.size >= (4u << 20)) {
+                std::vector<std::uint8_t> src(4u << 20, 0x5A), heap(4u << 20);
+                const auto bench = [&](const char *what, void *dst) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < 16; ++i) std::memcpy(dst, src.data(), src.size());
+                    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    std::fprintf(stderr, "[vk] membench: 16 x 4 MB into %s: %.0f MB/s\n", what, 64.0 / s);
+                };
+                bench("the heap", heap.data());
+                bench("the arena (host-cached)", f.data.mapped);
+                bench("the staging buffer (host-coherent)", staging_.mapped);
+                bench("the heap again", heap.data());
+            }
         }
         changed = true;
     }
